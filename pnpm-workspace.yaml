@@ -1,0 +1,5 @@
+# esbuild installe un binaire natif par un script de post-installation. pnpm 11
+# les bloque tous par défaut ; sans cette autorisation, `pnpm build` échoue sur
+# un binaire manquant, en local comme en CI.
+allowBuilds:
+  esbuild: true

@@ -1,0 +1,46 @@
+name: Review IA des PR
+
+# Le dépôt se relit avec sa propre action, sur la version de la branche
+# (`uses: ./pr-review`) et non sur le tag publié : une régression du prompt ou
+# du rendu se voit sur la PR qui l'introduit, avant d'être taguée.
+#
+# Sans secret `OLLAMA_API_KEY`, l'action le dit dans les logs et sort en 0.
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Numéro de la PR à relire'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', inputs.pr) }}
+
+      # Le bundle committé est exécuté tel quel, comme chez un consommateur.
+      # La doctrine n'est pas nommée : `.github/copilot-instructions.md` fait
+      # partie des chemins cherchés par défaut, et ce cas mérite d'être celui
+      # qu'on éprouve à chaque PR.
+      - uses: ./pr-review
+        with:
+          pr: ${{ github.event.pull_request.number || inputs.pr }}
+          ollama-api-key: ${{ secrets.OLLAMA_API_KEY }}
+          skip: |
+            */dist/**

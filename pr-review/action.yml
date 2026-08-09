@@ -1,0 +1,86 @@
+name: 'Review IA de PR (Ollama)'
+description: >-
+  Relit une pull request avec un modèle Ollama Cloud, en lui donnant la doctrine
+  du dépôt, et poste un commentaire de synthèse. Ne fait jamais échouer le job.
+author: 'Julien Cruau'
+
+branding:
+  icon: 'eye'
+  color: 'purple'
+
+inputs:
+  pr:
+    description: "Numéro de la PR à relire."
+    required: true
+
+  ollama-api-key:
+    description: >-
+      Clé Ollama Cloud. Vide (PR venue d'un fork, secret non configuré) : la
+      review est ignorée sans bruit et le job reste vert.
+    required: false
+    default: ''
+
+  github-token:
+    description: "Jeton utilisé par le CLI gh. Le jeton du job suffit, avec pull-requests: write."
+    required: false
+    default: ${{ github.token }}
+
+  model:
+    description: "Modèle Ollama Cloud."
+    required: false
+    default: 'glm-5.2:cloud'
+
+  doctrine:
+    description: >-
+      Fichiers de conventions injectés dans le prompt système, un chemin par
+      ligne, relatifs à la racine du dépôt. Ceux qui n'existent pas sont ignorés.
+      Défaut : .github/copilot-instructions.md, CLAUDE.md, AGENTS.md.
+    required: false
+    default: ''
+
+  skip:
+    description: >-
+      Motifs de fichiers à ne pas relire, un par ligne, syntaxe .gitignore
+      (`src/generated/**`, `*.snap`, `deploy/`). S'AJOUTENT au socle intégré
+      (lockfiles, binaires, node_modules), qui n'est pas désactivable.
+    required: false
+    default: ''
+
+  project-summary:
+    description: >-
+      Deux ou trois lignes situant le projet, si le fichier de doctrine ne le
+      fait pas déjà. Le plus souvent inutile.
+    required: false
+    default: ''
+
+  max-findings:
+    description: "Nombre maximum de puces, toutes sections confondues."
+    required: false
+    default: '12'
+
+  budget-chars:
+    description: "Plafond global du contenu intégral envoyé au modèle, en caractères."
+    required: false
+    default: '500000'
+
+  per-file-chars:
+    description: "Plafond par fichier, pour qu'un gros fichier ne mange pas tout le budget."
+    required: false
+    default: '80000'
+
+  timeout-minutes:
+    description: >-
+      Délai maximum de la requête au modèle. Doit rester sous le
+      timeout-minutes du job, sinon le commentaire d'échec n'a pas le temps
+      d'être posté.
+    required: false
+    default: '15'
+
+  dry-run:
+    description: "true : la review est écrite dans les logs et rien n'est posté."
+    required: false
+    default: 'false'
+
+runs:
+  using: 'node24'
+  main: 'dist/index.mjs'
