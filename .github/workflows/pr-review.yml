@@ -28,7 +28,9 @@ jobs:
   review:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Le mur vaut « passe la plus lente + fusion », soit jusqu'à deux fois le
+    # timeout-minutes de l'action, plus la marge du commentaire d'échec.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
         with:

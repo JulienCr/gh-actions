@@ -108,6 +108,20 @@ describe('resolveConfig · nombres illisibles', () => {
     const config = resolve({ 'INPUT_TIMEOUT-MINUTES': '20' });
     expect(config.timeoutMs).toBe(20 * 60_000);
   });
+
+  it('accepte zéro là où il veut dire quelque chose : couper le contexte importé', () => {
+    const warn = vi.fn();
+    const config = resolveConfig({ argv: ['42'], env: { 'INPUT_IMPORTS-BUDGET-CHARS': '0' }, warn });
+    expect(config.importsBudgetChars).toBe(0);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('refuse un budget d’imports négatif, qui ne veut rien dire', () => {
+    const warn = vi.fn();
+    const config = resolveConfig({ argv: ['42'], env: { 'INPUT_IMPORTS-BUDGET-CHARS': '-1' }, warn });
+    expect(config.importsBudgetChars).toBe(DEFAULTS.importsBudgetChars);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('resolveConfig · réglages du modèle', () => {
@@ -121,6 +135,11 @@ describe('resolveConfig · réglages du modèle', () => {
   it('laisse le dépôt choisir un autre niveau, y compris aucun', () => {
     expect(resolve({ INPUT_THINKING: 'high' }).thinking).toBe('high');
     expect(resolve({ INPUT_THINKING: 'off' }).thinking).toBe('off');
+  });
+
+  it('règle la fusion plus bas que les passes : elle trie, elle ne relit pas', () => {
+    expect(resolve().mergeThinking).toBe('high');
+    expect(resolve({ 'INPUT_MERGE-THINKING': 'max' }).mergeThinking).toBe('max');
   });
 
   it('prévient quand on redemande le décodage glouton, sans l’interdire', () => {

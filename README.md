@@ -5,13 +5,16 @@ par des tags `vX.Y.Z` plus un tag majeur mobile `vX`.
 
 | Action | Ce qu'elle fait |
 | --- | --- |
-| [`pr-review`](#pr-review) | Relit une pull request avec un modèle Ollama Cloud, en lui donnant la doctrine du dépôt, et poste un commentaire de synthèse. |
+| [`pr-review`](#pr-review) | Relit une pull request avec un modèle Ollama Cloud, en trois passes, et poste un commentaire de synthèse. |
 
 ## pr-review
 
 À l'ouverture d'une PR, un modèle la relit avec les conventions du dépôt sous les yeux et poste
 un commentaire. Ce qu'elle cherche est ce qu'un linter ne peut pas voir : les règles propres au
 projet, les régressions fonctionnelles, les fuites de données.
+
+La lecture est découpée en **trois passes indépendantes**, puis fusionnée : voir
+[Trois passes plutôt qu'une](#trois-passes-plutôt-quune).
 
 **Elle ne fait jamais échouer le job.** Une review est un avis, pas un gate. Quota épuisé, panne
 d'Ollama, clé absente : c'est dit dans un commentaire quand c'est possible, et le job sort en 0.
@@ -49,7 +52,9 @@ jobs:
     # Un brouillon ne consomme pas de quota : il sera relu au passage en « prêt ».
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Trois passes en parallèle puis leur fusion : le mur vaut jusqu'à deux fois
+    # le « timeout-minutes » de l'action, plus la marge du commentaire d'échec.
+    timeout-minutes: 40
     steps:
       # La tête de la PR, pas le commit de merge : le contenu lu doit
       # correspondre au diff, sinon le modèle raisonne sur des numéros de ligne
@@ -92,16 +97,18 @@ Seul `pr` est obligatoire.
 | `ollama-api-key` | `''` | Clé Ollama Cloud. Vide : review ignorée sans bruit, job vert. |
 | `github-token` | `${{ github.token }}` | Jeton du CLI `gh`. Le jeton du job suffit, avec `pull-requests: write`. |
 | `model` | `glm-5.2:cloud` | Modèle Ollama Cloud. |
-| `thinking` | `max` | Effort de raisonnement : `low`, `medium`, `high`, `max`, `off`. Un modèle qui refuse est relancé sans. |
+| `thinking` | `max` | Effort de raisonnement des trois passes : `low`, `medium`, `high`, `max`, `off`. Un modèle qui refuse est relancé sans. |
+| `merge-thinking` | `high` | Idem pour la fusion, qui trie sans avoir le code sous les yeux. |
 | `temperature` | `1` | **Ne pas mettre 0** : voir ci-dessous. |
 | `seed` | `1` | Graine, pour que deux lectures du même diff se ressemblent. `off` rend sa variance au modèle. |
 | `doctrine` | voir ci-dessous | Fichiers de conventions injectés dans le prompt, un chemin par ligne. |
 | `skip` | `''` | Motifs de fichiers à ne pas relire, un par ligne. **S'ajoutent** au socle intégré. |
 | `project-summary` | `''` | Deux ou trois lignes situant le projet, si la doctrine ne le fait pas. |
 | `max-findings` | `20` | Plafond de puces pour Bloquant, À corriger et Suggestions. « À vérifier » a son propre plafond de cinq. |
-| `budget-chars` | `500000` | Plafond global du contenu intégral envoyé au modèle. |
+| `budget-chars` | `500000` | Plafond du contenu intégral des fichiers **touchés**. |
 | `per-file-chars` | `80000` | Plafond par fichier. |
-| `timeout-minutes` | `15` | Délai de la requête au modèle. À garder sous le `timeout-minutes` du job. |
+| `imports-budget-chars` | `300000` | Plafond des fichiers **importés**, joints en contexte. `0` : aucun. |
+| `timeout-minutes` | `15` | Délai d'**une** requête. La review en fait quatre ; voir le `timeout-minutes` du job. |
 | `dry-run` | `false` | `true` : la review part dans les logs, rien n'est posté. |
 
 ### Pourquoi la température n'est pas à zéro
@@ -115,6 +122,33 @@ sans rien coûter.
 Corollaire pour relire une PR sous un autre angle : `seed: off` plutôt que de toucher à la
 température. Deux passages donneront deux lectures différentes, ce qui est le but.
 
+### Trois passes plutôt qu'une
+
+La review tenait en un seul appel : la doctrine du dépôt, six axes de recherche, les règles de
+rédaction et le gabarit de sortie, le tout pendant que le modèle lit quatre-vingt-dix kilo-octets
+de code. Les axes cités en dernier étaient ceux qu'il honorait le moins.
+
+Trois lectures indépendantes tournent donc en parallèle, sur le même contexte, avec un seul
+objectif chacune :
+
+1. **Régression fonctionnelle** : côté appelant, chemins d'erreur, entrées limites, état et
+   ordonnancement, ce que le changement a oublié.
+2. **Doctrine du dépôt** : ce que disent `CLAUDE.md` et consorts, et rien d'autre.
+3. **Données et accès** : frontières de rôle, secrets, données personnelles.
+
+Une quatrième requête les fusionne : elle déduplique, arbitre les sévérités, applique
+`max-findings` et rédige les cinq rubriques. **Elle ne reçoit pas le code**, et son prompt le lui
+dit : son travail est de trier, pas de relire, et un modèle qui complète de mémoire une trouvaille
+trop courte l'invente.
+
+Ce que ça coûte : le contexte part trois fois. Ce que ça évite : un axe expédié parce que deux
+autres tenaient la tête du modèle. Les passes étant parallèles, le mur du job vaut « la plus lente
+plus la fusion », pas leur somme, d'où le `timeout-minutes: 40` de l'exemple.
+
+Une passe qui échoue n'annule pas les autres : deux lectures sur trois valent mieux que rien, et le
+pied de page du commentaire dit laquelle manque. Si c'est la fusion qui échoue, les trouvailles
+brutes sont postées telles quelles, sans tri, plutôt que jetées.
+
 ### Ce que le modèle est censé rendre
 
 Cinq rubriques : Verdict, Bloquant, À corriger, Suggestions, **À vérifier**.
@@ -123,8 +157,8 @@ La dernière est là pour un motif précis. Un prompt qui réclame de la certitu
 sections vides : le modèle cherche, trouve quelque chose qu'il ne peut pas prouver avec les
 fichiers qu'on lui a donnés, et le jette. « À vérifier » lui donne où le mettre, ce qui coûte
 bien moins cher qu'un bug passé en silence. Le prompt lui interdit en revanche d'y ranger ce
-qu'il aurait pu démontrer, et lui demande, quand il écrit « Rien à signaler », de dire dans la
-même ligne ce qu'il a vérifié pour l'affirmer.
+qu'il aurait pu démontrer, fichiers importés compris, et lui demande, quand il écrit « Rien à
+signaler », de dire dans la même ligne ce qu'il a vérifié pour l'affirmer.
 
 ### La doctrine
 
@@ -147,8 +181,21 @@ Le diff **et** le contenu intégral des fichiers touchés, lignes numérotées. 
 montre pas le voisinage, et c'est le voisinage qui dit si une chaîne française est de l'éditorial
 en dur ou un libellé technique, ou si une requête franchit une frontière de rôle.
 
-Toute troncature est déclarée dans le pied du commentaire. Une review silencieusement partielle
-se lit exactement comme une review complète, c'est le pire des deux mondes.
+S'y ajoutent, dans une section à part, **les fichiers que ceux-là importent**. Sans eux, un doute
+légitime sur un appelant ne pouvait que finir sous « À vérifier » : « l'enum `OrderStatus`
+couvre-t-il bien ces six valeurs ? », « `truncate` compte-t-il des caractères ou des octets ? ».
+Avec le fichier sous les yeux, c'est une trouvaille ou ce n'est rien. La place était là : une PR
+réelle envoyait 92 000 tokens pour une fenêtre de 976 000.
+
+Un seul niveau d'import, les chemins relatifs et le préfixe `@/` (tenté sur `src/`, la racine, puis
+`app/`). Ce n'est pas un résolveur de modules : un `tsconfig.json` n'est pas lu, et **une
+résolution ratée est ignorée en silence**, parce qu'elle doit dégrader la review, jamais l'annuler.
+Le prompt étiquette ces fichiers comme non modifiés par la PR et interdit d'y relever des défauts :
+ils servent à juger le changement, pas à être jugés.
+
+Toute troncature est déclarée dans le pied du commentaire, et le nombre de fichiers importés aussi.
+Une review silencieusement partielle se lit exactement comme une review complète, c'est le pire des
+deux mondes ; et une review qui a vu plus que la PR doit le dire.
 
 ### Exclusions
 
@@ -179,6 +226,10 @@ npx --yes -p 'github:JulienCr/gh-actions#v1' pr-review 154 --model qwen3-coder:4
 
 Le `#v1` n'est pas décoratif : sans lui, npx prend la branche par défaut, et un réglage validé en
 local tournerait sur un prompt différent de celui de la CI. Épingle la même version des deux côtés.
+
+Corollaire utile : une version passée sert de point de comparaison. `#v1.1.0` est la dernière à
+relire en un seul appel et sans contexte importé ; la lancer sur la même PR, à graine égale, dit
+si un changement de prompt a rapporté des trouvailles ou seulement du bruit.
 
 La clé se prend dans `OLLAMA_API_KEY`, sinon dans 1Password à la référence `OLLAMA_API_KEY_REF`
 (défaut `op://Personal/Ollama/add more/api_key`), pour qu'elle ne traîne ni dans un `.env` ni

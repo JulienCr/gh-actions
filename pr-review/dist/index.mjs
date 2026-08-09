@@ -1,8 +1,99 @@
 #!/usr/bin/env node
 
 // pr-review/src/index.ts
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+
+// pr-review/src/imports.ts
+var EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue", ".svelte"];
+var ALIAS_BASES = ["src/", "", "app/"];
+var PATTERNS = [
+  // import x from 'y' ; export { a } from 'y' ; export * from 'y'
+  /\bfrom\s*['"]([^'"\n]+)['"]/g,
+  // import 'y' (effet de bord : feuille de style, polyfill)
+  /\bimport\s+['"]([^'"\n]+)['"]/g,
+  // import('y'), et import('y', { with: { type: 'json' } }) : la parenthèse
+  // fermante n'est pas exigée, sans quoi un import à attributs serait raté et
+  // le fichier ne serait jamais joint.
+  /\bimport\s*\(\s*['"]([^'"\n]+)['"]/g,
+  // require('y')
+  /\brequire\s*\(\s*['"]([^'"\n]+)['"]/g
+];
+function isInternal(specifier) {
+  return specifier.startsWith("./") || specifier.startsWith("../") || specifier.startsWith("@/");
+}
+function extractImports(content) {
+  const found = /* @__PURE__ */ new Map();
+  for (const pattern of PATTERNS) {
+    for (const match of content.matchAll(pattern)) {
+      const specifier = match[1];
+      if (!specifier || !isInternal(specifier) || found.has(specifier)) continue;
+      found.set(specifier, match.index);
+    }
+  }
+  return [...found].sort((a, b) => a[1] - b[1]).map(([specifier]) => specifier);
+}
+function normalizePath(path) {
+  const segments = [];
+  for (const segment of path.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment !== "..") {
+      segments.push(segment);
+      continue;
+    }
+    if (segments.length === 0) return null;
+    segments.pop();
+  }
+  return segments.length > 0 ? segments.join("/") : null;
+}
+function dirOf(path) {
+  const cut = path.lastIndexOf("/");
+  return cut === -1 ? "" : path.slice(0, cut);
+}
+function candidates(base) {
+  const list = [base];
+  const jsToTs = /\.(js|jsx|mjs|cjs)$/.exec(base);
+  if (jsToTs) {
+    const stem = base.slice(0, -jsToTs[0].length);
+    list.push(`${stem}.ts`, `${stem}.tsx`, `${stem}.mts`, `${stem}.cts`);
+  }
+  for (const extension of EXTENSIONS) list.push(`${base}${extension}`);
+  for (const extension of EXTENSIONS) list.push(`${base}/index${extension}`);
+  return list;
+}
+function resolveImport(fromPath, specifier, exists) {
+  const bases = [];
+  if (specifier.startsWith("@/")) {
+    const rest = specifier.slice("@/".length);
+    for (const base of ALIAS_BASES) bases.push(`${base}${rest}`);
+  } else if (specifier.startsWith("./") || specifier.startsWith("../")) {
+    bases.push(`${dirOf(fromPath)}/${specifier}`);
+  } else {
+    return null;
+  }
+  for (const base of bases) {
+    const normalized = normalizePath(base);
+    if (normalized === null) continue;
+    for (const candidate of candidates(normalized)) {
+      if (exists(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+function collectImports(sources, options) {
+  const seen = new Set(sources.map((source) => source.path));
+  const collected = [];
+  for (const source of sources) {
+    for (const specifier of extractImports(source.content)) {
+      const resolved = resolveImport(source.path, specifier, options.exists);
+      if (resolved === null || seen.has(resolved)) continue;
+      seen.add(resolved);
+      if (options.isExcluded(resolved)) continue;
+      collected.push(resolved);
+    }
+  }
+  return collected;
+}
 
 // pr-review/src/context.ts
 function hasContent(file, isSkipped) {
@@ -61,15 +152,16 @@ function assembleContext({
   rawDiff,
   prFiles,
   readFile,
+  exists,
   isSkipped,
   budget
 }) {
   const { diff, skipped } = filterDiff(rawDiff, isSkipped);
-  const files = [];
+  const sources = [];
   const omitted = [];
   let used = 0;
-  const candidates = prFiles.filter((file) => hasContent(file, isSkipped)).sort((a, b) => a.additions + a.deletions - (b.additions + b.deletions));
-  for (const file of candidates) {
+  const candidates2 = prFiles.filter((file) => hasContent(file, isSkipped)).sort((a, b) => a.additions + a.deletions - (b.additions + b.deletions));
+  for (const file of candidates2) {
     const content = readFile(file.path);
     if (content === null) continue;
     if (content.length > budget.perFileChars || used + content.length > budget.totalChars) {
@@ -77,11 +169,33 @@ function assembleContext({
       continue;
     }
     used += content.length;
-    files.push({ path: file.path, numbered: numberLines(content) });
+    sources.push({ path: file.path, content });
   }
   const order = new Map(prFiles.map((file, index) => [file.path, index]));
-  files.sort((a, b) => (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0));
-  return { diff, files, skipped, omitted };
+  sources.sort((a, b) => (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0));
+  const files = sources.map((source) => ({
+    path: source.path,
+    numbered: numberLines(source.content)
+  }));
+  const imported = readImported({ sources, readFile, exists, isSkipped, budget });
+  return { diff, files, imported, skipped, omitted };
+}
+function readImported({ sources, readFile, exists, isSkipped, budget }) {
+  if (budget.importedChars <= 0) return [];
+  const paths = collectImports(sources, { exists, isExcluded: isSkipped });
+  const contents = /* @__PURE__ */ new Map();
+  for (const path of paths) {
+    const content = readFile(path);
+    if (content !== null && content.length <= budget.perFileChars) contents.set(path, content);
+  }
+  const kept = /* @__PURE__ */ new Set();
+  let used = 0;
+  for (const [path, content] of [...contents].sort((a, b) => a[1].length - b[1].length)) {
+    if (used + content.length > budget.importedChars) continue;
+    used += content.length;
+    kept.add(path);
+  }
+  return paths.filter((path) => kept.has(path)).map((path) => ({ path, numbered: numberLines(contents.get(path)) }));
 }
 
 // pr-review/src/exec.ts
@@ -263,6 +377,14 @@ var DEFAULTS = {
   maxFindings: 20,
   budgetChars: 5e5,
   perFileChars: 8e4,
+  /**
+   * Budget des fichiers importés, distinct de celui des fichiers touchés.
+   *
+   * Mesuré sur une PR réelle : 92 000 tokens envoyés pour une fenêtre de
+   * 976 000. La place existe, et elle sert exactement là où le modèle devait
+   * renoncer à trancher faute d'avoir l'appelant sous les yeux. `0` désactive.
+   */
+  importsBudgetChars: 3e5,
   timeoutMinutes: 15,
   /**
    * Effort de raisonnement demandé au modèle.
@@ -273,6 +395,15 @@ var DEFAULTS = {
    * aucun modèle.
    */
   thinking: "max",
+  /**
+   * Effort de raisonnement de la fusion, plus bas que celui des passes.
+   *
+   * Les passes lisent quatre-vingt-dix kilo-octets de code, la fusion trie une
+   * trentaine de puces sans avoir le code sous les yeux : `max` n'y achèterait
+   * que de la latence. Les passes tournant en parallèle, elles coûtent le temps
+   * d'une seule, et c'est la fusion qui s'ajoute au mur du job.
+   */
+  mergeThinking: "high",
   /**
    * Surtout pas 0. Le décodage glouton sur un modèle de raisonnement raccourcit
    * la chaîne de pensée et la fait tourner en rond ; 1 est la valeur des
@@ -287,11 +418,11 @@ var UsageError = class extends Error {
 function readInput(env, name) {
   return (env[`INPUT_${name.replace(/ /g, "_").toUpperCase()}`] ?? "").trim();
 }
-function readNumber(env, name, fallback, warn) {
+function readNumber(env, name, fallback, warn, minimum = 1) {
   const raw = readInput(env, name);
   if (raw === "") return fallback;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
+  if (!Number.isFinite(parsed) || parsed < minimum) {
     warn(`input \xAB ${name} \xBB illisible (\xAB ${raw} \xBB) : on garde ${fallback}.`);
     return fallback;
   }
@@ -362,11 +493,19 @@ function resolveConfig({ argv, env, warn = () => {
     // Pas de validation contre une liste de niveaux : ils varient d'un modèle à
     // l'autre, et un niveau refusé est rattrapé à l'appel.
     thinking: readInput(env, "thinking") || DEFAULTS.thinking,
+    mergeThinking: readInput(env, "merge-thinking") || DEFAULTS.mergeThinking,
     temperature: readTemperature(env, warn),
     seed: readSeed(env, warn),
     maxFindings: readNumber(env, "max-findings", DEFAULTS.maxFindings, warn),
     budgetChars: readNumber(env, "budget-chars", DEFAULTS.budgetChars, warn),
     perFileChars: readNumber(env, "per-file-chars", DEFAULTS.perFileChars, warn),
+    importsBudgetChars: readNumber(
+      env,
+      "imports-budget-chars",
+      DEFAULTS.importsBudgetChars,
+      warn,
+      0
+    ),
     timeoutMs: readNumber(env, "timeout-minutes", DEFAULTS.timeoutMinutes, warn) * 6e4,
     doctrine: doctrineInput.length > 0 ? doctrineInput : [...DEFAULT_DOCTRINE],
     // Le plancher d'abord : ce qui suit ne peut qu'ajouter, jamais retirer.
@@ -502,21 +641,6 @@ function detail(body) {
 }
 
 // pr-review/src/prompt.ts
-var OUTPUT_TEMPLATE = `## Verdict
-Une seule phrase : ce que tu retiens de cette PR.
-
-## Bloquant
-- \`chemin/fichier.ts:42\` : ce qui casse, et pourquoi ici.
-
-## \xC0 corriger
-- \`chemin/fichier.tsx:17\` : \u2026
-
-## Suggestions
-- \`chemin/fichier.ts:88\` : \u2026
-
-## \xC0 v\xE9rifier
-- \`chemin/fichier.ts:120\` : ce que tu soup\xE7onnes sans pouvoir le prouver ici, et ce qu'il
-  faudrait regarder pour trancher.`;
 function renderDoctrine(files) {
   if (files.length === 0) {
     return `This repository ships no review doctrine. Judge on general engineering grounds only, and
@@ -530,7 +654,7 @@ authoritative, and they outrank your general habits.
 
 ${blocks}`;
 }
-function buildSystemPrompt(options) {
+function buildPreamble(options) {
   const summary = options.projectSummary.trim();
   return `You are reviewing a pull request on the \`${options.repo}\` repository.
 ${summary ? `
@@ -541,55 +665,27 @@ linter cannot see: this project's own rules, functional regressions, and data le
 
 ${renderDoctrine(options.doctrine)}
 
-# Expected output
-
-Return exactly these five sections, in this order, as markdown. The review itself is written
-in French: it is posted as a comment on the PR.
-
-${OUTPUT_TEMPLATE}
-
 # How hard to look
 
 Your job is coverage, not curation. A finding you swallowed because you were not sure enough
-is a bug that ships. Report what you find and let the section carry your confidence: a doubt
-belongs under \xAB \xC0 v\xE9rifier \xBB, never in the bin.
+is a bug that ships. Report what you find and let its label carry your confidence: a doubt is
+reported as a doubt, never dropped.
 
 - **Read every file you were given in full**, not only the changed lines. The diff says what
   moved; the code around it says what that broke. A reviewer who only reads \xAB + \xBB lines finds
   only typos.
 - **Do not soften a finding into silence.** When something looks wrong but you cannot prove it
-  from what you were given, say what you saw, what you suspect, and which file would settle
-  it. That is a \xAB \xC0 v\xE9rifier \xBB bullet, and it is worth more than an empty section.
-- **\xAB Rien \xE0 signaler \xBB is a claim, not a default.** Write it only with, on the same line, what
-  you checked in order to say it: \xAB Rien \xE0 signaler (chemins d'erreur et valeurs de retour
-  relus) \xBB. If you cannot name what you checked, you have not checked.
+  from what you were given, say what you saw, what you suspect, and which file would settle it.
+- **Finding nothing is a claim, not a default.** If this pass turns up nothing, say what you
+  checked in order to say it. If you cannot name what you checked, you have not checked.
 
-# Where the costly bugs hide
+# Citing code
 
-Walk these deliberately, on every changed file. None of them is visible in a diff read line by
-line, which is exactly why they survive until production.
-
-1. **The caller's side.** A changed signature, return shape, thrown error or nullability breaks
-   whoever calls it. If you were not given that caller, say so and ask.
-2. **Error paths.** What happens when this throws, returns null, times out, or gets an empty
-   list? An error caught, logged and swallowed is a silent failure: the feature is dead and
-   nobody is told.
-3. **Edge inputs.** Empty, zero, one element, duplicates, very large. Boundaries of a loop, a
-   slice, a pagination.
-4. **State and ordering.** Two runs racing, a retry replaying a side effect, a cache or a
-   ledger written before the thing it records actually succeeded, a missing await.
-5. **Data and access.** A query crossing a role boundary, a secret or a personal datum reaching
-   a log, a client bundle, or a third party.
-6. **What the change forgot.** A rename applied in two places out of three, a new branch with
-   no test, a migration with no way back.
-
-# How to write it
-
-- Every bullet starts with a \`path:line\` in backticks, path relative to the repository root.
-- A line number is read, never estimated. Only cite numbers visible in the numbered excerpts
-  below. When a file comes as diff only, cite the path with no line number.
-- **Never state what a file contains unless that file was included below**, not even to support
-  a comparison. If your point depends on a file you were not given, phrase it as a question.
+- Every finding starts with a \`path:line\` in backticks, path relative to the repository root.
+- A line number is read, never estimated. Only cite numbers visible in the numbered excerpts you
+  were given. When a file comes as diff only, cite the path with no line number.
+- **Never state what a file contains unless that file was included in your context**, not even
+  to support a comparison. If your point depends on a file you were not given, say so.
 
 # Two habits that ruin a review
 
@@ -609,41 +705,14 @@ reader doubt the whole finding, and a true finding dies with its invented suppor
    WRONG \u2014 \xAB alors que template.md dit d\xE9sormais \xAB partie 2 \xBB \xBB
    RIGHT \u2014 \xAB \xE0 confronter au vocabulaire retenu ailleurs, que je n'ai pas sous les yeux \xBB
 
-   Assert a file's contents only by quoting a string you can see in its excerpt above.
-- Do not recite the rule: say what breaks HERE and what it produces. \xAB Cha\xEEne FR en dur \xBB is
-  worthless; \xAB ce libell\xE9 de bouton est \xE9ditorial, il doit vivre dans le contenu sinon il
-  \xE9chappe \xE0 l'admin et \xE0 la traduction \xBB is worth something.
-- ${options.maxFindings} bullets maximum across Bloquant, \xC0 corriger and Suggestions, plus at
-  most five under \xC0 v\xE9rifier. Past that nobody reads you. If you have more, keep the costly
-  ones. This ceiling is there to rank your findings, never to justify dropping one in silence:
-  when you cut, say so in the Verdict.
-- Do not comment on formatting or style that lint and Prettier already settle.
-- No summary of the PR, no compliments, no closing paragraph. The author wrote it.
-- A finding outside the PR's scope is labelled as such, goes under Suggestions, and proposes
-  opening an issue. It never blocks.
-- Write in French. Never use an em dash.
-
-# Which section
-
-- Bloquant: breaks production, loses or exposes data, leaks a secret or personal data, or
-  introduces a certain functional regression.
-- \xC0 corriger: breaks a rule from the doctrine above, or a probable but undemonstrated bug.
-- Suggestions: optional improvements, debt, test blind spots.
-- \xC0 v\xE9rifier: what you cannot settle with the files you were given. A suspicion about a caller
-  you were not shown, an invariant you could not confirm, a behaviour that depends on data you
-  cannot see. Say what would confirm or kill it. Sending a real doubt here is right; sending a
-  finding you could have proven from the excerpts above is not.`;
+   Assert a file's contents only by quoting a string you can see in one of its excerpts.`;
 }
 function buildUserPrompt(meta, context) {
   const fileList = meta.files.map((file) => {
     const flag = context.skipped.includes(file.path) ? " (not reviewed)" : "";
     return `- ${file.path} (+${file.additions} / -${file.deletions}, ${file.status})${flag}`;
   }).join("\n");
-  const contents = context.files.length > 0 ? context.files.map((file) => `### ${file.path}
-
-\`\`\`
-${file.numbered}
-\`\`\``).join("\n\n") : "(no full content available, work from the diff alone)";
+  const contents = context.files.length > 0 ? context.files.map(renderFile).join("\n\n") : "(no full content available, work from the diff alone)";
   const omitted = context.omitted.length > 0 ? `
 
 No full content for these files, for lack of room. You only have their diff, so cite them without a line number:
@@ -669,18 +738,226 @@ ${context.diff}
 ## Full content of the changed files, after the change
 
 Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from this
-section was not given to you: do not describe its contents.
+section and from the next one was not given to you: do not describe its contents.
 
-${contents}`;
+${contents}${renderImported(context.imported)}`;
+}
+var renderFile = (file) => `### ${file.path}
+
+\`\`\`
+${file.numbered}
+\`\`\``;
+function renderImported(files) {
+  if (files.length === 0) return "";
+  return `
+
+## Context files, NOT modified by this PR
+
+These are here so you can settle a question instead of asking it: what a caller expects, what an
+enum actually contains, whether a helper counts characters or bytes. Same numbering, and you may
+cite them as evidence.
+
+**Do not review them.** Every finding must be about a changed file listed above. A defect that
+lives only in one of these files is out of scope: this PR did not introduce it, and its author
+did not ask. Use them to prove or to kill a doubt about the change itself.
+
+${files.map(renderFile).join("\n\n")}`;
+}
+
+// pr-review/src/passes.ts
+var PASS_HEADING = "## Trouvailles";
+var PASS_OUTPUT = `# What to return
+
+Return \`${PASS_HEADING}\` followed by one bullet per finding, in French, nothing else. No verdict,
+no summary, no closing paragraph: another pass writes those.
+
+${PASS_HEADING}
+- [bloquant] \`chemin/fichier.ts:42\` : ce qui casse, et ce que \xE7a produit ici.
+- [corriger] \`chemin/fichier.tsx:17\` : \u2026
+- [suggestion] \`chemin/fichier.ts:88\` : \u2026
+- [doute] \`chemin/fichier.ts:120\` : ce que tu soup\xE7onnes sans pouvoir le prouver, et ce qu'il
+  faudrait regarder pour trancher.
+
+Labels, one per bullet:
+
+- **bloquant**: breaks production, loses or exposes data, leaks a secret or personal data, or
+  introduces a certain functional regression.
+- **corriger**: breaks a rule from the doctrine above, or a probable but undemonstrated bug.
+- **suggestion**: optional improvement, debt, test blind spot. A finding outside this PR's scope
+  goes here, labelled as such, and proposes opening an issue. It never blocks.
+- **doute**: what you cannot settle with the files you were given. Say what would settle it.
+  A doubt that the context files above DO settle is not a doubt: read them and conclude.
+
+No ceiling on this pass: report everything you found on your axis. Ranking happens later.
+
+Do not recite the rule, say what breaks HERE and what it produces. \xAB Cha\xEEne FR en dur \xBB is
+worthless; \xAB ce libell\xE9 de bouton est \xE9ditorial, il doit vivre dans le contenu sinon il \xE9chappe \xE0
+l'admin et \xE0 la traduction \xBB is worth something.
+
+Never use an em dash. The merge pass is told not to rewrite your wording, so anything you write
+here reaches the posted comment as is.
+
+Found nothing? Return \`${PASS_HEADING}\` and a single bullet \xAB - [rien] : \xBB followed by what you
+actually checked to be able to say it. Never an empty section.`;
+var PASSES = [
+  {
+    id: "regression",
+    label: "r\xE9gression fonctionnelle",
+    objective: `# Your one job in this pass: functional regressions
+
+You are not looking at conventions, style, or data access. Another pass covers those. You are
+looking for code that will misbehave at runtime. Walk these deliberately, on every changed file.
+None of them is visible in a diff read line by line, which is exactly why they survive until
+production.
+
+1. **The caller's side.** A changed signature, return shape, thrown error or nullability breaks
+   whoever calls it. The context files include what the changed files import: use them. When the
+   caller is genuinely absent from your context, report a doubt.
+2. **Error paths.** What happens when this throws, returns null, times out, or gets an empty
+   list? An error caught, logged and swallowed is a silent failure: the feature is dead and
+   nobody is told.
+3. **Edge inputs.** Empty, zero, one element, duplicates, very large. Boundaries of a loop, a
+   slice, a pagination. Off-by-one on both ends.
+4. **State and ordering.** Two runs racing, a retry replaying a side effect, a cache or a ledger
+   written before the thing it records actually succeeded, a missing await.
+5. **What the change forgot.** A rename applied in two places out of three, a new branch with no
+   test, a migration with no way back, a flag read but never set.`
+  },
+  {
+    id: "doctrine",
+    label: "doctrine du d\xE9p\xF4t",
+    objective: `# Your one job in this pass: the repository's own rules
+
+Judge this PR against the doctrine quoted above, and against nothing else. Other passes cover
+runtime bugs and data access; a remark of yours that does not trace back to a written rule of
+this repository does not belong in this pass.
+
+- Go rule by rule through the doctrine, and check the changed files against each one that
+  applies. A rule nobody checks is a rule that decays.
+- **Quote the rule you are applying**, in a few words, so the author can tell a project rule from
+  a personal habit. If you cannot point to the rule, you are inventing it.
+- Silence is a claim here too: if the PR respects the doctrine, say which rules you actually
+  checked it against.
+- Ignore formatting and style that lint and Prettier already settle. A doctrine is what a linter
+  cannot enforce.
+
+If this repository ships no doctrine, say so in a single \xAB - [rien] : \xBB bullet and stop. Do not
+substitute your own conventions for the ones it did not write.`
+  },
+  {
+    id: "data",
+    label: "donn\xE9es et acc\xE8s",
+    objective: `# Your one job in this pass: data, secrets, and access boundaries
+
+Not runtime bugs, not conventions. Who can read what, and what escapes to where.
+
+1. **Role boundaries.** A query that returns rows the caller has no right to see. A filter on
+   tenant, owner or role that the change dropped, widened, or moved after the fetch instead of
+   into it. An admin path reachable without the check.
+2. **Secrets.** A key, token or password reaching a log, an error message, a client bundle, a URL
+   or a third party. A secret read from the wrong place, or committed.
+3. **Personal data.** An email, a phone number, an address, an IP in a log line, an analytics
+   payload, a redirect, or a message to an external service. Ask what the recipient can see.
+4. **Trust in inputs.** Data from a request used unvalidated in a query, a path, a redirect, a
+   command, or rendered as HTML.
+5. **What the endpoint exposes.** A new route, field or serializer that widens what leaves the
+   server. Compare with what the previous shape returned.
+
+Prove it from what you were given: a boundary crossing you cannot see in the excerpts is a
+\xAB doute \xBB, with the file that would settle it named.`
+  }
+];
+function buildPassSystemPrompt(pass, options) {
+  return `${buildPreamble(options)}
+
+${pass.objective}
+
+${PASS_OUTPUT}`;
+}
+var OUTPUT_TEMPLATE = `## Verdict
+Une seule phrase : ce que tu retiens de cette PR.
+
+## Bloquant
+- \`chemin/fichier.ts:42\` : ce qui casse, et pourquoi ici.
+
+## \xC0 corriger
+- \`chemin/fichier.tsx:17\` : \u2026
+
+## Suggestions
+- \`chemin/fichier.ts:88\` : \u2026
+
+## \xC0 v\xE9rifier
+- \`chemin/fichier.ts:120\` : ce que tu soup\xE7onnes sans pouvoir le prouver ici, et ce qu'il
+  faudrait regarder pour trancher.`;
+function buildMergeSystemPrompt(options) {
+  return `Three reviewers have just read the same pull request on \`${options.repo}\`, each on one axis:
+functional regressions, the repository's own conventions, and data access. You are assembling
+their findings into the single comment that gets posted on the PR.
+
+**You do not have the code.** You only have what they wrote. So:
+
+- Never add a finding. If it is not in their lists, it does not exist.
+- Never invent a line number, a path, or a detail to make a bullet sound firmer. Keep the
+  \`path:line\` they wrote, exactly as they wrote it.
+- When a bullet is too vague to be useful, keep it as is or drop it. Do not complete it.
+
+# What to do with their findings
+
+1. **Deduplicate.** Two reviewers describe the same defect in different words: keep one bullet,
+   the one that says best what breaks and what it produces. Two defects in the same file are not
+   duplicates.
+2. **Arbitrate the label.** They each judged on their own axis and could not see the others. A
+   \xAB corriger \xBB that turns out to lose data is \xAB Bloquant \xBB. A \xAB bloquant \xBB resting on an
+   unverified assumption belongs under \xAB \xC0 v\xE9rifier \xBB.
+3. **Rank, then cut.** ${options.maxFindings} bullets maximum across Bloquant, \xC0 corriger and
+   Suggestions, plus at most five under \xC0 v\xE9rifier. Past that nobody reads. Keep the costly ones.
+   **When you cut, say so in the Verdict**: this ceiling ranks findings, it never justifies
+   dropping one in silence.
+4. **Drop the \xAB rien \xBB bullets**, but remember what they checked: that is what makes a
+   \xAB Rien \xE0 signaler \xBB credible.
+
+# Expected output
+
+Return exactly these five sections, in this order, as markdown, and nothing before them.
+
+${OUTPUT_TEMPLATE}
+
+- A section with nothing in it says what was checked, on the same line:
+  \xAB Rien \xE0 signaler (chemins d'erreur et valeurs de retour relus) \xBB. Take that from what the
+  reviewers said they checked. If they said nothing, write \xAB Rien \xE0 signaler \xBB.
+- No summary of the PR, no compliments, no closing paragraph. The author wrote it.
+- Write in French. Never use an em dash.`;
+}
+function buildMergeUserPrompt(meta, results) {
+  const blocks = results.map((result) => `## Reviewer: ${result.pass.label}
+
+${result.findings.trim()}`).join("\n\n");
+  const fileList = meta.files.map((file) => `- ${file.path} (+${file.additions} / -${file.deletions}, ${file.status})`).join("\n");
+  return `# PR #${meta.number} \u2014 ${meta.title}
+
+## Author's description
+
+${meta.body.trim() || "(empty)"}
+
+## Files changed by this PR
+
+Every finding you keep must be about one of these. A path that is not in this list came from a
+context file, which this PR does not touch: drop that finding.
+
+${fileList}
+
+# What the reviewers found
+
+${blocks}`;
 }
 
 // pr-review/src/render.ts
 var MARKER = "<!-- ollama-review -->";
 var FIRST_HEADING = "## Verdict";
 var MAX_LENGTH = 12e3;
-function extractReview(content) {
+function extractReview(content, heading = FIRST_HEADING) {
   const withoutTags = content.replace(/<(think|thinking)>[\s\S]*?<\/\1>/gi, "").trim();
-  const start = withoutTags.lastIndexOf(FIRST_HEADING);
+  const start = withoutTags.lastIndexOf(heading);
   if (start !== -1) return withoutTags.slice(start).trim();
   if (withoutTags.length > MAX_LENGTH) {
     return `_Le mod\xE8le n'a pas suivi le gabarit. Fin de sa r\xE9ponse, tronqu\xE9e :_
@@ -721,13 +998,25 @@ function renderFooter(footer) {
   if (footer.thinkingChars > 0) {
     bits.push(`${count(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
   }
+  if (footer.imported > 0) {
+    bits.push(`${footer.imported} fichier(s) import\xE9s joints en contexte`);
+  }
   if (footer.skipped.length > 0) {
     bits.push(`${footer.skipped.length} fichier(s) g\xE9n\xE9r\xE9s ignor\xE9s`);
   }
   if (footer.omitted.length > 0) {
     bits.push(`diff seul (sans contexte complet) pour ${footer.omitted.join(", ")}`);
   }
+  if (footer.failedPasses.length > 0) {
+    const quoted = footer.failedPasses.map((pass) => `\xAB ${pass} \xBB`);
+    const plural = quoted.length > 1 ? "s" : "";
+    bits.push(`\u26A0 passe${plural} ${enumerate(quoted)} non aboutie${plural}`);
+  }
   return `<sub>${bits.join(" \xB7 ")}</sub>`;
+}
+function enumerate(items) {
+  if (items.length < 2) return items.join("");
+  return `${items.slice(0, -1).join(", ")} et ${items[items.length - 1]}`;
 }
 function renderComment(input) {
   const body = linkifyPaths(extractReview(input.review), input);
@@ -735,6 +1024,22 @@ function renderComment(input) {
 ## Review automatique
 
 ${body}
+
+---
+
+${renderFooter(input.footer)}`;
+}
+function renderPartialComment(input) {
+  const blocks = input.passes.map((pass) => `### ${pass.label}
+
+${linkifyPaths(pass.findings.trim(), input)}`).join("\n\n");
+  return `${MARKER}
+## Review automatique
+
+_La synth\xE8se n'a pas pu \xEAtre produite (${input.reason}). Voici les trouvailles brutes des passes qui
+ont abouti : ni tri\xE9es, ni d\xE9dupliqu\xE9es, ni plafonn\xE9es._
+
+${blocks}
 
 ---
 
@@ -790,6 +1095,53 @@ async function keyFrom1Password() {
     return "";
   }
 }
+async function callModel(config, run2, args) {
+  let result;
+  try {
+    result = await chat({
+      apiKey: config.apiKey,
+      model: config.model,
+      system: args.system,
+      user: args.user,
+      think: args.think,
+      temperature: config.temperature,
+      seed: config.seed,
+      timeoutMs: config.timeoutMs,
+      onRetry: (reason) => console.warn(`\u26A0 [${args.label}] ${reason} \u2014 nouvelle tentative dans 20 s.`),
+      onDowngrade: (reason) => console.warn(
+        `\u26A0 [${args.label}] ${config.model} n'a pas accept\xE9 \xAB thinking: ${args.think} \xBB (${reason}).
+  Relanc\xE9 sans raisonnement explicite : ce sera moins fouill\xE9.`
+      )
+    });
+  } catch (error) {
+    const reason = error instanceof OllamaError ? error.message : String(error);
+    console.error(`\u2717 ${args.label} : ${reason}`);
+    run2.failures.push(reason);
+    return null;
+  }
+  run2.promptTokens += result.promptTokens;
+  run2.evalTokens += result.evalTokens;
+  run2.thinkingChars += result.thinkingChars;
+  console.log(
+    `\u2713 ${args.label} en ${Math.round(result.durationMs / 1e3)} s (${result.promptTokens} tokens en entr\xE9e, ${result.evalTokens} en sortie).`
+  );
+  return result;
+}
+async function runPasses(config, run2, promptOptions, user) {
+  const results = await Promise.all(
+    PASSES.map(async (pass) => {
+      const result = await callModel(config, run2, {
+        system: buildPassSystemPrompt(pass, promptOptions),
+        user,
+        think: config.thinking,
+        label: `passe ${pass.label}`
+      });
+      if (result === null) return null;
+      return { pass, findings: extractReview(result.content, PASS_HEADING) };
+    })
+  );
+  return results.filter((result) => result !== null);
+}
 async function review(config) {
   const root = repoRoot();
   console.log(`Lecture de la PR #${config.pr}\u2026`);
@@ -803,12 +1155,25 @@ async function review(config) {
     rawDiff,
     prFiles: meta.files,
     isSkipped: compileMatcher(config.skip),
-    budget: { totalChars: config.budgetChars, perFileChars: config.perFileChars },
+    budget: {
+      totalChars: config.budgetChars,
+      perFileChars: config.perFileChars,
+      importedChars: config.importsBudgetChars
+    },
     readFile: (path) => {
       try {
         return readFileSync(join(root, path), "utf-8");
       } catch {
         return null;
+      }
+    },
+    // Un dossier n'est pas un fichier : sans ce test, `./composants` résoudrait
+    // vers le dossier lui-même et on raterait son `index.ts`.
+    exists: (path) => {
+      try {
+        return statSync(join(root, path), { throwIfNoEntry: false })?.isFile() ?? false;
+      } catch {
+        return false;
       }
     }
   });
@@ -816,55 +1181,56 @@ async function review(config) {
     console.log("Aucun fichier relisible dans cette PR (g\xE9n\xE9r\xE9s, binaires ou lockfiles seulement).");
     return;
   }
-  const system = buildSystemPrompt({
+  const promptOptions = {
     repo,
     projectSummary: config.projectSummary,
-    doctrine: readDoctrine(root, config.doctrine),
-    maxFindings: config.maxFindings
-  });
+    doctrine: readDoctrine(root, config.doctrine)
+  };
   const user = buildUserPrompt(meta, context);
   console.log(
-    `Contexte : ${context.files.length} fichier(s) en int\xE9gral, ${Math.round((system.length + user.length) / 1024)} Ko envoy\xE9s \xE0 ${config.model}.`
+    `Contexte : ${context.files.length} fichier(s) touch\xE9s, ${context.imported.length} import\xE9(s), ~${Math.round(user.length / 1024)} Ko par passe, ${PASSES.length} passes + fusion (${config.model}).`
   );
-  let result;
-  try {
-    result = await chat({
-      apiKey: config.apiKey,
-      model: config.model,
-      system,
-      user,
-      think: config.thinking,
-      temperature: config.temperature,
-      seed: config.seed,
-      timeoutMs: config.timeoutMs,
-      onRetry: (reason) => console.warn(`\u26A0 ${reason} \u2014 nouvelle tentative dans 20 s.`),
-      onDowngrade: (reason) => console.warn(
-        `\u26A0 ${config.model} n'a pas accept\xE9 \xAB thinking: ${config.thinking} \xBB (${reason}).
-  Review relanc\xE9e sans raisonnement explicite : elle sera moins fouill\xE9e.`
-      )
-    });
-  } catch (error) {
-    const reason = error instanceof OllamaError ? error.message : String(error);
-    console.error(`\xC9chec de la review : ${reason}`);
+  const started = Date.now();
+  const run2 = { promptTokens: 0, evalTokens: 0, thinkingChars: 0, failures: [] };
+  const outcomes = await runPasses(config, run2, promptOptions, user);
+  if (outcomes.length === 0) {
+    const reason = run2.failures[0] ?? "raison inconnue";
+    console.error(`\xC9chec de la review : aucune passe n'a abouti (${reason}).`);
     if (!config.dryRun) await postComment(config.pr, renderFailureComment(reason, config.model));
     return;
   }
+  const merged = await callModel(config, run2, {
+    system: buildMergeSystemPrompt({ repo, maxFindings: config.maxFindings }),
+    user: buildMergeUserPrompt(meta, outcomes),
+    think: config.mergeThinking,
+    label: "fusion"
+  });
   const server = (process.env.GITHUB_SERVER_URL ?? "https://github.com").replace(/\/$/, "");
-  const comment = renderComment({
-    review: result.content,
+  const shared = {
     repoUrl: `${server}/${repo}`,
     headSha: meta.headSha,
-    knownPaths: new Set(meta.files.map((file) => file.path)),
+    // Les fichiers importés sont de vrais fichiers du dépôt : les lier est juste.
+    // Le filtre garde son rôle contre les chemins que le modèle invente.
+    knownPaths: knownPaths(meta, context),
     footer: {
       model: config.model,
-      durationMs: result.durationMs,
-      promptTokens: result.promptTokens,
-      evalTokens: result.evalTokens,
-      thinkingChars: result.thinkingChars,
+      durationMs: Date.now() - started,
+      promptTokens: run2.promptTokens,
+      evalTokens: run2.evalTokens,
+      thinkingChars: run2.thinkingChars,
       skipped: context.skipped,
-      omitted: context.omitted
+      omitted: context.omitted,
+      imported: context.imported.length,
+      failedPasses: PASSES.filter((pass) => !outcomes.some((outcome) => outcome.pass === pass)).map(
+        (pass) => pass.label
+      )
     }
-  });
+  };
+  const comment = merged === null ? renderPartialComment({
+    ...shared,
+    reason: run2.failures.at(-1) ?? "raison inconnue",
+    passes: outcomes.map((outcome) => ({ label: outcome.pass.label, findings: outcome.findings }))
+  }) : renderComment({ ...shared, review: merged.content });
   if (config.dryRun) {
     console.log("\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 review (dry-run, non post\xE9e) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n");
     console.log(comment);
@@ -872,6 +1238,12 @@ async function review(config) {
   }
   await postComment(config.pr, comment);
   console.log(`Review post\xE9e sur la PR #${config.pr}.`);
+}
+function knownPaths(meta, context) {
+  return /* @__PURE__ */ new Set([
+    ...meta.files.map((file) => file.path),
+    ...context.imported.map((file) => file.path)
+  ]);
 }
 async function main() {
   const config = resolveConfig({

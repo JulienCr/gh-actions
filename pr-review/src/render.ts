@@ -24,15 +24,19 @@ const MAX_LENGTH = 12_000;
  * `<think>…</think>` ne suffisait donc pas : le seul repère fiable est le
  * gabarit qu'on impose.
  *
- * On coupe à la DERNIÈRE occurrence de « ## Verdict », pas à la première : le
+ * On coupe à la DERNIÈRE occurrence du titre, pas à la première : le
  * raisonnement cite volontiers le gabarit avant de le remplir. Et la recherche
  * n'est pas ancrée en début de ligne, parce que le modèle a écrit
  * « OK, final review:## Verdict » d'un seul tenant.
+ *
+ * `heading` est paramétrable parce qu'une passe de review rend `## Trouvailles`
+ * et non `## Verdict` : c'est le même raisonnement à couper au même endroit, il
+ * n'y avait pas de raison d'en écrire une seconde version.
  */
-export function extractReview(content: string): string {
+export function extractReview(content: string, heading: string = FIRST_HEADING): string {
   const withoutTags = content.replace(/<(think|thinking)>[\s\S]*?<\/\1>/gi, '').trim();
 
-  const start = withoutTags.lastIndexOf(FIRST_HEADING);
+  const start = withoutTags.lastIndexOf(heading);
   if (start !== -1) return withoutTags.slice(start).trim();
 
   // Sans repère, on ne peut pas distinguer la review du reste. Plutôt que de
@@ -101,6 +105,16 @@ export interface Footer {
   skipped: string[];
   /** Fichiers dont seul le diff a été envoyé, faute de place. */
   omitted: string[];
+  /**
+   * Nombre de fichiers joints parce qu'un fichier touché les importe.
+   *
+   * Annoncé au même titre qu'une troncature : une review qui a vu plus que la PR
+   * doit le dire, sans quoi le lecteur ne comprend pas d'où sort une affirmation
+   * sur un fichier absent du diff.
+   */
+  imported: number;
+  /** Passes qui n'ont pas abouti. Une review partielle doit se déclarer. */
+  failedPasses: string[];
 }
 
 function formatDuration(ms: number): string {
@@ -120,6 +134,9 @@ function renderFooter(footer: Footer): string {
   if (footer.thinkingChars > 0) {
     bits.push(`${count(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
   }
+  if (footer.imported > 0) {
+    bits.push(`${footer.imported} fichier(s) importés joints en contexte`);
+  }
   if (footer.skipped.length > 0) {
     bits.push(`${footer.skipped.length} fichier(s) générés ignorés`);
   }
@@ -127,7 +144,18 @@ function renderFooter(footer: Footer): string {
     // Dit explicitement : une review partielle ne doit pas se lire comme une review complète.
     bits.push(`diff seul (sans contexte complet) pour ${footer.omitted.join(', ')}`);
   }
+  if (footer.failedPasses.length > 0) {
+    const quoted = footer.failedPasses.map((pass) => `« ${pass} »`);
+    const plural = quoted.length > 1 ? 's' : '';
+    bits.push(`⚠ passe${plural} ${enumerate(quoted)} non aboutie${plural}`);
+  }
   return `<sub>${bits.join(' · ')}</sub>`;
+}
+
+/** Une énumération française : virgules, puis « et » devant le dernier terme. */
+function enumerate(items: string[]): string {
+  if (items.length < 2) return items.join('');
+  return `${items.slice(0, -1).join(', ')} et ${items[items.length - 1]}`;
 }
 
 export interface CommentInput extends LinkifyOptions {
@@ -141,6 +169,39 @@ export function renderComment(input: CommentInput): string {
 ## Review automatique
 
 ${body}
+
+---
+
+${renderFooter(input.footer)}`;
+}
+
+export interface PartialCommentInput extends LinkifyOptions {
+  /** Les trouvailles brutes, une entrée par passe qui a abouti. */
+  passes: { label: string; findings: string }[];
+  reason: string;
+  footer: Footer;
+}
+
+/**
+ * Commentaire posté quand les passes ont abouti mais pas leur fusion.
+ *
+ * Trois lectures déjà payées ne sont pas jetées parce que le tri a échoué : on
+ * les rend telles quelles, en disant qu'elles n'ont été ni dédupliquées ni
+ * classées. C'est moins lisible qu'une review, et c'est très au-dessus du
+ * silence, que ce programme refuse (cf. l'en-tête de `index.ts`).
+ */
+export function renderPartialComment(input: PartialCommentInput): string {
+  const blocks = input.passes
+    .map((pass) => `### ${pass.label}\n\n${linkifyPaths(pass.findings.trim(), input)}`)
+    .join('\n\n');
+
+  return `${MARKER}
+## Review automatique
+
+_La synthèse n'a pas pu être produite (${input.reason}). Voici les trouvailles brutes des passes qui
+ont abouti : ni triées, ni dédupliquées, ni plafonnées._
+
+${blocks}
 
 ---
 

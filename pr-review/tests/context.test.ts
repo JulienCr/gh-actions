@@ -24,10 +24,18 @@ const file = (path: string, over: Partial<PrFile> = {}): PrFile => ({
 /** Le plancher plus les motifs qu'un dépôt ajouterait par l'input « skip ». */
 const isSkipped = compileMatcher([...ALWAYS_SKIPPED, 'src/generated/**', 'deploy/**']);
 
-const BUDGET: ContextBudget = { totalChars: 500_000, perFileChars: 80_000 };
+const BUDGET: ContextBudget = { totalChars: 500_000, perFileChars: 80_000, importedChars: 300_000 };
 
 const assemble = (over: Partial<AssembleOptions>) =>
-  assembleContext({ rawDiff: '', prFiles: [], readFile: () => null, isSkipped, budget: BUDGET, ...over });
+  assembleContext({
+    rawDiff: '',
+    prFiles: [],
+    readFile: () => null,
+    exists: () => false,
+    isSkipped,
+    budget: BUDGET,
+    ...over,
+  });
 
 describe('le prédicat d’exclusion, une fois câblé sur les inputs', () => {
   it('garde le code, le contenu éditorial et la config', () => {
@@ -142,7 +150,7 @@ describe('assembleContext', () => {
       rawDiff: DIFF,
       prFiles: [file('src/a.ts')],
       readFile: () => 'x'.repeat(500),
-      budget: { totalChars: 1000, perFileChars: 100 },
+      budget: { ...BUDGET, totalChars: 1000, perFileChars: 100 },
     });
     expect(context.files).toHaveLength(0);
     expect(context.omitted).toEqual(['src/a.ts']);
@@ -152,7 +160,7 @@ describe('assembleContext', () => {
     const context = assemble({
       prFiles: [file('a.ts', { additions: 1 }), file('b.ts', { additions: 2 })],
       readFile: () => 'y'.repeat(60),
-      budget: { totalChars: 100, perFileChars: 100 },
+      budget: { ...BUDGET, totalChars: 100, perFileChars: 100 },
     });
     expect(context.files.map((entry) => entry.path)).toEqual(['a.ts']);
     expect(context.omitted).toEqual(['b.ts']);
@@ -164,5 +172,67 @@ describe('assembleContext', () => {
       readFile: () => 'z',
     });
     expect(context.files.map((entry) => entry.path)).toEqual(['gros.ts', 'petit.ts']);
+  });
+});
+
+describe('les fichiers importés, joints en second rang', () => {
+  /** Une PR d'un fichier qui importe un helper et un schéma du dépôt. */
+  const REPO: Record<string, string> = {
+    'src/app/page.tsx': "import { truncate } from '@/lib/format';\nimport { STATUS } from './status';\n",
+    'src/lib/format.ts': 'export const truncate = (s: string) => s.slice(0, 10);\n',
+    'src/app/status.ts': 'export const STATUS = ["draft"];\n',
+    'src/generated/prisma.ts': 'export const client = {};\n',
+  };
+
+  const imported = (over: Partial<AssembleOptions> = {}) =>
+    assemble({
+      prFiles: [file('src/app/page.tsx')],
+      readFile: (path) => REPO[path] ?? null,
+      exists: (path) => path in REPO,
+      ...over,
+    }).imported.map((entry) => entry.path);
+
+  it('joint ce que les fichiers touchés importent, alias compris', () => {
+    expect(imported()).toEqual(['src/lib/format.ts', 'src/app/status.ts']);
+  });
+
+  it('numérote les lignes, pour que le modèle puisse citer un chemin:ligne juste', () => {
+    const context = assemble({
+      prFiles: [file('src/app/page.tsx')],
+      readFile: (path) => REPO[path] ?? null,
+      exists: (path) => path in REPO,
+    });
+    expect(context.imported[0]?.numbered).toBe('1| export const truncate = (s: string) => s.slice(0, 10);');
+  });
+
+  it('ne joint rien quand le budget est à zéro', () => {
+    expect(imported({ budget: { ...BUDGET, importedChars: 0 } })).toEqual([]);
+  });
+
+  it('laisse au contexte importé un budget à lui, que la PR ne peut pas manger', () => {
+    // Le budget des fichiers touchés est épuisé ; celui des imports ne l'est pas.
+    const context = assemble({
+      prFiles: [file('src/app/page.tsx')],
+      readFile: (path) => REPO[path] ?? null,
+      exists: (path) => path in REPO,
+      budget: { ...BUDGET, totalChars: 10_000, importedChars: 60 },
+    });
+    // 55 caractères tiennent, le second dépasse : pas de liste des recalés, le
+    // contexte importé n'a jamais été promis au lecteur.
+    expect(context.imported.map((entry) => entry.path)).toEqual(['src/app/status.ts']);
+  });
+
+  it('respecte les exclusions du dépôt', () => {
+    expect(
+      imported({
+        readFile: (path) => (path === 'src/app/page.tsx' ? "import x from '@/generated/prisma';" : REPO[path] ?? null),
+      }),
+    ).toEqual([]);
+  });
+
+  it('ne rejoint pas un fichier déjà fourni parce qu’il est dans la PR', () => {
+    expect(imported({ prFiles: [file('src/app/page.tsx'), file('src/lib/format.ts')] })).toEqual([
+      'src/app/status.ts',
+    ]);
   });
 });
