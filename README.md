@@ -63,7 +63,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', inputs.pr) }}
 
-      - uses: JulienCr/gh-actions/pr-review@v1
+      - uses: JulienCr/gh-actions/pr-review@v2
         with:
           pr: ${{ github.event.pull_request.number || inputs.pr }}
           ollama-api-key: ${{ secrets.OLLAMA_API_KEY }}
@@ -220,11 +220,11 @@ input casserait l'extraction, c'est pourquoi il n'y en a pas.
 Sans rien installer dans le dépôt relu, depuis sa racine :
 
 ```bash
-npx --yes -p 'github:JulienCr/gh-actions#v1' pr-review 154 --dry-run
-npx --yes -p 'github:JulienCr/gh-actions#v1' pr-review 154 --model qwen3-coder:480b-cloud --dry-run
+npx --yes -p 'github:JulienCr/gh-actions#v2' pr-review 154 --dry-run
+npx --yes -p 'github:JulienCr/gh-actions#v2' pr-review 154 --model qwen3-coder:480b-cloud --dry-run
 ```
 
-Le `#v1` n'est pas décoratif : sans lui, npx prend la branche par défaut, et un réglage validé en
+Le `#v2` n'est pas décoratif : sans lui, npx prend la branche par défaut, et un réglage validé en
 local tournerait sur un prompt différent de celui de la CI. Épingle la même version des deux côtés.
 
 Corollaire utile : une version passée sert de point de comparaison. `#v1.1.0` est la dernière à
@@ -252,18 +252,36 @@ pnpm build         # régénère les bundles dans <action>/dist/
 
 `<action>/dist/index.mjs` est **committé** : le runner l'exécute tel quel, sans jamais installer
 ni builder. La CI vérifie que le bundle correspond aux sources ; sans cette garde, une
-modification de `src/` publiée sans rebuild ferait distribuer l'ancien bundle par le tag `v1`, en
+modification de `src/` publiée sans rebuild ferait distribuer l'ancien bundle par le tag majeur, en
 silence et à tous les dépôts.
 
 ### Publier une version
 
 ```bash
-git tag v1.0.1 && git push origin v1.0.1
+git tag v2.0.1 && git push origin v2.0.1
 ```
 
 Le workflow `release.yml` rejoue les tests et la garde du bundle, puis déplace le tag majeur
-`v1`. Les dépôts épinglés sur `@v1` prennent la correction à leur prochaine PR, sans rien
-changer chez eux. `@v1.0.1` pour figer une version précise.
+`v2`. Les dépôts épinglés sur `@v2` prennent la correction à leur prochaine PR, sans rien
+changer chez eux. `@v2.0.1` pour figer une version précise.
 
-Une rupture de compatibilité (input retiré ou renommé, comportement par défaut inversé) passe en
-`v2` : `v1` reste où il est et les dépôts migrent quand ils veulent.
+Une rupture de compatibilité (input retiré ou renommé, comportement par défaut inversé) passe au
+majeur suivant : le précédent reste où il est et les dépôts migrent quand ils veulent.
+
+### Migrer de `v1` à `v2`
+
+`v1` relit en un seul appel et n'envoie que les fichiers touchés. `v2` découpe en trois passes plus
+une fusion, et joint les fichiers importés. Deux choses à changer dans le workflow du dépôt :
+
+```yaml
+    timeout-minutes: 40                        # 25 ne suffit plus
+    steps:
+      - uses: JulienCr/gh-actions/pr-review@v2 # au lieu de @v1
+```
+
+Le `timeout-minutes` n'est pas optionnel : le mur vaut désormais « passe la plus lente plus la
+fusion », et un job resté à 25 minutes se fait tuer à mi-review. Aucun input n'a été retiré ni
+renommé, le reste de la configuration se reprend tel quel. Compter environ quatre fois plus de
+tokens en entrée par PR : c'est le prix du découpage, le contexte partant à chaque passe.
+
+Pour rester sur l'ancien comportement, `@v1` continue de fonctionner et ne bougera plus.
