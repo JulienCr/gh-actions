@@ -74,6 +74,14 @@ Aucune dépendance à installer : l'action n'importe que des builtins Node et pi
 CLI `gh`, déjà présent sur le runner. Le job reste donc vert même quand le lockfile de la branche
 est cassé, c'est-à-dire précisément quand une review sert.
 
+⚠️ **Une PR en conflit ne déclenche aucun workflow `pull_request`.** GitHub ne sait pas calculer
+son commit de merge, donc il n'émet pas l'événement. Copilot, lui, passe par un autre mécanisme et
+tourne quand même, ce qui rend l'asymétrie déroutante. Si la review ne part pas sur une PR neuve,
+vérifier `gh pr view <n> --json mergeable` avant de suspecter le YAML : rebaser suffit. Corollaire,
+`synchronize` n'étant pas dans les types écoutés, relancer la review après un rebase se fait par
+`workflow_dispatch`, ou en repassant la PR en brouillon puis en « prêt »
+(`gh pr ready --undo <n> && gh pr ready <n>`).
+
 ### Inputs
 
 Seul `pr` est obligatoire.
@@ -140,9 +148,12 @@ input casserait l'extraction, c'est pourquoi il n'y en a pas.
 Sans rien installer dans le dépôt relu, depuis sa racine :
 
 ```bash
-npx --yes -p github:JulienCr/gh-actions pr-review 154 --dry-run
-npx --yes -p github:JulienCr/gh-actions pr-review 154 --model qwen3-coder:480b-cloud --dry-run
+npx --yes -p 'github:JulienCr/gh-actions#v1' pr-review 154 --dry-run
+npx --yes -p 'github:JulienCr/gh-actions#v1' pr-review 154 --model qwen3-coder:480b-cloud --dry-run
 ```
+
+Le `#v1` n'est pas décoratif : sans lui, npx prend la branche par défaut, et un réglage validé en
+local tournerait sur un prompt différent de celui de la CI. Épingle la même version des deux côtés.
 
 La clé se prend dans `OLLAMA_API_KEY`, sinon dans 1Password à la référence `OLLAMA_API_KEY_REF`
 (défaut `op://Personal/Ollama/add more/api_key`), pour qu'elle ne traîne ni dans un `.env` ni

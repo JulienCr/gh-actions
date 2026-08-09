@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "pr-review": "pr-review/dist/index.js"
+    "pr-review": "pr-review/dist/index.mjs"
   },
   "files": [
     "pr-review/dist",
