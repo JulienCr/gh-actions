@@ -69,6 +69,12 @@ describe('les trois passes', () => {
     expect(buildPassSystemPrompt(pass('doctrine'), OPTIONS)).toContain('Never an empty section');
   });
 
+  it('portent les règles de forme que la fusion ne corrigera pas à leur place', () => {
+    // La fusion a consigne de ne pas réécrire une trouvaille : ce qu'une passe
+    // écrit arrive tel quel dans le commentaire posté.
+    expect(buildPassSystemPrompt(pass('regression'), OPTIONS)).toContain('Never use an em dash');
+  });
+
   it('renvoient un doute que les fichiers de contexte tranchent à sa conclusion', () => {
     expect(buildPassSystemPrompt(pass('data'), OPTIONS)).toContain(
       'A doubt that the context files above DO settle is not a doubt',

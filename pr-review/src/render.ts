@@ -145,9 +145,17 @@ function renderFooter(footer: Footer): string {
     bits.push(`diff seul (sans contexte complet) pour ${footer.omitted.join(', ')}`);
   }
   if (footer.failedPasses.length > 0) {
-    bits.push(`⚠ passe ${footer.failedPasses.map((pass) => `« ${pass} »`).join(' et ')} non aboutie`);
+    const quoted = footer.failedPasses.map((pass) => `« ${pass} »`);
+    const plural = quoted.length > 1 ? 's' : '';
+    bits.push(`⚠ passe${plural} ${enumerate(quoted)} non aboutie${plural}`);
   }
   return `<sub>${bits.join(' · ')}</sub>`;
+}
+
+/** Une énumération française : virgules, puis « et » devant le dernier terme. */
+function enumerate(items: string[]): string {
+  if (items.length < 2) return items.join('');
+  return `${items.slice(0, -1).join(', ')} et ${items[items.length - 1]}`;
 }
 
 export interface CommentInput extends LinkifyOptions {

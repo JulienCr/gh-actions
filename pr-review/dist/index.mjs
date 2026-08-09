@@ -12,10 +12,12 @@ var PATTERNS = [
   /\bfrom\s*['"]([^'"\n]+)['"]/g,
   // import 'y' (effet de bord : feuille de style, polyfill)
   /\bimport\s+['"]([^'"\n]+)['"]/g,
-  // import('y')
-  /\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g,
+  // import('y'), et import('y', { with: { type: 'json' } }) : la parenthèse
+  // fermante n'est pas exigée, sans quoi un import à attributs serait raté et
+  // le fichier ne serait jamais joint.
+  /\bimport\s*\(\s*['"]([^'"\n]+)['"]/g,
   // require('y')
-  /\brequire\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g
+  /\brequire\s*\(\s*['"]([^'"\n]+)['"]/g
 ];
 function isInternal(specifier) {
   return specifier.startsWith("./") || specifier.startsWith("../") || specifier.startsWith("@/");
@@ -792,6 +794,9 @@ Do not recite the rule, say what breaks HERE and what it produces. \xAB Cha\xEEn
 worthless; \xAB ce libell\xE9 de bouton est \xE9ditorial, il doit vivre dans le contenu sinon il \xE9chappe \xE0
 l'admin et \xE0 la traduction \xBB is worth something.
 
+Never use an em dash. The merge pass is told not to rewrite your wording, so anything you write
+here reaches the posted comment as is.
+
 Found nothing? Return \`${PASS_HEADING}\` and a single bullet \xAB - [rien] : \xBB followed by what you
 actually checked to be able to say it. Never an empty section.`;
 var PASSES = [
@@ -1003,9 +1008,15 @@ function renderFooter(footer) {
     bits.push(`diff seul (sans contexte complet) pour ${footer.omitted.join(", ")}`);
   }
   if (footer.failedPasses.length > 0) {
-    bits.push(`\u26A0 passe ${footer.failedPasses.map((pass) => `\xAB ${pass} \xBB`).join(" et ")} non aboutie`);
+    const quoted = footer.failedPasses.map((pass) => `\xAB ${pass} \xBB`);
+    const plural = quoted.length > 1 ? "s" : "";
+    bits.push(`\u26A0 passe${plural} ${enumerate(quoted)} non aboutie${plural}`);
   }
   return `<sub>${bits.join(" \xB7 ")}</sub>`;
+}
+function enumerate(items) {
+  if (items.length < 2) return items.join("");
+  return `${items.slice(0, -1).join(", ")} et ${items[items.length - 1]}`;
 }
 function renderComment(input) {
   const body = linkifyPaths(extractReview(input.review), input);

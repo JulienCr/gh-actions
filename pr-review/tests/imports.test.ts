@@ -39,6 +39,12 @@ describe('extractImports', () => {
     ]);
   });
 
+  it('lit un import dynamique porteur d’attributs, dont la chaîne n’est pas suivie de « ) »', () => {
+    expect(extractImports("const data = await import('./data.json', { with: { type: 'json' } });")).toEqual([
+      './data.json',
+    ]);
+  });
+
   it('ne rend qu’une fois un chemin importé deux fois', () => {
     const found = extractImports("import a from './x';\nimport b from './x';");
     expect(found).toEqual(['./x']);

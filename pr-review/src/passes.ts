@@ -54,6 +54,9 @@ Do not recite the rule, say what breaks HERE and what it produces. « Chaîne FR
 worthless; « ce libellé de bouton est éditorial, il doit vivre dans le contenu sinon il échappe à
 l'admin et à la traduction » is worth something.
 
+Never use an em dash. The merge pass is told not to rewrite your wording, so anything you write
+here reaches the posted comment as is.
+
 Found nothing? Return \`${PASS_HEADING}\` and a single bullet « - [rien] : » followed by what you
 actually checked to be able to say it. Never an empty section.`;
 

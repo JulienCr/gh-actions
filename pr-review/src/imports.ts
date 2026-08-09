@@ -40,10 +40,12 @@ const PATTERNS = [
   /\bfrom\s*['"]([^'"\n]+)['"]/g,
   // import 'y' (effet de bord : feuille de style, polyfill)
   /\bimport\s+['"]([^'"\n]+)['"]/g,
-  // import('y')
-  /\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g,
+  // import('y'), et import('y', { with: { type: 'json' } }) : la parenthèse
+  // fermante n'est pas exigée, sans quoi un import à attributs serait raté et
+  // le fichier ne serait jamais joint.
+  /\bimport\s*\(\s*['"]([^'"\n]+)['"]/g,
   // require('y')
-  /\brequire\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g,
+  /\brequire\s*\(\s*['"]([^'"\n]+)['"]/g,
 ];
 
 /** Un spécificateur qui désigne un fichier du dépôt, par opposition à un paquet npm. */

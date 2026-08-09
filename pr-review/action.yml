@@ -96,7 +96,10 @@ inputs:
     default: '20'
 
   budget-chars:
-    description: "Plafond global du contenu intégral envoyé au modèle, en caractères."
+    description: >-
+      Plafond du contenu intégral des fichiers TOUCHÉS, en caractères. Les
+      fichiers importés ont le leur, ci-dessous : ce n'est pas le total envoyé
+      au modèle.
     required: false
     default: '500000'
 

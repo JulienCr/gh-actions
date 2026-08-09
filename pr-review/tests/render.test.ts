@@ -141,6 +141,24 @@ describe('renderComment', () => {
     expect(comment).toContain('⚠ passe « données et accès » non aboutie');
   });
 
+  it('accorde au pluriel quand deux passes manquent, et énumère à la française', () => {
+    const comment = renderComment({
+      ...OPTIONS,
+      review: 'ok',
+      footer: { ...FOOTER, failedPasses: ['doctrine du dépôt', 'données et accès'] },
+    });
+    expect(comment).toContain('⚠ passes « doctrine du dépôt » et « données et accès » non abouties');
+  });
+
+  it('sépare par des virgules au-delà de deux, plutôt que d’enchaîner les « et »', () => {
+    const comment = renderComment({
+      ...OPTIONS,
+      review: 'ok',
+      footer: { ...FOOTER, failedPasses: ['a', 'b', 'c'] },
+    });
+    expect(comment).toContain('⚠ passes « a », « b » et « c » non abouties');
+  });
+
   it('nettoie la réflexion et pose les liens en une passe', () => {
     const comment = renderComment({
       ...OPTIONS,
