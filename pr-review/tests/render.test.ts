@@ -5,6 +5,7 @@ import {
   linkifyPaths,
   renderComment,
   renderFailureComment,
+  renderPartialComment,
 } from '../src/render';
 
 const OPTIONS = {
@@ -34,6 +35,13 @@ describe('extractReview', () => {
   it('coupe à la DERNIÈRE occurrence : le raisonnement cite le gabarit avant de le remplir', () => {
     const raw = 'Je dois produire ## Verdict puis Bloquant.\n\n## Verdict\nLa vraie.';
     expect(extractReview(raw)).toBe('## Verdict\nLa vraie.');
+  });
+
+  it('coupe au titre d’une passe, qui ne rend pas le gabarit final', () => {
+    const raw = "Voyons les appelants.\n## Trouvailles\n- [doute] `src/a.ts:3` : à confirmer.";
+    expect(extractReview(raw, '## Trouvailles')).toBe(
+      '## Trouvailles\n- [doute] `src/a.ts:3` : à confirmer.',
+    );
   });
 
   it('annonce la troncature quand le gabarit est absent, plutôt que de poster un pavé', () => {
@@ -82,6 +90,8 @@ const FOOTER = {
   thinkingChars: 0,
   skipped: [],
   omitted: [],
+  imported: 0,
+  failedPasses: [],
 };
 
 describe('renderComment', () => {
@@ -117,6 +127,20 @@ describe('renderComment', () => {
     expect(comment).toContain('diff seul (sans contexte complet) pour src/gros.ts');
   });
 
+  it('annonce le contexte lu au-delà de la PR, qu’une review honnête doit déclarer', () => {
+    const comment = renderComment({ ...OPTIONS, review: 'ok', footer: { ...FOOTER, imported: 7 } });
+    expect(comment).toContain('7 fichier(s) importés joints en contexte');
+  });
+
+  it('dit quelle passe manque, plutôt que de rendre deux tiers de review sans le dire', () => {
+    const comment = renderComment({
+      ...OPTIONS,
+      review: 'ok',
+      footer: { ...FOOTER, failedPasses: ['données et accès'] },
+    });
+    expect(comment).toContain('⚠ passe « données et accès » non aboutie');
+  });
+
   it('nettoie la réflexion et pose les liens en une passe', () => {
     const comment = renderComment({
       ...OPTIONS,
@@ -125,6 +149,35 @@ describe('renderComment', () => {
     });
     expect(comment).not.toContain('hmm');
     expect(comment).toContain('/blob/abc123/src/lib/content.ts#L9');
+  });
+});
+
+describe('renderPartialComment', () => {
+  const comment = renderPartialComment({
+    ...OPTIONS,
+    reason: "Ollama n'a pas répondu en 15 min",
+    passes: [
+      { label: 'régression fonctionnelle', findings: '- `src/lib/content.ts:9` : souci' },
+      { label: 'données et accès', findings: '- [rien] : requêtes relues.' },
+    ],
+    footer: { ...FOOTER, failedPasses: ['doctrine du dépôt'] },
+  });
+
+  it('rend les trouvailles déjà payées plutôt que de les jeter avec la fusion', () => {
+    expect(comment.startsWith(MARKER)).toBe(true);
+    expect(comment).toContain("Ollama n'a pas répondu en 15 min");
+    expect(comment).toContain('### régression fonctionnelle');
+    expect(comment).toContain('### données et accès');
+  });
+
+  it('dit que ce n’est pas une review : ni triée, ni dédupliquée', () => {
+    expect(comment).toContain('ni triées, ni dédupliquées, ni plafonnées');
+  });
+
+  it('pose quand même les liens et le pied de page', () => {
+    expect(comment).toContain('/blob/abc123/src/lib/content.ts#L9');
+    expect(comment).toContain('glm-5.2:cloud via Ollama Cloud');
+    expect(comment).toContain('⚠ passe « doctrine du dépôt » non aboutie');
   });
 });
 

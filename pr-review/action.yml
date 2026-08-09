@@ -1,7 +1,8 @@
 name: 'Review IA de PR (Ollama)'
 description: >-
-  Relit une pull request avec un modèle Ollama Cloud, en lui donnant la doctrine
-  du dépôt, et poste un commentaire de synthèse. Ne fait jamais échouer le job.
+  Relit une pull request avec un modèle Ollama Cloud en trois passes (régression,
+  doctrine du dépôt, données et accès), et poste un commentaire de synthèse. Ne
+  fait jamais échouer le job.
 author: 'Julien Cruau'
 
 branding:
@@ -32,12 +33,21 @@ inputs:
 
   thinking:
     description: >-
-      Effort de raisonnement demandé au modèle : low, medium, high, max, ou off.
-      Ce que chaque modèle accepte lui appartient : un niveau refusé retombe sur
-      le raisonnement par défaut, un modèle qui n'en fait pas est relancé sans.
-      Dans les deux cas la review continue, et le log le dit.
+      Effort de raisonnement des trois passes de lecture : low, medium, high,
+      max, ou off. Ce que chaque modèle accepte lui appartient : un niveau refusé
+      retombe sur le raisonnement par défaut, un modèle qui n'en fait pas est
+      relancé sans. Dans les deux cas la review continue, et le log le dit.
     required: false
     default: 'max'
+
+  merge-thinking:
+    description: >-
+      Effort de raisonnement de la fusion, qui trie les trouvailles des trois
+      passes sans avoir le code sous les yeux. Plus bas que « thinking » à
+      dessein : c'est la fusion qui s'ajoute au mur du job, les passes tournant
+      en parallèle.
+    required: false
+    default: 'high'
 
   temperature:
     description: >-
@@ -95,11 +105,21 @@ inputs:
     required: false
     default: '80000'
 
+  imports-budget-chars:
+    description: >-
+      Plafond des fichiers que les fichiers touchés importent, joints en
+      contexte pour que le modèle tranche un doute au lieu de le signaler. Budget
+      distinct de « budget-chars » : les fichiers de la PR gardent le leur quoi
+      qu'il arrive. 0 désactive le contexte importé.
+    required: false
+    default: '300000'
+
   timeout-minutes:
     description: >-
-      Délai maximum de la requête au modèle. Doit rester sous le
-      timeout-minutes du job, sinon le commentaire d'échec n'a pas le temps
-      d'être posté.
+      Délai maximum d'UNE requête au modèle. La review en fait quatre : trois
+      passes en parallèle puis leur fusion, donc le mur du job vaut jusqu'à deux
+      fois cette valeur. Le timeout-minutes du job doit rester au-dessus, sinon
+      le commentaire d'échec n'a pas le temps d'être posté.
     required: false
     default: '15'
 

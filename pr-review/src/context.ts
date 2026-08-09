@@ -4,19 +4,24 @@
  * Module **pur** : aucune E/S, la lecture des fichiers est injectée. C'est ce
  * qui le rend testable sans dépôt de fixtures.
  *
- * Deux partis pris :
+ * Trois partis pris :
  *
  * 1. On envoie le diff **et** le contenu intégral des fichiers touchés. Un diff
  *    seul ne montre pas le voisinage, et c'est le voisinage qui dit si une
  *    chaîne française est de l'éditorial en dur ou un libellé technique, ou si
  *    une requête franchit une frontière de rôle. Avec les contextes longs des
  *    modèles visés et des PR à ~2500 lignes, ça tient très largement.
- * 2. Toute troncature est déclarée dans le commentaire final. Une review
+ * 2. On y joint, en second rang, les fichiers que ceux-là importent. Mesuré sur
+ *    une PR réelle : 92 000 tokens envoyés pour une fenêtre de 976 000. La place
+ *    existait, et elle manquait exactement là où le modèle devait renoncer à
+ *    trancher, faute d'avoir l'appelant ou l'enum sous les yeux.
+ * 3. Toute troncature est déclarée dans le commentaire final. Une review
  *    silencieusement partielle se lit exactement comme une review complète,
  *    c'est le pire des deux mondes.
  */
 
 import type { PrFile } from './gh';
+import { collectImports, type ExistsPredicate } from './imports';
 
 /** Prédicat « ce chemin est-il hors review ». Vient de `compileMatcher`. */
 export type SkipPredicate = (path: string) => boolean;
@@ -110,11 +115,25 @@ export interface ContextBudget {
   totalChars: number;
   /** Plafond par fichier. Un gros fichier ne doit pas manger tout le budget. */
   perFileChars: number;
+  /**
+   * Plafond des fichiers importés, distinct du précédent.
+   *
+   * Séparé plutôt que partagé pour que les fichiers touchés, qui sont l'objet de
+   * la review, gardent leur budget quoi qu'il arrive : une grosse PR ne doit pas
+   * se retrouver privée de son propre contenu parce qu'un module partagé aurait
+   * été lu avant. `0` désactive le contexte importé.
+   */
+  importedChars: number;
 }
 
 export interface AssembledContext {
   diff: string;
   files: FileContent[];
+  /**
+   * Fichiers non touchés par la PR, joints parce qu'un fichier touché les
+   * importe. Ils servent à juger le changement, pas à être jugés.
+   */
+  imported: FileContent[];
   /** Fichiers écartés du diff comme du contenu (générés, binaires, lockfiles). */
   skipped: string[];
   /** Fichiers relus dans le diff mais dont le contenu intégral n'a pas tenu. */
@@ -125,6 +144,12 @@ export interface AssembleOptions {
   rawDiff: string;
   prFiles: PrFile[];
   readFile: (path: string) => string | null;
+  /**
+   * `readFile` rendrait le même service, mais la résolution d'un import essaie
+   * jusqu'à vingt candidats : les tester par une lecture ferait vingt lectures
+   * jetées par import. Un test d'existence est une syscall, pas un fichier.
+   */
+  exists: ExistsPredicate;
   isSkipped: SkipPredicate;
   budget: ContextBudget;
 }
@@ -140,12 +165,13 @@ export function assembleContext({
   rawDiff,
   prFiles,
   readFile,
+  exists,
   isSkipped,
   budget,
 }: AssembleOptions): AssembledContext {
   const { diff, skipped } = filterDiff(rawDiff, isSkipped);
 
-  const files: FileContent[] = [];
+  const sources: { path: string; content: string }[] = [];
   const omitted: string[] = [];
   let used = 0;
 
@@ -163,13 +189,64 @@ export function assembleContext({
       continue;
     }
     used += content.length;
-    files.push({ path: file.path, numbered: numberLines(content) });
+    sources.push({ path: file.path, content });
   }
 
   // Rendre les fichiers dans l'ordre de la PR, pas dans l'ordre de sélection :
   // le modèle lit mieux une PR présentée comme elle a été écrite.
   const order = new Map(prFiles.map((file, index) => [file.path, index]));
-  files.sort((a, b) => (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0));
+  sources.sort((a, b) => (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0));
 
-  return { diff, files, skipped, omitted };
+  const files = sources.map((source) => ({
+    path: source.path,
+    numbered: numberLines(source.content),
+  }));
+
+  const imported = readImported({ sources, readFile, exists, isSkipped, budget });
+
+  return { diff, files, imported, skipped, omitted };
+}
+
+interface ImportedOptions {
+  sources: { path: string; content: string }[];
+  readFile: (path: string) => string | null;
+  exists: ExistsPredicate;
+  isSkipped: SkipPredicate;
+  budget: ContextBudget;
+}
+
+/**
+ * Lit les fichiers importés par ceux de la PR, dans la limite de leur budget.
+ *
+ * Ne sont candidats que les imports des fichiers **effectivement fournis** : un
+ * fichier trop gros pour tenir n'a pas été montré au modèle, joindre ses
+ * dépendances reviendrait à commenter un voisinage sans le voisin.
+ *
+ * Un fichier qui ne tient pas n'est pas déclaré au lecteur, à la différence des
+ * fichiers touchés : le contexte importé est un bonus, on n'a jamais promis de
+ * l'avoir lu en entier.
+ */
+function readImported({ sources, readFile, exists, isSkipped, budget }: ImportedOptions): FileContent[] {
+  if (budget.importedChars <= 0) return [];
+
+  const paths = collectImports(sources, { exists, isExcluded: isSkipped });
+  const contents = new Map<string, string>();
+  for (const path of paths) {
+    const content = readFile(path);
+    if (content !== null && content.length <= budget.perFileChars) contents.set(path, content);
+  }
+
+  // Mêmes plus-petits-d'abord que pour les fichiers touchés, et pour la même
+  // raison : huit dépendances lues valent mieux qu'une seule énorme.
+  const kept = new Set<string>();
+  let used = 0;
+  for (const [path, content] of [...contents].sort((a, b) => a[1].length - b[1].length)) {
+    if (used + content.length > budget.importedChars) continue;
+    used += content.length;
+    kept.add(path);
+  }
+
+  return paths
+    .filter((path) => kept.has(path))
+    .map((path) => ({ path, numbered: numberLines(contents.get(path)!) }));
 }

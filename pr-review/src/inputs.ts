@@ -76,6 +76,14 @@ export const DEFAULTS = {
   maxFindings: 20,
   budgetChars: 500_000,
   perFileChars: 80_000,
+  /**
+   * Budget des fichiers importés, distinct de celui des fichiers touchés.
+   *
+   * Mesuré sur une PR réelle : 92 000 tokens envoyés pour une fenêtre de
+   * 976 000. La place existe, et elle sert exactement là où le modèle devait
+   * renoncer à trancher faute d'avoir l'appelant sous les yeux. `0` désactive.
+   */
+  importsBudgetChars: 300_000,
   timeoutMinutes: 15,
   /**
    * Effort de raisonnement demandé au modèle.
@@ -86,6 +94,15 @@ export const DEFAULTS = {
    * aucun modèle.
    */
   thinking: 'max',
+  /**
+   * Effort de raisonnement de la fusion, plus bas que celui des passes.
+   *
+   * Les passes lisent quatre-vingt-dix kilo-octets de code, la fusion trie une
+   * trentaine de puces sans avoir le code sous les yeux : `max` n'y achèterait
+   * que de la latence. Les passes tournant en parallèle, elles coûtent le temps
+   * d'une seule, et c'est la fusion qui s'ajoute au mur du job.
+   */
+  mergeThinking: 'high',
   /**
    * Surtout pas 0. Le décodage glouton sur un modèle de raisonnement raccourcit
    * la chaîne de pensée et la fait tourner en rond ; 1 est la valeur des
@@ -100,14 +117,18 @@ export interface Config {
   pr: number;
   dryRun: boolean;
   model: string;
-  /** Niveau passé à `think`. Vide : le modèle garde son propre défaut. */
+  /** Niveau passé à `think` pour les passes. Vide : le modèle garde son défaut. */
   thinking: string;
+  /** Idem pour la fusion, qui n'a pas besoin d'autant. */
+  mergeThinking: string;
   temperature: number;
   /** `undefined` : pas de graine, le modèle varie d'une exécution à l'autre. */
   seed: number | undefined;
   maxFindings: number;
   budgetChars: number;
   perFileChars: number;
+  /** Plafond des fichiers importés joints en contexte. `0` : aucun. */
+  importsBudgetChars: number;
   timeoutMs: number;
   /** Chemins de doctrine, dans l'ordre où ils seront injectés dans le prompt. */
   doctrine: string[];
@@ -142,12 +163,25 @@ export function readInput(env: Env, name: string): string {
   return (env[`INPUT_${name.replace(/ /g, '_').toUpperCase()}`] ?? '').trim();
 }
 
-/** Nombre positif, ou le repli. Une valeur illisible ne doit pas annuler la review. */
-function readNumber(env: Env, name: string, fallback: number, warn: (message: string) => void): number {
+/**
+ * Nombre au-dessus du minimum, ou le repli. Une valeur illisible ne doit pas
+ * annuler la review.
+ *
+ * `minimum` vaut 1 partout sauf pour les budgets qu'on peut vouloir annuler :
+ * un plafond nul n'a pas de sens pour un délai, il en a un pour du contexte
+ * facultatif, où il veut dire « n'en joins aucun ».
+ */
+function readNumber(
+  env: Env,
+  name: string,
+  fallback: number,
+  warn: (message: string) => void,
+  minimum = 1,
+): number {
   const raw = readInput(env, name);
   if (raw === '') return fallback;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
+  if (!Number.isFinite(parsed) || parsed < minimum) {
     warn(`input « ${name} » illisible (« ${raw} ») : on garde ${fallback}.`);
     return fallback;
   }
@@ -246,11 +280,19 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     // Pas de validation contre une liste de niveaux : ils varient d'un modèle à
     // l'autre, et un niveau refusé est rattrapé à l'appel.
     thinking: readInput(env, 'thinking') || DEFAULTS.thinking,
+    mergeThinking: readInput(env, 'merge-thinking') || DEFAULTS.mergeThinking,
     temperature: readTemperature(env, warn),
     seed: readSeed(env, warn),
     maxFindings: readNumber(env, 'max-findings', DEFAULTS.maxFindings, warn),
     budgetChars: readNumber(env, 'budget-chars', DEFAULTS.budgetChars, warn),
     perFileChars: readNumber(env, 'per-file-chars', DEFAULTS.perFileChars, warn),
+    importsBudgetChars: readNumber(
+      env,
+      'imports-budget-chars',
+      DEFAULTS.importsBudgetChars,
+      warn,
+      0,
+    ),
     timeoutMs: readNumber(env, 'timeout-minutes', DEFAULTS.timeoutMinutes, warn) * 60_000,
     doctrine: doctrineInput.length > 0 ? doctrineInput : [...DEFAULT_DOCTRINE],
     // Le plancher d'abord : ce qui suit ne peut qu'ajouter, jamais retirer.

@@ -1,6 +1,11 @@
 /**
  * Review IA d'une pull request, postée en un commentaire de synthèse.
  *
+ * Quatre appels au modèle et non un : trois passes indépendantes (régression
+ * fonctionnelle, doctrine du dépôt, données et accès) qui voient le même
+ * contexte, puis une fusion qui trie et rédige. Voir `passes.ts` pour le
+ * pourquoi du découpage.
+ *
  * Tourne à l'identique en CI (action `JulienCr/gh-actions/pr-review`) et en
  * local, pour régler un prompt sans polluer une PR :
  *
@@ -13,17 +18,25 @@
  * PR jugée irréprochable.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { assembleContext } from './context';
+import { assembleContext, type AssembledContext } from './context';
 import { run } from './exec';
-import { currentHeadSha, fetchPrDiff, fetchPrMeta, postComment, resolveRepo } from './gh';
+import { currentHeadSha, fetchPrDiff, fetchPrMeta, postComment, resolveRepo, type PrMeta } from './gh';
 import { compileMatcher } from './globs';
 import { resolveConfig, UsageError, type Config } from './inputs';
-import { chat, OllamaError } from './ollama';
-import { buildSystemPrompt, buildUserPrompt, type DoctrineFile } from './prompt';
-import { renderComment, renderFailureComment } from './render';
+import { chat, OllamaError, type ChatResult } from './ollama';
+import { buildUserPrompt, type DoctrineFile, type PromptOptions } from './prompt';
+import {
+  buildMergeSystemPrompt,
+  buildMergeUserPrompt,
+  buildPassSystemPrompt,
+  PASSES,
+  PASS_HEADING,
+  type Pass,
+} from './passes';
+import { extractReview, renderComment, renderFailureComment, renderPartialComment } from './render';
 
 /** Emplacement 1Password de la clé, pour l'usage local. Surchargeable. */
 const DEFAULT_KEY_REF = 'op://Personal/Ollama/add more/api_key';
@@ -104,6 +117,97 @@ async function keyFrom1Password(): Promise<string> {
   }
 }
 
+/** Ce que les quatre appels laissent derrière eux : des compteurs et des échecs. */
+interface Run {
+  promptTokens: number;
+  evalTokens: number;
+  thinkingChars: number;
+  /** Raisons des appels en échec, pour les expliquer si plus rien n'aboutit. */
+  failures: string[];
+}
+
+/**
+ * Un appel au modèle, dont l'échec ne fait pas tomber les autres.
+ *
+ * Les trois passes sont indépendantes : deux passes sur trois valent mieux que
+ * rien, à condition que le commentaire le déclare, ce dont se charge le pied de
+ * page. La raison du premier échec est conservée pour le cas où tout échoue.
+ */
+async function callModel(
+  config: Config,
+  run: Run,
+  args: { system: string; user: string; think: string; label: string },
+): Promise<ChatResult | null> {
+  let result: ChatResult;
+  try {
+    result = await chat({
+      apiKey: config.apiKey,
+      model: config.model,
+      system: args.system,
+      user: args.user,
+      think: args.think,
+      temperature: config.temperature,
+      seed: config.seed,
+      timeoutMs: config.timeoutMs,
+      onRetry: (reason) => console.warn(`⚠ [${args.label}] ${reason} — nouvelle tentative dans 20 s.`),
+      onDowngrade: (reason) =>
+        console.warn(
+          `⚠ [${args.label}] ${config.model} n'a pas accepté « thinking: ${args.think} » (${reason}).\n` +
+            '  Relancé sans raisonnement explicite : ce sera moins fouillé.',
+        ),
+    });
+  } catch (error) {
+    const reason = error instanceof OllamaError ? error.message : String(error);
+    console.error(`✗ ${args.label} : ${reason}`);
+    run.failures.push(reason);
+    return null;
+  }
+
+  run.promptTokens += result.promptTokens;
+  run.evalTokens += result.evalTokens;
+  run.thinkingChars += result.thinkingChars;
+  console.log(
+    `✓ ${args.label} en ${Math.round(result.durationMs / 1000)} s ` +
+      `(${result.promptTokens} tokens en entrée, ${result.evalTokens} en sortie).`,
+  );
+  return result;
+}
+
+interface PassOutcome {
+  pass: Pass;
+  findings: string;
+}
+
+/**
+ * Lance les trois passes en parallèle.
+ *
+ * En parallèle et non l'une après l'autre : elles ne dépendent pas les unes des
+ * autres, et le mur du job devient la plus lente au lieu de leur somme. Le prix
+ * est que le contexte part trois fois ; c'est le coût assumé du découpage, et il
+ * est bien plus faible que celui d'un axe de recherche que le modèle expédie
+ * parce que deux autres lui tiennent la tête.
+ */
+async function runPasses(
+  config: Config,
+  run: Run,
+  promptOptions: PromptOptions,
+  user: string,
+): Promise<PassOutcome[]> {
+  const results = await Promise.all(
+    PASSES.map(async (pass) => {
+      const result = await callModel(config, run, {
+        system: buildPassSystemPrompt(pass, promptOptions),
+        user,
+        think: config.thinking,
+        label: `passe ${pass.label}`,
+      });
+      if (result === null) return null;
+      return { pass, findings: extractReview(result.content, PASS_HEADING) };
+    }),
+  );
+  return results.filter((result): result is PassOutcome => result !== null);
+}
+
 async function review(config: Config): Promise<void> {
   const root = repoRoot();
 
@@ -119,12 +223,25 @@ async function review(config: Config): Promise<void> {
     rawDiff,
     prFiles: meta.files,
     isSkipped: compileMatcher(config.skip),
-    budget: { totalChars: config.budgetChars, perFileChars: config.perFileChars },
+    budget: {
+      totalChars: config.budgetChars,
+      perFileChars: config.perFileChars,
+      importedChars: config.importsBudgetChars,
+    },
     readFile: (path) => {
       try {
         return readFileSync(join(root, path), 'utf-8');
       } catch {
         return null;
+      }
+    },
+    // Un dossier n'est pas un fichier : sans ce test, `./composants` résoudrait
+    // vers le dossier lui-même et on raterait son `index.ts`.
+    exists: (path) => {
+      try {
+        return statSync(join(root, path), { throwIfNoEntry: false })?.isFile() ?? false;
+      } catch {
+        return false;
       }
     },
   });
@@ -134,59 +251,65 @@ async function review(config: Config): Promise<void> {
     return;
   }
 
-  const system = buildSystemPrompt({
+  const promptOptions: PromptOptions = {
     repo,
     projectSummary: config.projectSummary,
     doctrine: readDoctrine(root, config.doctrine),
-    maxFindings: config.maxFindings,
-  });
+  };
   const user = buildUserPrompt(meta, context);
   console.log(
-    `Contexte : ${context.files.length} fichier(s) en intégral, ` +
-      `${Math.round((system.length + user.length) / 1024)} Ko envoyés à ${config.model}.`,
+    `Contexte : ${context.files.length} fichier(s) touchés, ${context.imported.length} importé(s), ` +
+      `~${Math.round(user.length / 1024)} Ko par passe, ${PASSES.length} passes + fusion (${config.model}).`,
   );
 
-  let result;
-  try {
-    result = await chat({
-      apiKey: config.apiKey,
-      model: config.model,
-      system,
-      user,
-      think: config.thinking,
-      temperature: config.temperature,
-      seed: config.seed,
-      timeoutMs: config.timeoutMs,
-      onRetry: (reason) => console.warn(`⚠ ${reason} — nouvelle tentative dans 20 s.`),
-      onDowngrade: (reason) =>
-        console.warn(
-          `⚠ ${config.model} n'a pas accepté « thinking: ${config.thinking} » (${reason}).\n` +
-            '  Review relancée sans raisonnement explicite : elle sera moins fouillée.',
-        ),
-    });
-  } catch (error) {
-    const reason = error instanceof OllamaError ? error.message : String(error);
-    console.error(`Échec de la review : ${reason}`);
+  const started = Date.now();
+  const run: Run = { promptTokens: 0, evalTokens: 0, thinkingChars: 0, failures: [] };
+  const outcomes = await runPasses(config, run, promptOptions, user);
+
+  if (outcomes.length === 0) {
+    const reason = run.failures[0] ?? 'raison inconnue';
+    console.error(`Échec de la review : aucune passe n'a abouti (${reason}).`);
     if (!config.dryRun) await postComment(config.pr, renderFailureComment(reason, config.model));
     return;
   }
 
+  const merged = await callModel(config, run, {
+    system: buildMergeSystemPrompt({ repo, maxFindings: config.maxFindings }),
+    user: buildMergeUserPrompt(meta, outcomes),
+    think: config.mergeThinking,
+    label: 'fusion',
+  });
+
   const server = (process.env.GITHUB_SERVER_URL ?? 'https://github.com').replace(/\/$/, '');
-  const comment = renderComment({
-    review: result.content,
+  const shared = {
     repoUrl: `${server}/${repo}`,
     headSha: meta.headSha,
-    knownPaths: new Set(meta.files.map((file) => file.path)),
+    // Les fichiers importés sont de vrais fichiers du dépôt : les lier est juste.
+    // Le filtre garde son rôle contre les chemins que le modèle invente.
+    knownPaths: knownPaths(meta, context),
     footer: {
       model: config.model,
-      durationMs: result.durationMs,
-      promptTokens: result.promptTokens,
-      evalTokens: result.evalTokens,
-      thinkingChars: result.thinkingChars,
+      durationMs: Date.now() - started,
+      promptTokens: run.promptTokens,
+      evalTokens: run.evalTokens,
+      thinkingChars: run.thinkingChars,
       skipped: context.skipped,
       omitted: context.omitted,
+      imported: context.imported.length,
+      failedPasses: PASSES.filter((pass) => !outcomes.some((outcome) => outcome.pass === pass)).map(
+        (pass) => pass.label,
+      ),
     },
-  });
+  };
+
+  const comment =
+    merged === null
+      ? renderPartialComment({
+          ...shared,
+          reason: run.failures.at(-1) ?? 'raison inconnue',
+          passes: outcomes.map((outcome) => ({ label: outcome.pass.label, findings: outcome.findings })),
+        })
+      : renderComment({ ...shared, review: merged.content });
 
   if (config.dryRun) {
     console.log('\n────────── review (dry-run, non postée) ──────────\n');
@@ -196,6 +319,13 @@ async function review(config: Config): Promise<void> {
 
   await postComment(config.pr, comment);
   console.log(`Review postée sur la PR #${config.pr}.`);
+}
+
+function knownPaths(meta: PrMeta, context: AssembledContext): Set<string> {
+  return new Set([
+    ...meta.files.map((file) => file.path),
+    ...context.imported.map((file) => file.path),
+  ]);
 }
 
 async function main(): Promise<void> {

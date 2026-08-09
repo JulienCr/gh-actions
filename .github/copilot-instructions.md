@@ -39,9 +39,10 @@ mergé ici part chez tous les consommateurs au prochain tag. C'est ce qui rend c
 
 ### Tests
 
-- Les modules purs (`context`, `prompt`, `render`, `globs`, `inputs`) se testent sans E/S : les
-  lecteurs de fichiers et l'environnement sont injectés. Une PR qui ajoute une E/S dans l'un
-  d'eux pour se simplifier la vie mérite d'être discutée.
+- Les modules purs (`context`, `imports`, `prompt`, `passes`, `render`, `globs`, `inputs`) se
+  testent sans E/S : les lecteurs de fichiers, le test d'existence et l'environnement sont
+  injectés. Une PR qui ajoute une E/S dans l'un d'eux pour se simplifier la vie mérite d'être
+  discutée.
 - Un test qui passe avec ET sans le correctif n'épingle rien.
 
 ## Skip

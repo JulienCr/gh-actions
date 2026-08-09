@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { AssembledContext } from '../src/context';
 import type { PrMeta } from '../src/gh';
-import { buildSystemPrompt, buildUserPrompt, type SystemPromptOptions } from '../src/prompt';
+import { buildPreamble, buildUserPrompt, type PromptOptions } from '../src/prompt';
 
 const META: PrMeta = {
   number: 42,
@@ -20,16 +20,17 @@ const META: PrMeta = {
 const CONTEXT: AssembledContext = {
   diff: 'diff --git a/src/app/page.tsx b/src/app/page.tsx',
   files: [{ path: 'src/app/page.tsx', numbered: '1| export default function Page() {}' }],
+  imported: [],
   skipped: ['pnpm-lock.yaml'],
   omitted: [],
 };
 
-const system = (over: Partial<SystemPromptOptions> = {}) =>
-  buildSystemPrompt({ repo: 'JulienCr/exemple', projectSummary: '', doctrine: [], maxFindings: 12, ...over });
+const preamble = (over: Partial<PromptOptions> = {}) =>
+  buildPreamble({ repo: 'JulienCr/exemple', projectSummary: '', doctrine: [], ...over });
 
-describe('buildSystemPrompt', () => {
+describe('buildPreamble', () => {
   it('injecte chaque fichier de doctrine avec son chemin, au lieu de recopier des règles en dur', () => {
-    const prompt = system({
+    const prompt = preamble({
       doctrine: [
         { path: '.github/copilot-instructions.md', content: 'DOCTRINE_SENTINELLE' },
         { path: 'CLAUDE.md', content: 'CONVENTIONS_SENTINELLE' },
@@ -42,80 +43,41 @@ describe('buildSystemPrompt', () => {
   });
 
   it('situe le dépôt relu, puisque plus aucun nom de projet n’est écrit dans le prompt', () => {
-    expect(system()).toContain('`JulienCr/exemple`');
+    expect(preamble()).toContain('`JulienCr/exemple`');
   });
 
   it('reprend le cadrage fourni par le dépôt, et n’en invente pas quand il manque', () => {
-    expect(system({ projectSummary: 'Un escape game à Paris.' })).toContain('Un escape game à Paris.');
+    expect(preamble({ projectSummary: 'Un escape game à Paris.' })).toContain('Un escape game à Paris.');
     // Sans cadrage, le prompt enchaîne directement : pas de ligne vide en trop
     // ni de gabarit resté vide, qui inviterait le modèle à combler le trou.
-    expect(system()).toContain('repository.\n\nYou run when the PR is opened');
+    expect(preamble()).toContain('repository.\n\nYou run when the PR is opened');
   });
 
   it('prévient le modèle quand aucune doctrine n’a été trouvée', () => {
-    const prompt = system();
+    const prompt = preamble();
     expect(prompt).toContain('ships no review doctrine');
     expect(prompt).toContain('never present a remark as if it came from a project rule');
   });
 
   it('n’avertit pas de l’absence de doctrine quand il y en a une', () => {
-    const prompt = system({ doctrine: [{ path: 'CLAUDE.md', content: 'x' }] });
-    expect(prompt).not.toContain('ships no review doctrine');
-  });
-
-  it('impose les cinq rubriques, dont l’exutoire des doutes', () => {
-    const prompt = system();
-    for (const heading of [
-      '## Verdict',
-      '## Bloquant',
-      '## À corriger',
-      '## Suggestions',
-      '## À vérifier',
-    ]) {
-      expect(prompt).toContain(heading);
-    }
+    expect(preamble({ doctrine: [{ path: 'CLAUDE.md', content: 'x' }] })).not.toContain(
+      'ships no review doctrine',
+    );
   });
 
   it('demande de la couverture, pas de la sélection', () => {
-    const prompt = system();
+    const prompt = preamble();
     expect(prompt).toContain('coverage, not curation');
     // Le garde-fou qui a produit trois « Rien à signaler » sur quatre : le
     // modèle cherchait, trouvait, puis jetait faute de certitude.
-    expect(prompt).not.toContain('Do not manufacture remarks to fill space');
     expect(prompt).toContain('Do not soften a finding into silence');
-  });
-
-  it('n’accepte « Rien à signaler » qu’accompagné de ce qui a été vérifié', () => {
-    const prompt = system();
-    expect(prompt).toContain('« Rien à signaler » is a claim, not a default');
-  });
-
-  it('donne les axes où se cachent les vrais bugs, qu’un diff ne montre pas', () => {
-    const prompt = system();
-    expect(prompt).toContain('Where the costly bugs hide');
-    for (const axis of ["The caller's side", 'Error paths', 'Edge inputs', 'State and ordering']) {
-      expect(prompt).toContain(axis);
-    }
+    expect(prompt).toContain('Finding nothing is a claim, not a default');
   });
 
   it('interdit la liste de numéros de ligne, qui a produit un numéro inventé sur quatre', () => {
-    const prompt = system();
+    const prompt = preamble();
     expect(prompt).toContain('exactly one line number per finding');
     expect(prompt).toContain('Never state what a file contains unless that file was included');
-  });
-
-  it('donne ses consignes en anglais mais réclame une review en français', () => {
-    const prompt = system();
-    expect(prompt).toContain('The review itself is written');
-    expect(prompt).toContain('Write in French');
-  });
-
-  it('reporte le plafond de puces demandé par le dépôt', () => {
-    expect(system({ maxFindings: 5 })).toContain('5 bullets maximum');
-  });
-
-  it('présente le plafond comme un ordre de priorité, pas comme un permis de taire', () => {
-    expect(system()).toContain('never to justify dropping one in silence');
   });
 });
 
@@ -140,5 +102,22 @@ describe('buildUserPrompt', () => {
 
   it('rend une description vide lisible plutôt qu’un trou', () => {
     expect(buildUserPrompt({ ...META, body: '   ' }, CONTEXT)).toContain('(empty)');
+  });
+
+  it('range les fichiers importés dans une section à part, et dit de ne pas les relire', () => {
+    const prompt = buildUserPrompt(META, {
+      ...CONTEXT,
+      imported: [{ path: 'src/lib/format.ts', numbered: '1| export const truncate = 1;' }],
+    });
+    expect(prompt).toContain('## Context files, NOT modified by this PR');
+    expect(prompt).toContain('### src/lib/format.ts');
+    // Sans cette consigne, le modèle relève des défauts dans du code que la PR
+    // ne touche pas, et la review devient inutilisable pour son auteur.
+    expect(prompt).toContain('**Do not review them.**');
+    expect(prompt).toContain('Every finding must be about a changed file listed above');
+  });
+
+  it('n’ouvre pas de section de contexte quand aucun import n’a été résolu', () => {
+    expect(buildUserPrompt(META, CONTEXT)).not.toContain('Context files');
   });
 });
