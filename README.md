@@ -1,6 +1,6 @@
 # gh-actions
 
-Les actions GitHub réutilisables de Julien Cruau. Un dossier par action, versionnées ensemble
+Les actions GitHub réutilisables. Un dossier par action, versionnées ensemble
 par des tags `vX.Y.Z` plus un tag majeur mobile `vX`.
 
 | Action | Ce qu'elle fait |
