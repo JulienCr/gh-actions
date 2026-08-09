@@ -153,8 +153,16 @@ async function review(config: Config): Promise<void> {
       model: config.model,
       system,
       user,
+      think: config.thinking,
+      temperature: config.temperature,
+      seed: config.seed,
       timeoutMs: config.timeoutMs,
       onRetry: (reason) => console.warn(`⚠ ${reason} — nouvelle tentative dans 20 s.`),
+      onDowngrade: (reason) =>
+        console.warn(
+          `⚠ ${config.model} n'a pas accepté « thinking: ${config.thinking} » (${reason}).\n` +
+            '  Review relancée sans raisonnement explicite : elle sera moins fouillée.',
+        ),
     });
   } catch (error) {
     const reason = error instanceof OllamaError ? error.message : String(error);
@@ -174,6 +182,7 @@ async function review(config: Config): Promise<void> {
       durationMs: result.durationMs,
       promptTokens: result.promptTokens,
       evalTokens: result.evalTokens,
+      thinkingChars: result.thinkingChars,
       skipped: context.skipped,
       omitted: context.omitted,
     },

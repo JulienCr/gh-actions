@@ -73,16 +73,38 @@ export const DEFAULT_DOCTRINE: readonly string[] = [
 
 export const DEFAULTS = {
   model: 'glm-5.2:cloud',
-  maxFindings: 12,
+  maxFindings: 20,
   budgetChars: 500_000,
   perFileChars: 80_000,
   timeoutMinutes: 15,
+  /**
+   * Effort de raisonnement demandé au modèle.
+   *
+   * `max` parce qu'une review vaut par ce qu'elle trouve, pas par sa latence :
+   * le job tourne pendant que l'auteur fait autre chose. Un modèle qui ne sait
+   * pas raisonner rejoue sans (cf. `chat`), donc ce défaut ne ferme la porte à
+   * aucun modèle.
+   */
+  thinking: 'max',
+  /**
+   * Surtout pas 0. Le décodage glouton sur un modèle de raisonnement raccourcit
+   * la chaîne de pensée et la fait tourner en rond ; 1 est la valeur des
+   * exemples officiels de GLM-5. La stabilité d'un jour à l'autre est confiée à
+   * la graine, qui la sert sans coûter en profondeur.
+   */
+  temperature: 1,
+  seed: 1,
 } as const;
 
 export interface Config {
   pr: number;
   dryRun: boolean;
   model: string;
+  /** Niveau passé à `think`. Vide : le modèle garde son propre défaut. */
+  thinking: string;
+  temperature: number;
+  /** `undefined` : pas de graine, le modèle varie d'une exécution à l'autre. */
+  seed: number | undefined;
   maxFindings: number;
   budgetChars: number;
   perFileChars: number;
@@ -136,6 +158,42 @@ function readBoolean(env: Env, name: string): boolean {
   return /^(true|1|yes)$/i.test(readInput(env, name));
 }
 
+/**
+ * Comme `readNumber`, mais zéro est une valeur, pas une erreur.
+ *
+ * `readNumber` refuse zéro parce qu'un plafond nul n'a pas de sens ; une
+ * température nulle en a un, même si on la déconseille.
+ */
+function readTemperature(env: Env, warn: (message: string) => void): number {
+  const raw = readInput(env, 'temperature');
+  if (raw === '') return DEFAULTS.temperature;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    warn(`input « temperature » illisible (« ${raw} ») : on garde ${DEFAULTS.temperature}.`);
+    return DEFAULTS.temperature;
+  }
+  if (parsed === 0) {
+    warn(
+      'temperature = 0 sur un modèle de raisonnement : la review sera plus courte et plus\n' +
+        '  superficielle. Pour de la stabilité, garde la température et fixe « seed ».',
+    );
+  }
+  return parsed;
+}
+
+/** `off` (ou `none`) rend la variance au modèle ; tout le reste est une graine. */
+function readSeed(env: Env, warn: (message: string) => void): number | undefined {
+  const raw = readInput(env, 'seed');
+  if (raw === '') return DEFAULTS.seed;
+  if (/^(off|none|false)$/i.test(raw)) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed)) {
+    warn(`input « seed » illisible (« ${raw} ») : on garde ${DEFAULTS.seed}.`);
+    return DEFAULTS.seed;
+  }
+  return parsed;
+}
+
 export interface ResolveOptions {
   argv: string[];
   env: Env;
@@ -185,6 +243,11 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     pr,
     dryRun,
     model,
+    // Pas de validation contre une liste de niveaux : ils varient d'un modèle à
+    // l'autre, et un niveau refusé est rattrapé à l'appel.
+    thinking: readInput(env, 'thinking') || DEFAULTS.thinking,
+    temperature: readTemperature(env, warn),
+    seed: readSeed(env, warn),
     maxFindings: readNumber(env, 'max-findings', DEFAULTS.maxFindings, warn),
     budgetChars: readNumber(env, 'budget-chars', DEFAULTS.budgetChars, warn),
     perFileChars: readNumber(env, 'per-file-chars', DEFAULTS.perFileChars, warn),

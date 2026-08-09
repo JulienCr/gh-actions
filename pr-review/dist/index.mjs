@@ -260,10 +260,27 @@ var DEFAULT_DOCTRINE = [
 ];
 var DEFAULTS = {
   model: "glm-5.2:cloud",
-  maxFindings: 12,
+  maxFindings: 20,
   budgetChars: 5e5,
   perFileChars: 8e4,
-  timeoutMinutes: 15
+  timeoutMinutes: 15,
+  /**
+   * Effort de raisonnement demandé au modèle.
+   *
+   * `max` parce qu'une review vaut par ce qu'elle trouve, pas par sa latence :
+   * le job tourne pendant que l'auteur fait autre chose. Un modèle qui ne sait
+   * pas raisonner rejoue sans (cf. `chat`), donc ce défaut ne ferme la porte à
+   * aucun modèle.
+   */
+  thinking: "max",
+  /**
+   * Surtout pas 0. Le décodage glouton sur un modèle de raisonnement raccourcit
+   * la chaîne de pensée et la fait tourner en rond ; 1 est la valeur des
+   * exemples officiels de GLM-5. La stabilité d'un jour à l'autre est confiée à
+   * la graine, qui la sert sans coûter en profondeur.
+   */
+  temperature: 1,
+  seed: 1
 };
 var UsageError = class extends Error {
 };
@@ -282,6 +299,32 @@ function readNumber(env, name, fallback, warn) {
 }
 function readBoolean(env, name) {
   return /^(true|1|yes)$/i.test(readInput(env, name));
+}
+function readTemperature(env, warn) {
+  const raw = readInput(env, "temperature");
+  if (raw === "") return DEFAULTS.temperature;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    warn(`input \xAB temperature \xBB illisible (\xAB ${raw} \xBB) : on garde ${DEFAULTS.temperature}.`);
+    return DEFAULTS.temperature;
+  }
+  if (parsed === 0) {
+    warn(
+      "temperature = 0 sur un mod\xE8le de raisonnement : la review sera plus courte et plus\n  superficielle. Pour de la stabilit\xE9, garde la temp\xE9rature et fixe \xAB seed \xBB."
+    );
+  }
+  return parsed;
+}
+function readSeed(env, warn) {
+  const raw = readInput(env, "seed");
+  if (raw === "") return DEFAULTS.seed;
+  if (/^(off|none|false)$/i.test(raw)) return void 0;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed)) {
+    warn(`input \xAB seed \xBB illisible (\xAB ${raw} \xBB) : on garde ${DEFAULTS.seed}.`);
+    return DEFAULTS.seed;
+  }
+  return parsed;
 }
 function resolveConfig({ argv, env, warn = () => {
 } }) {
@@ -316,6 +359,11 @@ function resolveConfig({ argv, env, warn = () => {
     pr,
     dryRun,
     model,
+    // Pas de validation contre une liste de niveaux : ils varient d'un modèle à
+    // l'autre, et un niveau refusé est rattrapé à l'appel.
+    thinking: readInput(env, "thinking") || DEFAULTS.thinking,
+    temperature: readTemperature(env, warn),
+    seed: readSeed(env, warn),
     maxFindings: readNumber(env, "max-findings", DEFAULTS.maxFindings, warn),
     budgetChars: readNumber(env, "budget-chars", DEFAULTS.budgetChars, warn),
     perFileChars: readNumber(env, "per-file-chars", DEFAULTS.perFileChars, warn),
@@ -336,35 +384,47 @@ var RETRY_DELAY_MS = 2e4;
 var OllamaError = class extends Error {
   /** Une seconde tentative a-t-elle une chance d'aboutir ? */
   retryable;
-  constructor(message, retryable = false) {
+  /** Le modèle a refusé `think` : rejouer sans est la seule issue. */
+  thinkingRejected;
+  constructor(message, retryable = false, thinkingRejected = false) {
     super(message);
     this.name = "OllamaError";
     this.retryable = retryable;
+    this.thinkingRejected = thinkingRejected;
   }
 };
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var worthRetrying = (status) => status === 429 || status >= 500;
+function parseThink(value) {
+  const normalised = value.trim().toLowerCase();
+  if (normalised === "true") return true;
+  if (/^(false|off|none)$/.test(normalised)) return false;
+  return normalised;
+}
+var rejectsThinking = (status, body) => status === 400 && /think/i.test(body);
+var rejectsThinkingValue = (body) => /invalid think value/i.test(body);
 async function chat(options) {
   const started = Date.now();
+  const done = (payload) => ({
+    content: payload.message?.content ?? "",
+    promptTokens: payload.prompt_eval_count ?? 0,
+    evalTokens: payload.eval_count ?? 0,
+    thinkingChars: payload.message?.thinking?.length ?? 0,
+    durationMs: Date.now() - started
+  });
   try {
-    const payload = await request(options);
-    return {
-      content: payload.message?.content ?? "",
-      promptTokens: payload.prompt_eval_count ?? 0,
-      evalTokens: payload.eval_count ?? 0,
-      durationMs: Date.now() - started
-    };
+    return done(await request(options));
   } catch (error) {
-    if (!(error instanceof OllamaError) || !error.retryable) throw error;
+    if (!(error instanceof OllamaError)) throw error;
+    if (error.thinkingRejected && options.think) {
+      const fallback = rejectsThinkingValue(error.message) ? "true" : "";
+      options.onDowngrade?.(error.message);
+      return done(await request({ ...options, think: fallback }));
+    }
+    if (!error.retryable) throw error;
     options.onRetry?.(error.message);
     await sleep(options.retryDelayMs ?? RETRY_DELAY_MS);
-    const payload = await request(options);
-    return {
-      content: payload.message?.content ?? "",
-      promptTokens: payload.prompt_eval_count ?? 0,
-      evalTokens: payload.eval_count ?? 0,
-      durationMs: Date.now() - started
-    };
+    return done(await request(options));
   }
 }
 async function request(options) {
@@ -381,9 +441,14 @@ async function request(options) {
       body: JSON.stringify({
         model: options.model,
         stream: false,
-        // Une review doit être reproductible : deux lectures du même diff ne
-        // doivent pas rendre deux verdicts différents.
-        options: { temperature: 0 },
+        ...options.think ? { think: parseThink(options.think) } : {},
+        // Une review doit rester comparable d'un jour à l'autre : c'est la
+        // graine qui s'en charge, pas une température nulle, qui sur un modèle
+        // de raisonnement coûterait la moitié de sa profondeur d'analyse.
+        options: {
+          temperature: options.temperature ?? 1,
+          ...options.seed === void 0 ? {} : { seed: options.seed }
+        },
         messages: [
           { role: "system", content: options.system },
           { role: "user", content: options.user }
@@ -402,7 +467,8 @@ async function request(options) {
   if (!response.ok) {
     throw new OllamaError(
       `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
-      worthRetrying(response.status)
+      worthRetrying(response.status),
+      rejectsThinking(response.status, text)
     );
   }
   let payload;
@@ -411,7 +477,13 @@ async function request(options) {
   } catch {
     throw new OllamaError(`r\xE9ponse illisible d'Ollama (${text.slice(0, 200)})`);
   }
-  if (payload.error) throw new OllamaError(`Ollama a r\xE9pondu une erreur : ${payload.error}`);
+  if (payload.error) {
+    throw new OllamaError(
+      `Ollama a r\xE9pondu une erreur : ${payload.error}`,
+      false,
+      /think/i.test(payload.error)
+    );
+  }
   if (!payload.message?.content?.trim()) {
     throw new OllamaError("Ollama a rendu une r\xE9ponse vide");
   }
@@ -440,7 +512,11 @@ Une seule phrase : ce que tu retiens de cette PR.
 - \`chemin/fichier.tsx:17\` : \u2026
 
 ## Suggestions
-- \`chemin/fichier.ts:88\` : \u2026`;
+- \`chemin/fichier.ts:88\` : \u2026
+
+## \xC0 v\xE9rifier
+- \`chemin/fichier.ts:120\` : ce que tu soup\xE7onnes sans pouvoir le prouver ici, et ce qu'il
+  faudrait regarder pour trancher.`;
 function renderDoctrine(files) {
   if (files.length === 0) {
     return `This repository ships no review doctrine. Judge on general engineering grounds only, and
@@ -467,15 +543,48 @@ ${renderDoctrine(options.doctrine)}
 
 # Expected output
 
-Return exactly these four sections, in this order, as markdown. The review itself is written
+Return exactly these five sections, in this order, as markdown. The review itself is written
 in French: it is posted as a comment on the PR.
 
 ${OUTPUT_TEMPLATE}
 
+# How hard to look
+
+Your job is coverage, not curation. A finding you swallowed because you were not sure enough
+is a bug that ships. Report what you find and let the section carry your confidence: a doubt
+belongs under \xAB \xC0 v\xE9rifier \xBB, never in the bin.
+
+- **Read every file you were given in full**, not only the changed lines. The diff says what
+  moved; the code around it says what that broke. A reviewer who only reads \xAB + \xBB lines finds
+  only typos.
+- **Do not soften a finding into silence.** When something looks wrong but you cannot prove it
+  from what you were given, say what you saw, what you suspect, and which file would settle
+  it. That is a \xAB \xC0 v\xE9rifier \xBB bullet, and it is worth more than an empty section.
+- **\xAB Rien \xE0 signaler \xBB is a claim, not a default.** Write it only with, on the same line, what
+  you checked in order to say it: \xAB Rien \xE0 signaler (chemins d'erreur et valeurs de retour
+  relus) \xBB. If you cannot name what you checked, you have not checked.
+
+# Where the costly bugs hide
+
+Walk these deliberately, on every changed file. None of them is visible in a diff read line by
+line, which is exactly why they survive until production.
+
+1. **The caller's side.** A changed signature, return shape, thrown error or nullability breaks
+   whoever calls it. If you were not given that caller, say so and ask.
+2. **Error paths.** What happens when this throws, returns null, times out, or gets an empty
+   list? An error caught, logged and swallowed is a silent failure: the feature is dead and
+   nobody is told.
+3. **Edge inputs.** Empty, zero, one element, duplicates, very large. Boundaries of a loop, a
+   slice, a pagination.
+4. **State and ordering.** Two runs racing, a retry replaying a side effect, a cache or a
+   ledger written before the thing it records actually succeeded, a missing await.
+5. **Data and access.** A query crossing a role boundary, a secret or a personal datum reaching
+   a log, a client bundle, or a third party.
+6. **What the change forgot.** A rename applied in two places out of three, a new branch with
+   no test, a migration with no way back.
+
 # How to write it
 
-- Under a section with nothing to say, write \xAB Rien \xE0 signaler \xBB and move on. Do not
-  manufacture remarks to fill space.
 - Every bullet starts with a \`path:line\` in backticks, path relative to the repository root.
 - A line number is read, never estimated. Only cite numbers visible in the numbered excerpts
   below. When a file comes as diff only, cite the path with no line number.
@@ -504,8 +613,10 @@ reader doubt the whole finding, and a true finding dies with its invented suppor
 - Do not recite the rule: say what breaks HERE and what it produces. \xAB Cha\xEEne FR en dur \xBB is
   worthless; \xAB ce libell\xE9 de bouton est \xE9ditorial, il doit vivre dans le contenu sinon il
   \xE9chappe \xE0 l'admin et \xE0 la traduction \xBB is worth something.
-- ${options.maxFindings} bullets maximum across all sections. Past that nobody reads you. Keep
-  the costly ones.
+- ${options.maxFindings} bullets maximum across Bloquant, \xC0 corriger and Suggestions, plus at
+  most five under \xC0 v\xE9rifier. Past that nobody reads you. If you have more, keep the costly
+  ones. This ceiling is there to rank your findings, never to justify dropping one in silence:
+  when you cut, say so in the Verdict.
 - Do not comment on formatting or style that lint and Prettier already settle.
 - No summary of the PR, no compliments, no closing paragraph. The author wrote it.
 - A finding outside the PR's scope is labelled as such, goes under Suggestions, and proposes
@@ -517,7 +628,11 @@ reader doubt the whole finding, and a true finding dies with its invented suppor
 - Bloquant: breaks production, loses or exposes data, leaks a secret or personal data, or
   introduces a certain functional regression.
 - \xC0 corriger: breaks a rule from the doctrine above, or a probable but undemonstrated bug.
-- Suggestions: optional improvements, debt, test blind spots.`;
+- Suggestions: optional improvements, debt, test blind spots.
+- \xC0 v\xE9rifier: what you cannot settle with the files you were given. A suspicion about a caller
+  you were not shown, an invariant you could not confirm, a behaviour that depends on data you
+  cannot see. Say what would confirm or kill it. Sending a real doubt here is right; sending a
+  finding you could have proven from the excerpts above is not.`;
 }
 function buildUserPrompt(meta, context) {
   const fileList = meta.files.map((file) => {
@@ -603,6 +718,9 @@ function renderFooter(footer) {
     formatDuration(footer.durationMs),
     `${count(footer.promptTokens)} tokens en entr\xE9e, ${count(footer.evalTokens)} en sortie`
   ];
+  if (footer.thinkingChars > 0) {
+    bits.push(`${count(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
+  }
   if (footer.skipped.length > 0) {
     bits.push(`${footer.skipped.length} fichier(s) g\xE9n\xE9r\xE9s ignor\xE9s`);
   }
@@ -715,8 +833,15 @@ async function review(config) {
       model: config.model,
       system,
       user,
+      think: config.thinking,
+      temperature: config.temperature,
+      seed: config.seed,
       timeoutMs: config.timeoutMs,
-      onRetry: (reason) => console.warn(`\u26A0 ${reason} \u2014 nouvelle tentative dans 20 s.`)
+      onRetry: (reason) => console.warn(`\u26A0 ${reason} \u2014 nouvelle tentative dans 20 s.`),
+      onDowngrade: (reason) => console.warn(
+        `\u26A0 ${config.model} n'a pas accept\xE9 \xAB thinking: ${config.thinking} \xBB (${reason}).
+  Review relanc\xE9e sans raisonnement explicite : elle sera moins fouill\xE9e.`
+      )
     });
   } catch (error) {
     const reason = error instanceof OllamaError ? error.message : String(error);
@@ -735,6 +860,7 @@ async function review(config) {
       durationMs: result.durationMs,
       promptTokens: result.promptTokens,
       evalTokens: result.evalTokens,
+      thinkingChars: result.thinkingChars,
       skipped: context.skipped,
       omitted: context.omitted
     }

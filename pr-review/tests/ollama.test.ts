@@ -61,27 +61,118 @@ beforeEach(() => {
 const ok = (content: string) =>
   JSON.stringify({ message: { role: 'assistant', content }, prompt_eval_count: 100, eval_count: 20 });
 
-const call = () =>
-  chat({ apiKey: 'faux', model: 'glm-5.2:cloud', system: 'sys', user: 'usr', retryDelayMs: 1 });
+const call = (over: Partial<Parameters<typeof chat>[0]> = {}) =>
+  chat({
+    apiKey: 'faux',
+    model: 'glm-5.2:cloud',
+    system: 'sys',
+    user: 'usr',
+    retryDelayMs: 1,
+    ...over,
+  });
 
 describe('chat · requête', () => {
-  it('demande une réponse déterministe et non streamée', async () => {
+  it('demande une réponse non streamée, sans brider l’échantillonnage', async () => {
     queue.push({ status: 200, body: ok('## Verdict\nok') });
-    await call();
+    await call({ temperature: 1, seed: 1 });
     expect(lastBody.stream).toBe(false);
-    expect(lastBody.options).toEqual({ temperature: 0 });
+    // Surtout pas temperature 0 : voir le commentaire de `ChatOptions`.
+    expect(lastBody.options).toEqual({ temperature: 1, seed: 1 });
     expect(lastBody.messages).toEqual([
       { role: 'system', content: 'sys' },
       { role: 'user', content: 'usr' },
     ]);
   });
 
-  it('rend le contenu et les compteurs de tokens', async () => {
-    queue.push({ status: 200, body: ok('## Verdict\nok') });
+  it('omet la graine quand on n’en veut pas, plutôt que d’en inventer une', async () => {
+    queue.push({ status: 200, body: ok('ok') });
+    await call({ seed: undefined });
+    expect(lastBody.options).toEqual({ temperature: 1 });
+  });
+
+  it('transmet le niveau de raisonnement demandé', async () => {
+    queue.push({ status: 200, body: ok('ok') });
+    await call({ think: 'max' });
+    expect(lastBody.think).toBe('max');
+  });
+
+  it('n’envoie pas « think » du tout quand aucun niveau n’est demandé', async () => {
+    queue.push({ status: 200, body: ok('ok') });
+    await call({ think: '' });
+    expect(lastBody).not.toHaveProperty('think');
+  });
+
+  it('traduit « off » en refus explicite de raisonner, pas en absence de consigne', async () => {
+    queue.push({ status: 200, body: ok('ok') });
+    await call({ think: 'off' });
+    expect(lastBody.think).toBe(false);
+  });
+
+  it('rend le contenu, les compteurs de tokens et la taille du raisonnement', async () => {
+    queue.push({
+      status: 200,
+      body: JSON.stringify({
+        message: { role: 'assistant', content: '## Verdict\nok', thinking: 'abcde' },
+        prompt_eval_count: 100,
+        eval_count: 20,
+      }),
+    });
     const result = await call();
     expect(result.content).toBe('## Verdict\nok');
     expect(result.promptTokens).toBe(100);
     expect(result.evalTokens).toBe(20);
+    expect(result.thinkingChars).toBe(5);
+  });
+});
+
+describe('chat · modèle sans raisonnement', () => {
+  it('rejoue sans « think » plutôt que de rendre l’action inutilisable', async () => {
+    queue.push(
+      { status: 400, body: '{"error":"registry.ollama.ai/library/x does not support thinking"}' },
+      { status: 200, body: ok('review sans raisonnement') },
+    );
+    const downgrades: string[] = [];
+    const result = await call({ think: 'max', onDowngrade: (reason) => downgrades.push(reason) });
+
+    expect(result.content).toBe('review sans raisonnement');
+    expect(calls).toBe(2);
+    // La seconde tentative doit vraiment avoir lâché le paramètre : le rejouer
+    // à l'identique produirait le même 400 et une review perdue.
+    expect(lastBody).not.toHaveProperty('think');
+    // Silencieux, ce repli ferait croire à une review fouillée qui ne l'est pas.
+    expect(downgrades).toHaveLength(1);
+  });
+
+  it('garde le raisonnement quand seul le niveau est fautif', async () => {
+    queue.push(
+      {
+        status: 400,
+        body: '{"error": "invalid think value: "nawak" (must be "high", "medium", "low", "max", true, or false)"}',
+      },
+      { status: 200, body: ok('review quand même raisonnée') },
+    );
+    const result = await call({ think: 'nawak' });
+
+    expect(result.content).toBe('review quand même raisonnée');
+    // Une coquille dans un input ne doit coûter que le niveau demandé, pas la
+    // profondeur d'analyse : on retombe sur le raisonnement par défaut.
+    expect(lastBody.think).toBe(true);
+  });
+
+  it('ne rejoue pas un 400 qui ne parle pas de raisonnement', async () => {
+    queue.push({ status: 400, body: '{"error":"prompt trop long"}' });
+    await expect(call({ think: 'max' })).rejects.toThrow(OllamaError);
+    expect(calls).toBe(1);
+  });
+
+  it('rattrape aussi le refus rendu en 200 avec un corps d’erreur', async () => {
+    queue.push(
+      { status: 200, body: '{"error":"thinking is not supported by this model"}' },
+      { status: 200, body: ok('repli') },
+    );
+    const result = await call({ think: 'high' });
+    expect(result.content).toBe('repli');
+    expect(calls).toBe(2);
   });
 });
 

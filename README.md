@@ -92,14 +92,39 @@ Seul `pr` est obligatoire.
 | `ollama-api-key` | `''` | Clé Ollama Cloud. Vide : review ignorée sans bruit, job vert. |
 | `github-token` | `${{ github.token }}` | Jeton du CLI `gh`. Le jeton du job suffit, avec `pull-requests: write`. |
 | `model` | `glm-5.2:cloud` | Modèle Ollama Cloud. |
+| `thinking` | `max` | Effort de raisonnement : `low`, `medium`, `high`, `max`, `off`. Un modèle qui refuse est relancé sans. |
+| `temperature` | `1` | **Ne pas mettre 0** : voir ci-dessous. |
+| `seed` | `1` | Graine, pour que deux lectures du même diff se ressemblent. `off` rend sa variance au modèle. |
 | `doctrine` | voir ci-dessous | Fichiers de conventions injectés dans le prompt, un chemin par ligne. |
 | `skip` | `''` | Motifs de fichiers à ne pas relire, un par ligne. **S'ajoutent** au socle intégré. |
 | `project-summary` | `''` | Deux ou trois lignes situant le projet, si la doctrine ne le fait pas. |
-| `max-findings` | `12` | Plafond de puces, toutes sections confondues. |
+| `max-findings` | `20` | Plafond de puces pour Bloquant, À corriger et Suggestions. « À vérifier » a son propre plafond de cinq. |
 | `budget-chars` | `500000` | Plafond global du contenu intégral envoyé au modèle. |
 | `per-file-chars` | `80000` | Plafond par fichier. |
 | `timeout-minutes` | `15` | Délai de la requête au modèle. À garder sous le `timeout-minutes` du job. |
 | `dry-run` | `false` | `true` : la review part dans les logs, rien n'est posté. |
+
+### Pourquoi la température n'est pas à zéro
+
+Le réflexe, sur une tâche qui doit être reproductible, est `temperature: 0`. Sur un modèle de
+raisonnement c'est un mauvais calcul : le décodage glouton raccourcit la chaîne de pensée et la
+fait tourner en rond, et on paie en profondeur d'analyse une reproductibilité que le cloud ne
+garantit de toute façon pas. La stabilité d'un jour à l'autre est confiée à `seed`, qui la sert
+sans rien coûter.
+
+Corollaire pour relire une PR sous un autre angle : `seed: off` plutôt que de toucher à la
+température. Deux passages donneront deux lectures différentes, ce qui est le but.
+
+### Ce que le modèle est censé rendre
+
+Cinq rubriques : Verdict, Bloquant, À corriger, Suggestions, **À vérifier**.
+
+La dernière est là pour un motif précis. Un prompt qui réclame de la certitude obtient des
+sections vides : le modèle cherche, trouve quelque chose qu'il ne peut pas prouver avec les
+fichiers qu'on lui a donnés, et le jette. « À vérifier » lui donne où le mettre, ce qui coûte
+bien moins cher qu'un bug passé en silence. Le prompt lui interdit en revanche d'y ranger ce
+qu'il aurait pu démontrer, et lui demande, quand il écrit « Rien à signaler », de dire dans la
+même ligne ce qu'il a vérifié pour l'affirmer.
 
 ### La doctrine
 

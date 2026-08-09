@@ -27,10 +27,25 @@ export interface ChatOptions {
   model: string;
   system: string;
   user: string;
+  /**
+   * Effort de raisonnement : `low`, `medium`, `high`, `max`, ou un booléen.
+   * Vide : le paramètre n'est pas envoyé et le modèle garde son défaut.
+   */
+  think?: string;
+  /**
+   * Vaut 1 par défaut côté appelant, pas 0 : sur un modèle de raisonnement, le
+   * décodage glouton appauvrit la chaîne de pensée et la fait tourner en rond.
+   * C'est la valeur des exemples officiels de GLM-5.
+   */
+  temperature?: number;
+  /** Rend deux lectures du même diff comparables, dans la mesure du possible. */
+  seed?: number;
   timeoutMs?: number;
   /** Sert aux tests, qui ne peuvent pas attendre vingt secondes. */
   retryDelayMs?: number;
   onRetry?: (reason: string) => void;
+  /** Prévient quand le modèle a refusé `think` et qu'on rejoue sans. */
+  onDowngrade?: (reason: string) => void;
 }
 
 export interface ChatResult {
@@ -38,15 +53,26 @@ export interface ChatResult {
   promptTokens: number;
   evalTokens: number;
   durationMs: number;
+  /**
+   * Taille du raisonnement rendu à part, en caractères.
+   *
+   * Reporté dans le pied de page du commentaire : c'est la seule mesure qui dit
+   * si le modèle a creusé ou expédié, et donc si régler `think` a servi à
+   * quelque chose. Vaut 0 quand le modèle mêle son raisonnement au contenu.
+   */
+  thinkingChars: number;
 }
 
 export class OllamaError extends Error {
   /** Une seconde tentative a-t-elle une chance d'aboutir ? */
   readonly retryable: boolean;
-  constructor(message: string, retryable = false) {
+  /** Le modèle a refusé `think` : rejouer sans est la seule issue. */
+  readonly thinkingRejected: boolean;
+  constructor(message: string, retryable = false, thinkingRejected = false) {
     super(message);
     this.name = 'OllamaError';
     this.retryable = retryable;
+    this.thinkingRejected = thinkingRejected;
   }
 }
 
@@ -62,27 +88,72 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** 429 et 5xx valent une seconde tentative ; un 401 ou un 404 de modèle, non. */
 const worthRetrying = (status: number) => status === 429 || status >= 500;
 
+/**
+ * `think` accepte un niveau (`low`, `medium`, `high`, `max`) ou un booléen.
+ *
+ * On transmet la valeur telle quelle plutôt que de la valider contre une liste :
+ * ce que chaque modèle accepte lui appartient, et une liste écrite ici serait
+ * périmée au prochain modèle. Une valeur refusée est rattrapée par le repli de
+ * `chat`, qui distingue les deux refus possibles.
+ */
+function parseThink(value: string): string | boolean {
+  const normalised = value.trim().toLowerCase();
+  if (normalised === 'true') return true;
+  if (/^(false|off|none)$/.test(normalised)) return false;
+  return normalised;
+}
+
+/**
+ * Le serveur a-t-il rejeté la demande de raisonnement ?
+ *
+ * On teste le message et pas le seul code : un 400 vient aussi d'un prompt trop
+ * long, et rejouer sans `think` n'y changerait rien.
+ *
+ * Le corps d'un refus de valeur n'est pas du JSON valide (Ollama n'échappe pas
+ * les guillemets qu'il cite : `invalid think value: "nawak" (...)`), d'où le
+ * test sur le texte brut, avant toute tentative d'analyse.
+ */
+const rejectsThinking = (status: number, body: string) => status === 400 && /think/i.test(body);
+
+/**
+ * Refus de la **valeur**, pas de la fonctionnalité.
+ *
+ * Mesuré : une valeur inconnue rend « invalid think value: … (must be "high",
+ * "medium", "low", "max", true, or false) ». Le modèle sait donc raisonner, seul
+ * le niveau est mauvais : retomber sur `true` garde le raisonnement à son niveau
+ * par défaut, là où retirer le paramètre le supprimerait. Une coquille dans un
+ * input ne doit pas coûter la profondeur de la review.
+ */
+const rejectsThinkingValue = (body: string) => /invalid think value/i.test(body);
+
 export async function chat(options: ChatOptions): Promise<ChatResult> {
   const started = Date.now();
+  const done = (payload: ChatPayload): ChatResult => ({
+    content: payload.message?.content ?? '',
+    promptTokens: payload.prompt_eval_count ?? 0,
+    evalTokens: payload.eval_count ?? 0,
+    thinkingChars: payload.message?.thinking?.length ?? 0,
+    durationMs: Date.now() - started,
+  });
+
   try {
-    const payload = await request(options);
-    return {
-      content: payload.message?.content ?? '',
-      promptTokens: payload.prompt_eval_count ?? 0,
-      evalTokens: payload.eval_count ?? 0,
-      durationMs: Date.now() - started,
-    };
+    return done(await request(options));
   } catch (error) {
-    if (!(error instanceof OllamaError) || !error.retryable) throw error;
+    if (!(error instanceof OllamaError)) throw error;
+    // Un modèle sans raisonnement explicite reste un modèle utilisable : on
+    // rejoue sans `think` plutôt que de rendre une action inutilisable dès que
+    // le dépôt appelant change de modèle.
+    if (error.thinkingRejected && options.think) {
+      // Un niveau mal orthographié ne coûte que le niveau ; un modèle qui ne
+      // raisonne pas coûte le raisonnement. Deux replis, pas un.
+      const fallback = rejectsThinkingValue(error.message) ? 'true' : '';
+      options.onDowngrade?.(error.message);
+      return done(await request({ ...options, think: fallback }));
+    }
+    if (!error.retryable) throw error;
     options.onRetry?.(error.message);
     await sleep(options.retryDelayMs ?? RETRY_DELAY_MS);
-    const payload = await request(options);
-    return {
-      content: payload.message?.content ?? '',
-      promptTokens: payload.prompt_eval_count ?? 0,
-      evalTokens: payload.eval_count ?? 0,
-      durationMs: Date.now() - started,
-    };
+    return done(await request(options));
   }
 }
 
@@ -101,9 +172,14 @@ async function request(options: ChatOptions): Promise<ChatPayload> {
       body: JSON.stringify({
         model: options.model,
         stream: false,
-        // Une review doit être reproductible : deux lectures du même diff ne
-        // doivent pas rendre deux verdicts différents.
-        options: { temperature: 0 },
+        ...(options.think ? { think: parseThink(options.think) } : {}),
+        // Une review doit rester comparable d'un jour à l'autre : c'est la
+        // graine qui s'en charge, pas une température nulle, qui sur un modèle
+        // de raisonnement coûterait la moitié de sa profondeur d'analyse.
+        options: {
+          temperature: options.temperature ?? 1,
+          ...(options.seed === undefined ? {} : { seed: options.seed }),
+        },
         messages: [
           { role: 'system', content: options.system },
           { role: 'user', content: options.user },
@@ -128,6 +204,7 @@ async function request(options: ChatOptions): Promise<ChatPayload> {
     throw new OllamaError(
       `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
       worthRetrying(response.status),
+      rejectsThinking(response.status, text),
     );
   }
 
@@ -137,7 +214,15 @@ async function request(options: ChatOptions): Promise<ChatPayload> {
   } catch {
     throw new OllamaError(`réponse illisible d'Ollama (${text.slice(0, 200)})`);
   }
-  if (payload.error) throw new OllamaError(`Ollama a répondu une erreur : ${payload.error}`);
+  if (payload.error) {
+    // Certaines erreurs arrivent en 200 avec un corps d'erreur : le refus du
+    // raisonnement en fait partie, d'où le même test que sur la voie 400.
+    throw new OllamaError(
+      `Ollama a répondu une erreur : ${payload.error}`,
+      false,
+      /think/i.test(payload.error),
+    );
+  }
   if (!payload.message?.content?.trim()) {
     // Un contenu vide arrive quand tout est parti dans `thinking` : le dire
     // vaut mieux que poster un commentaire vide.

@@ -109,3 +109,31 @@ describe('resolveConfig · nombres illisibles', () => {
     expect(config.timeoutMs).toBe(20 * 60_000);
   });
 });
+
+describe('resolveConfig · réglages du modèle', () => {
+  it('demande le raisonnement maximum par défaut : une review vaut par ce qu’elle trouve', () => {
+    const config = resolve();
+    expect(config.thinking).toBe('max');
+    expect(config.temperature).toBe(1);
+    expect(config.seed).toBe(1);
+  });
+
+  it('laisse le dépôt choisir un autre niveau, y compris aucun', () => {
+    expect(resolve({ INPUT_THINKING: 'high' }).thinking).toBe('high');
+    expect(resolve({ INPUT_THINKING: 'off' }).thinking).toBe('off');
+  });
+
+  it('prévient quand on redemande le décodage glouton, sans l’interdire', () => {
+    const warn = vi.fn();
+    const config = resolveConfig({ argv: ['42'], env: { INPUT_TEMPERATURE: '0' }, warn });
+    // Zéro reste une valeur : c'est un plafond qui ne peut pas être nul, pas
+    // une température.
+    expect(config.temperature).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('rend sa variance au modèle quand la graine est coupée', () => {
+    expect(resolve({ INPUT_SEED: 'off' }).seed).toBeUndefined();
+    expect(resolve({ INPUT_SEED: '7' }).seed).toBe(7);
+  });
+});

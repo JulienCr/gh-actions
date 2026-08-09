@@ -88,6 +88,15 @@ export interface Footer {
   durationMs: number;
   promptTokens: number;
   evalTokens: number;
+  /**
+   * Taille du raisonnement, en caractères.
+   *
+   * Affiché parce que c'est la seule façon, depuis la PR, de voir si le modèle a
+   * creusé ou expédié : une review courte après 40 Ko de raisonnement et la même
+   * review après 2 Ko ne se corrigent pas de la même manière. Vaut 0 quand le
+   * modèle mêle son raisonnement à sa réponse, et la ligne disparaît alors.
+   */
+  thinkingChars: number;
   /** Fichiers écartés d'office (générés, binaires, lockfiles). */
   skipped: string[];
   /** Fichiers dont seul le diff a été envoyé, faute de place. */
@@ -108,6 +117,9 @@ function renderFooter(footer: Footer): string {
     formatDuration(footer.durationMs),
     `${count(footer.promptTokens)} tokens en entrée, ${count(footer.evalTokens)} en sortie`,
   ];
+  if (footer.thinkingChars > 0) {
+    bits.push(`${count(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
+  }
   if (footer.skipped.length > 0) {
     bits.push(`${footer.skipped.length} fichier(s) générés ignorés`);
   }

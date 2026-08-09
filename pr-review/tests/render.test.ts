@@ -79,6 +79,7 @@ const FOOTER = {
   durationMs: 134_000,
   promptTokens: 84_312,
   evalTokens: 1204,
+  thinkingChars: 0,
   skipped: [],
   omitted: [],
 };
@@ -90,6 +91,20 @@ describe('renderComment', () => {
     expect(comment).toContain('## Review automatique');
     expect(comment).toContain('glm-5.2:cloud via Ollama Cloud');
     expect(comment).toContain('2 min 14 s');
+  });
+
+  it('affiche la taille du raisonnement, seul indice qu’une review courte a été creusée', () => {
+    const comment = renderComment({
+      ...OPTIONS,
+      review: '## Verdict\nok',
+      footer: { ...FOOTER, thinkingChars: 40_960 },
+    });
+    expect(comment).toContain('40 Ko de raisonnement');
+  });
+
+  it('tait la ligne de raisonnement quand le modèle n’en rend pas à part', () => {
+    const comment = renderComment({ ...OPTIONS, review: '## Verdict\nok', footer: FOOTER });
+    expect(comment).not.toContain('de raisonnement');
   });
 
   it('annonce une review partielle plutôt que de la laisser passer pour complète', () => {

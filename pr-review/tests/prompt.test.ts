@@ -63,12 +63,39 @@ describe('buildSystemPrompt', () => {
     expect(prompt).not.toContain('ships no review doctrine');
   });
 
-  it('impose les quatre rubriques et le repli « Rien à signaler »', () => {
+  it('impose les cinq rubriques, dont l’exutoire des doutes', () => {
     const prompt = system();
-    for (const heading of ['## Verdict', '## Bloquant', '## À corriger', '## Suggestions']) {
+    for (const heading of [
+      '## Verdict',
+      '## Bloquant',
+      '## À corriger',
+      '## Suggestions',
+      '## À vérifier',
+    ]) {
       expect(prompt).toContain(heading);
     }
-    expect(prompt).toContain('Rien à signaler');
+  });
+
+  it('demande de la couverture, pas de la sélection', () => {
+    const prompt = system();
+    expect(prompt).toContain('coverage, not curation');
+    // Le garde-fou qui a produit trois « Rien à signaler » sur quatre : le
+    // modèle cherchait, trouvait, puis jetait faute de certitude.
+    expect(prompt).not.toContain('Do not manufacture remarks to fill space');
+    expect(prompt).toContain('Do not soften a finding into silence');
+  });
+
+  it('n’accepte « Rien à signaler » qu’accompagné de ce qui a été vérifié', () => {
+    const prompt = system();
+    expect(prompt).toContain('« Rien à signaler » is a claim, not a default');
+  });
+
+  it('donne les axes où se cachent les vrais bugs, qu’un diff ne montre pas', () => {
+    const prompt = system();
+    expect(prompt).toContain('Where the costly bugs hide');
+    for (const axis of ["The caller's side", 'Error paths', 'Edge inputs', 'State and ordering']) {
+      expect(prompt).toContain(axis);
+    }
   });
 
   it('interdit la liste de numéros de ligne, qui a produit un numéro inventé sur quatre', () => {
@@ -85,6 +112,10 @@ describe('buildSystemPrompt', () => {
 
   it('reporte le plafond de puces demandé par le dépôt', () => {
     expect(system({ maxFindings: 5 })).toContain('5 bullets maximum');
+  });
+
+  it('présente le plafond comme un ordre de priorité, pas comme un permis de taire', () => {
+    expect(system()).toContain('never to justify dropping one in silence');
   });
 });
 

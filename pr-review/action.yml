@@ -30,6 +30,31 @@ inputs:
     required: false
     default: 'glm-5.2:cloud'
 
+  thinking:
+    description: >-
+      Effort de raisonnement demandé au modèle : low, medium, high, max, ou off.
+      Ce que chaque modèle accepte lui appartient : un niveau refusé retombe sur
+      le raisonnement par défaut, un modèle qui n'en fait pas est relancé sans.
+      Dans les deux cas la review continue, et le log le dit.
+    required: false
+    default: 'max'
+
+  temperature:
+    description: >-
+      Ne pas mettre 0 : sur un modèle de raisonnement, le décodage glouton rend
+      des reviews courtes et superficielles. Pour de la stabilité, garder cette
+      valeur et fixer « seed ».
+    required: false
+    default: '1'
+
+  seed:
+    description: >-
+      Graine d'échantillonnage, pour que deux lectures du même diff se
+      ressemblent. « off » rend sa variance au modèle, utile pour relire une PR
+      sous un autre angle.
+    required: false
+    default: '1'
+
   doctrine:
     description: >-
       Fichiers de conventions injectés dans le prompt système, un chemin par
@@ -54,9 +79,11 @@ inputs:
     default: ''
 
   max-findings:
-    description: "Nombre maximum de puces, toutes sections confondues."
+    description: >-
+      Nombre maximum de puces pour Bloquant, À corriger et Suggestions. La
+      section « À vérifier » a son propre plafond de cinq.
     required: false
-    default: '12'
+    default: '20'
 
   budget-chars:
     description: "Plafond global du contenu intégral envoyé au modèle, en caractères."

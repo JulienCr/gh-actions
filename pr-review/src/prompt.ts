@@ -38,7 +38,11 @@ Une seule phrase : ce que tu retiens de cette PR.
 - \`chemin/fichier.tsx:17\` : …
 
 ## Suggestions
-- \`chemin/fichier.ts:88\` : …`;
+- \`chemin/fichier.ts:88\` : …
+
+## À vérifier
+- \`chemin/fichier.ts:120\` : ce que tu soupçonnes sans pouvoir le prouver ici, et ce qu'il
+  faudrait regarder pour trancher.`;
 
 export interface DoctrineFile {
   path: string;
@@ -85,15 +89,48 @@ ${renderDoctrine(options.doctrine)}
 
 # Expected output
 
-Return exactly these four sections, in this order, as markdown. The review itself is written
+Return exactly these five sections, in this order, as markdown. The review itself is written
 in French: it is posted as a comment on the PR.
 
 ${OUTPUT_TEMPLATE}
 
+# How hard to look
+
+Your job is coverage, not curation. A finding you swallowed because you were not sure enough
+is a bug that ships. Report what you find and let the section carry your confidence: a doubt
+belongs under « À vérifier », never in the bin.
+
+- **Read every file you were given in full**, not only the changed lines. The diff says what
+  moved; the code around it says what that broke. A reviewer who only reads « + » lines finds
+  only typos.
+- **Do not soften a finding into silence.** When something looks wrong but you cannot prove it
+  from what you were given, say what you saw, what you suspect, and which file would settle
+  it. That is a « À vérifier » bullet, and it is worth more than an empty section.
+- **« Rien à signaler » is a claim, not a default.** Write it only with, on the same line, what
+  you checked in order to say it: « Rien à signaler (chemins d'erreur et valeurs de retour
+  relus) ». If you cannot name what you checked, you have not checked.
+
+# Where the costly bugs hide
+
+Walk these deliberately, on every changed file. None of them is visible in a diff read line by
+line, which is exactly why they survive until production.
+
+1. **The caller's side.** A changed signature, return shape, thrown error or nullability breaks
+   whoever calls it. If you were not given that caller, say so and ask.
+2. **Error paths.** What happens when this throws, returns null, times out, or gets an empty
+   list? An error caught, logged and swallowed is a silent failure: the feature is dead and
+   nobody is told.
+3. **Edge inputs.** Empty, zero, one element, duplicates, very large. Boundaries of a loop, a
+   slice, a pagination.
+4. **State and ordering.** Two runs racing, a retry replaying a side effect, a cache or a
+   ledger written before the thing it records actually succeeded, a missing await.
+5. **Data and access.** A query crossing a role boundary, a secret or a personal datum reaching
+   a log, a client bundle, or a third party.
+6. **What the change forgot.** A rename applied in two places out of three, a new branch with
+   no test, a migration with no way back.
+
 # How to write it
 
-- Under a section with nothing to say, write « Rien à signaler » and move on. Do not
-  manufacture remarks to fill space.
 - Every bullet starts with a \`path:line\` in backticks, path relative to the repository root.
 - A line number is read, never estimated. Only cite numbers visible in the numbered excerpts
   below. When a file comes as diff only, cite the path with no line number.
@@ -122,8 +159,10 @@ reader doubt the whole finding, and a true finding dies with its invented suppor
 - Do not recite the rule: say what breaks HERE and what it produces. « Chaîne FR en dur » is
   worthless; « ce libellé de bouton est éditorial, il doit vivre dans le contenu sinon il
   échappe à l'admin et à la traduction » is worth something.
-- ${options.maxFindings} bullets maximum across all sections. Past that nobody reads you. Keep
-  the costly ones.
+- ${options.maxFindings} bullets maximum across Bloquant, À corriger and Suggestions, plus at
+  most five under À vérifier. Past that nobody reads you. If you have more, keep the costly
+  ones. This ceiling is there to rank your findings, never to justify dropping one in silence:
+  when you cut, say so in the Verdict.
 - Do not comment on formatting or style that lint and Prettier already settle.
 - No summary of the PR, no compliments, no closing paragraph. The author wrote it.
 - A finding outside the PR's scope is labelled as such, goes under Suggestions, and proposes
@@ -135,7 +174,11 @@ reader doubt the whole finding, and a true finding dies with its invented suppor
 - Bloquant: breaks production, loses or exposes data, leaks a secret or personal data, or
   introduces a certain functional regression.
 - À corriger: breaks a rule from the doctrine above, or a probable but undemonstrated bug.
-- Suggestions: optional improvements, debt, test blind spots.`;
+- Suggestions: optional improvements, debt, test blind spots.
+- À vérifier: what you cannot settle with the files you were given. A suspicion about a caller
+  you were not shown, an invariant you could not confirm, a behaviour that depends on data you
+  cannot see. Say what would confirm or kill it. Sending a real doubt here is right; sending a
+  finding you could have proven from the excerpts above is not.`;
 }
 
 export function buildUserPrompt(meta: PrMeta, context: AssembledContext): string {
