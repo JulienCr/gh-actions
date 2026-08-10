@@ -307,6 +307,18 @@ describe('chat · panne de transport', () => {
     });
   });
 
+  it('ne recopie pas les identifiants d’une URL dans le message', async () => {
+    // Mesuré : `fetch` refuse une URL portant des identifiants, et son refus
+    // les cite en clair — « Request cannot be constructed from a URL that
+    // includes credentials: http://user:motdepasse@… ». Le message part
+    // directement dans le journal d'un dépôt public, alors même que le refus
+    // garantit qu'aucune connexion n'a eu lieu.
+    await withHost('http://sonde:motdepasse@127.0.0.1:11434', async () => {
+      await expect(call()).rejects.toThrow(/identifiants|credentials/i);
+      await expect(call()).rejects.not.toThrow(/motdepasse/);
+    });
+  });
+
   it('nomme le code même quand aucun message ne le porte', async () => {
     // Une connexion coupée en plein flux — le risque propre à un appel de
     // plusieurs minutes. Mesuré : « terminated » puis « other side closed », et
@@ -365,6 +377,22 @@ describe('chat · réponses inexploitables', () => {
     expect(calls).toBe(2);
   });
 
+  it('traite une coupure au milieu d’une ligne comme l’interruption qu’elle est', async () => {
+    // Même panne que le test précédent, à ceci près qu'elle tombe au milieu
+    // d'un fragment plutôt qu'entre deux. La classer « illisible » la rendrait
+    // non reprisable, et perdrait la review sur un détail d'alignement des
+    // octets — alors que la coupure entre deux lignes, elle, vaut une reprise.
+    const cut = {
+      status: 200,
+      body:
+        `${JSON.stringify({ message: { content: 'la revue commence' }, done: false })}\n` +
+        '{"message":{"content":"et se fait couper au mil',
+    };
+    queue.push(cut, { ...cut });
+    await expect(call()).rejects.toThrow(/interrompu/);
+    expect(calls).toBe(2);
+  });
+
   it('signale un corps non JSON', async () => {
     queue.push({ status: 200, body: '<html>proxy</html>' });
     await expect(call()).rejects.toThrow(/illisible/);
@@ -378,6 +406,25 @@ describe('chat · dépassement de délai', () => {
     await withServer(
       () => {
         /* ne répond jamais */
+      },
+      async () => {
+        await expect(
+          chat({ apiKey: 'faux', model: 'm', system: 's', user: 'u', timeoutMs: 60, retryDelayMs: 1 }),
+        ).rejects.toThrow(/n'a pas répondu/);
+      },
+    );
+  });
+
+  it('couvre aussi la lecture d’un corps d’erreur qui n’arrive jamais', async () => {
+    // Le corps d'un refus est court, mais rien ne garantit qu'il arrive : un
+    // 503 rendu par un proxy à bout de souffle peut annoncer une taille puis se
+    // taire. Sans traitement, l'abandon remonterait en `DOMException` brute,
+    // hors de la classification (donc ni nommé, ni marqué non reprisable).
+    await withServer(
+      (_req, res) => {
+        res.writeHead(503, { 'content-type': 'text/plain', 'content-length': '100' });
+        res.write('le corps commence');
+        /* et ne finit jamais */
       },
       async () => {
         await expect(

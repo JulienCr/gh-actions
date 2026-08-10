@@ -250,22 +250,20 @@ async function request(options: ChatOptions): Promise<ChatPayload> {
     throw transportError(error, timeoutMs);
   }
 
-  if (!response.ok) {
-    // Un refus tient en quelques lignes et arrive d'un coup : le lire en entier
-    // ne risque pas l'attente que le streaming sert à éviter.
-    const text = await response.text();
-    throw new OllamaError(
-      `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
-      worthRetrying(response.status),
-      rejectsThinking(response.status, text),
-    );
-  }
-
-  // La lecture du flux est soumise au même traitement que l'appel : en
-  // streaming, l'essentiel de l'attente se passe ici, après que `fetch` a résolu
-  // sur les seuls en-têtes. Une panne de transport y arrive donc bien plus
-  // souvent que sur l'appel lui-même.
+  // Toute lecture du corps est soumise au même traitement que l'appel : en
+  // streaming, l'essentiel de l'attente se passe après que `fetch` a résolu sur
+  // les seuls en-têtes. Une panne de transport y arrive donc bien plus souvent
+  // que sur l'appel lui-même — y compris sur le corps d'un refus, court mais
+  // pas garanti d'arriver.
   try {
+    if (!response.ok) {
+      const text = await response.text();
+      throw new OllamaError(
+        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
+        worthRetrying(response.status),
+        rejectsThinking(response.status, text),
+      );
+    }
     return await collect(response);
   } catch (error) {
     if (error instanceof OllamaError) throw error;
@@ -276,8 +274,10 @@ async function request(options: ChatOptions): Promise<ChatPayload> {
 /**
  * Traduit une panne de transport en erreur explicite.
  *
- * Ni l'URL ni les en-têtes ne sont repris : la clé ne doit jamais atterrir dans
- * un journal de CI.
+ * Rien de la requête n'est recopié ici. Ce qu'on ne maîtrise pas, en revanche,
+ * c'est ce que le message d'undici contient de son côté : il cite volontiers
+ * l'URL visée, d'où le masquage de `redact`. La clé de l'API, elle, voyage dans
+ * un en-tête et n'apparaît dans aucun de ces messages.
  */
 function transportError(error: unknown, timeoutMs: number): OllamaError {
   // Un dépassement de délai ne se reprend pas : le même prompt reprendrait le
@@ -308,8 +308,20 @@ function describeCause(error: unknown): string {
     chain.push(typeof code === 'string' ? `${current.message} [${code}]` : current.message);
     current = current.cause;
   }
-  return chain.length > 0 ? chain.join(' ← ') : String(error);
+  return redact(chain.length > 0 ? chain.join(' ← ') : String(error));
 }
+
+/**
+ * Masque les identifiants qu'une URL trimballerait dans un message d'erreur.
+ *
+ * Mesuré : `fetch` refuse une URL qui en porte — « Request cannot be
+ * constructed from a URL that includes credentials: … » — et cite l'URL
+ * entière, mot de passe compris. Le refus garantit qu'aucune connexion n'a eu
+ * lieu, mais le message, lui, part dans le journal d'un dépôt public. C'est
+ * `OLLAMA_HOST` qui ouvre ce chemin, la clé de l'API voyageant pour sa part
+ * dans un en-tête, qui n'est jamais journalisé.
+ */
+const redact = (text: string) => text.replace(/\/\/[^/\s@]+@/g, '//***@');
 
 /** Recompose la réponse complète à partir des fragments du flux. */
 async function collect(response: Response): Promise<ChatPayload> {
@@ -318,14 +330,22 @@ async function collect(response: Response): Promise<ChatPayload> {
   let promptTokens = 0;
   let evalTokens = 0;
   let complete = false;
+  let fragments = 0;
 
   for await (const line of streamLines(response.body!)) {
     let chunk: StreamChunk;
     try {
       chunk = JSON.parse(line) as StreamChunk;
     } catch {
+      // Une ligne illisible APRÈS des fragments valides n'est pas un corps
+      // étranger : c'est le dernier fragment, coupé en son milieu. La même
+      // panne que l'absence de `done`, à un alignement d'octets près — d'où le
+      // même traitement, plutôt qu'un « illisible » non reprisable qui perdrait
+      // la review sur ce seul détail.
+      if (fragments > 0) break;
       throw new OllamaError(`réponse illisible d'Ollama (${line.slice(0, 200)})`);
     }
+    fragments += 1;
     if (chunk.error) {
       // Certaines erreurs arrivent en 200 avec un corps d'erreur : le refus du
       // raisonnement en fait partie, d'où le même test que sur la voie 400.

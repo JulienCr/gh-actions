@@ -617,15 +617,15 @@ async function request(options) {
   } catch (error) {
     throw transportError(error, timeoutMs);
   }
-  if (!response.ok) {
-    const text = await response.text();
-    throw new OllamaError(
-      `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
-      worthRetrying(response.status),
-      rejectsThinking(response.status, text)
-    );
-  }
   try {
+    if (!response.ok) {
+      const text = await response.text();
+      throw new OllamaError(
+        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
+        worthRetrying(response.status),
+        rejectsThinking(response.status, text)
+      );
+    }
     return await collect(response);
   } catch (error) {
     if (error instanceof OllamaError) throw error;
@@ -648,21 +648,25 @@ function describeCause(error) {
     chain.push(typeof code === "string" ? `${current.message} [${code}]` : current.message);
     current = current.cause;
   }
-  return chain.length > 0 ? chain.join(" \u2190 ") : String(error);
+  return redact(chain.length > 0 ? chain.join(" \u2190 ") : String(error));
 }
+var redact = (text) => text.replace(/\/\/[^/\s@]+@/g, "//***@");
 async function collect(response) {
   let content = "";
   let thinking = "";
   let promptTokens = 0;
   let evalTokens = 0;
   let complete = false;
+  let fragments = 0;
   for await (const line of streamLines(response.body)) {
     let chunk;
     try {
       chunk = JSON.parse(line);
     } catch {
+      if (fragments > 0) break;
       throw new OllamaError(`r\xE9ponse illisible d'Ollama (${line.slice(0, 200)})`);
     }
+    fragments += 1;
     if (chunk.error) {
       throw new OllamaError(
         `Ollama a r\xE9pondu une erreur : ${chunk.error}`,
