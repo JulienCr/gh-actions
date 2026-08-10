@@ -58,8 +58,49 @@ beforeEach(() => {
   calls = 0;
 });
 
+/**
+ * Une réponse complète tient en un seul fragment, `done: true` compris : c'est
+ * ce marqueur, et non la fermeture de la connexion, qui distingue une
+ * génération terminée d'un flux coupé en route.
+ */
 const ok = (content: string) =>
-  JSON.stringify({ message: { role: 'assistant', content }, prompt_eval_count: 100, eval_count: 20 });
+  JSON.stringify({
+    message: { role: 'assistant', content },
+    done: true,
+    prompt_eval_count: 100,
+    eval_count: 20,
+  });
+
+/**
+ * Détourne l'appelant vers un autre hôte le temps d'un test, et le restaure même
+ * si l'assertion échoue : sans le `finally`, un seul test rouge laisse la
+ * variable d'environnement en place et fait tomber tous les suivants, qui
+ * accusent alors le mauvais coupable.
+ */
+async function withHost(url: string, body: () => Promise<void>): Promise<void> {
+  const previous = process.env.OLLAMA_HOST;
+  process.env.OLLAMA_HOST = url;
+  try {
+    await body();
+  } finally {
+    if (previous === undefined) delete process.env.OLLAMA_HOST;
+    else process.env.OLLAMA_HOST = previous;
+  }
+}
+
+/** Ouvre un serveur éphémère, le referme quoi qu'il arrive, et y pointe l'appelant. */
+async function withServer(
+  handler: Parameters<typeof createServer>[1],
+  body: () => Promise<void>,
+): Promise<void> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await withHost(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, body);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
 
 const call = (over: Partial<Parameters<typeof chat>[0]> = {}) =>
   chat({
@@ -72,10 +113,15 @@ const call = (over: Partial<Parameters<typeof chat>[0]> = {}) =>
   });
 
 describe('chat · requête', () => {
-  it('demande une réponse non streamée, sans brider l’échantillonnage', async () => {
+  it('demande une réponse streamée, sans brider l’échantillonnage', async () => {
     queue.push({ status: 200, body: ok('## Verdict\nok') });
     await call({ temperature: 1, seed: 1 });
-    expect(lastBody.stream).toBe(false);
+    // Non négociable : sans streaming, Ollama ne renvoie pas un octet avant la
+    // fin de la génération, et le `fetch` de Node abandonne au bout de 300 s
+    // d'attente d'en-têtes (`UND_ERR_HEADERS_TIMEOUT`), quel que soit
+    // l'`AbortSignal` posé par l'appelant. Mesuré sur la PR wolfgangparis#578 :
+    // la passe la plus bavarde tombait à 300,8 s.
+    expect(lastBody.stream).toBe(true);
     // Surtout pas temperature 0 : voir le commentaire de `ChatOptions`.
     expect(lastBody.options).toEqual({ temperature: 1, seed: 1 });
     expect(lastBody.messages).toEqual([
@@ -108,11 +154,31 @@ describe('chat · requête', () => {
     expect(lastBody.think).toBe(false);
   });
 
+  it('agrège les fragments du flux en une seule réponse', async () => {
+    queue.push({
+      status: 200,
+      body: [
+        JSON.stringify({ message: { role: 'assistant', thinking: 'je ré', content: '' }, done: false }),
+        JSON.stringify({ message: { role: 'assistant', thinking: 'fléchis', content: '## Verdict\n' }, done: false }),
+        JSON.stringify({ message: { role: 'assistant', content: 'rien à signaler' }, done: false }),
+        // Ollama ne renseigne les compteurs que sur le dernier fragment.
+        JSON.stringify({ message: { role: 'assistant', content: '' }, done: true, prompt_eval_count: 84817, eval_count: 31158 }),
+      ].join('\n'),
+    });
+    const result = await call();
+
+    expect(result.content).toBe('## Verdict\nrien à signaler');
+    expect(result.thinkingChars).toBe('je réfléchis'.length);
+    expect(result.promptTokens).toBe(84817);
+    expect(result.evalTokens).toBe(31158);
+  });
+
   it('rend le contenu, les compteurs de tokens et la taille du raisonnement', async () => {
     queue.push({
       status: 200,
       body: JSON.stringify({
         message: { role: 'assistant', content: '## Verdict\nok', thinking: 'abcde' },
+        done: true,
         prompt_eval_count: 100,
         eval_count: 20,
       }),
@@ -202,6 +268,17 @@ describe('chat · reprise', () => {
     expect(calls).toBe(1);
   });
 
+  it('chronomètre la tentative retenue, et non la somme des essais', async () => {
+    queue.push({ status: 503, body: 'ko' }, { status: 200, body: ok('enfin') });
+    const result = await call({ retryDelayMs: 300 });
+
+    expect(result.content).toBe('enfin');
+    // Une durée cumulée est pire qu'absente : sur wolfgangparis#578 elle a
+    // affiché « 611 s » pour deux tentatives de ~300 s, ce qui a rendu invisible
+    // le plafond de 300 s que chacune venait de heurter.
+    expect(result.durationMs).toBeLessThan(300);
+  });
+
   it('abandonne après un second échec, sans troisième tentative', async () => {
     queue.push({ status: 503, body: 'ko' }, { status: 503, body: 'toujours ko' });
     await expect(call()).rejects.toThrow(OllamaError);
@@ -209,9 +286,49 @@ describe('chat · reprise', () => {
   });
 });
 
+describe('chat · panne de transport', () => {
+  it('nomme la cause, que « fetch failed » seul rend indéchiffrable', async () => {
+    // `fetch` rend un « fetch failed » nu et range tout ce qui sert au
+    // diagnostic (ECONNREFUSED, UND_ERR_HEADERS_TIMEOUT…) dans `cause`. Sans
+    // cette remontée, un journal de CI ne permet pas de distinguer un port
+    // fermé d'un délai dépassé : mesuré sur wolfgangparis#578, où il a fallu
+    // rejouer la panne à côté pour l'identifier.
+    // Un port éphémère refermé aussitôt : la connexion est refusée pour de bon.
+    // Surtout pas un port bas « jamais écouté » (1, 22…) : `fetch` en refuse
+    // toute une liste avant même de tenter la connexion, et rend un « bad port »
+    // qui ne dit rien du transport.
+    const closed = createServer();
+    await new Promise<void>((resolve) => closed.listen(0, '127.0.0.1', resolve));
+    const port = (closed.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => closed.close(() => resolve()));
+
+    await withHost(`http://127.0.0.1:${port}`, async () => {
+      await expect(call()).rejects.toThrow(/ECONNREFUSED/);
+    });
+  });
+
+  it('nomme le code même quand aucun message ne le porte', async () => {
+    // Une connexion coupée en plein flux — le risque propre à un appel de
+    // plusieurs minutes. Mesuré : « terminated » puis « other side closed », et
+    // le seul terme identifiant la panne, UND_ERR_SOCKET, n'est que dans `code`.
+    await withServer(
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.write(`${JSON.stringify({ message: { content: 'coupé net' }, done: false })}\n`);
+        res.destroy();
+      },
+      async () => {
+        await expect(call()).rejects.toThrow(/UND_ERR_SOCKET/);
+      },
+    );
+  });
+});
+
 describe('chat · réponses inexploitables', () => {
   it('refuse une réponse vide plutôt que de poster un commentaire blanc', async () => {
-    queue.push({ status: 200, body: JSON.stringify({ message: { content: '   ' } }) });
+    // Génération bel et bien terminée, mais qui n'a rien produit d'affichable :
+    // tout est parti dans le raisonnement.
+    queue.push({ status: 200, body: JSON.stringify({ message: { content: '   ' }, done: true }) });
     await expect(call()).rejects.toThrow(/réponse vide/);
     expect(calls).toBe(1);
   });
@@ -219,6 +336,33 @@ describe('chat · réponses inexploitables', () => {
   it('remonte une erreur applicative arrivée en 200', async () => {
     queue.push({ status: 200, body: JSON.stringify({ error: 'model is loading' }) });
     await expect(call()).rejects.toThrow(/model is loading/);
+  });
+
+  it('refuse un flux interrompu avant la fin plutôt que de poster une review tronquée', async () => {
+    // Ni erreur ni statut : le flux s'arrête, simplement. Sans le marqueur
+    // `done`, rien ne distingue ça d'une génération terminée — sinon ce test.
+    const truncated = {
+      status: 200,
+      body: [
+        JSON.stringify({ message: { content: '## Verdict\nla revue commence' }, done: false }),
+        JSON.stringify({ message: { content: ' et se fait couper' }, done: false }),
+      ].join('\n'),
+    };
+    // Deux fois : la coupure vaut une reprise (test suivant), c'est donc la
+    // seconde qui décide de l'abandon.
+    queue.push(truncated, { ...truncated });
+    await expect(call()).rejects.toThrow(/interrompu/);
+    expect(calls).toBe(2);
+  });
+
+  it('reprend un flux interrompu : une coupure de transport peut ne pas se répéter', async () => {
+    queue.push(
+      { status: 200, body: JSON.stringify({ message: { content: 'coupé' }, done: false }) },
+      { status: 200, body: ok('complet') },
+    );
+    const result = await call();
+    expect(result.content).toBe('complet');
+    expect(calls).toBe(2);
   });
 
   it('signale un corps non JSON', async () => {
@@ -231,18 +375,33 @@ describe('chat · dépassement de délai', () => {
   it("n'est pas repris : le même prompt reprendrait le même temps", async () => {
     // Aucune réponse programmée côté serveur n'est nécessaire : le délai est si
     // court que la requête est abandonnée avant toute réponse utile.
-    const slow = createServer(() => {
-      /* ne répond jamais */
-    });
-    await new Promise<void>((resolve) => slow.listen(0, '127.0.0.1', resolve));
-    const previous = process.env.OLLAMA_HOST;
-    process.env.OLLAMA_HOST = `http://127.0.0.1:${(slow.address() as AddressInfo).port}`;
+    await withServer(
+      () => {
+        /* ne répond jamais */
+      },
+      async () => {
+        await expect(
+          chat({ apiKey: 'faux', model: 'm', system: 's', user: 'u', timeoutMs: 60, retryDelayMs: 1 }),
+        ).rejects.toThrow(/n'a pas répondu/);
+      },
+    );
+  });
 
-    await expect(
-      chat({ apiKey: 'faux', model: 'm', system: 's', user: 'u', timeoutMs: 60, retryDelayMs: 1 }),
-    ).rejects.toThrow(/n'a pas répondu/);
-
-    process.env.OLLAMA_HOST = previous;
-    await new Promise<void>((resolve) => slow.close(() => resolve()));
+  it('couvre la lecture du flux, et pas seulement l’attente des en-têtes', async () => {
+    // Le piège propre au streaming : les en-têtes arrivent, `fetch` résout, et
+    // l'attente se déplace dans la boucle de lecture. Un délai qui ne couvrirait
+    // que l'appel laisserait le job pendre jusqu'à ce que GitHub le tue.
+    await withServer(
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.write(`${JSON.stringify({ message: { content: 'je commence' }, done: false })}\n`);
+        /* puis plus jamais rien */
+      },
+      async () => {
+        await expect(
+          chat({ apiKey: 'faux', model: 'm', system: 's', user: 'u', timeoutMs: 60, retryDelayMs: 1 }),
+        ).rejects.toThrow(/n'a pas répondu/);
+      },
+    );
   });
 });
