@@ -532,6 +532,22 @@ var OllamaError = class extends Error {
     this.thinkingRejected = thinkingRejected;
   }
 };
+async function* streamLines(body) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for await (const chunk of body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    let cut = buffer.indexOf("\n");
+    while (cut !== -1) {
+      const line = buffer.slice(0, cut).trim();
+      buffer = buffer.slice(cut + 1);
+      if (line) yield line;
+      cut = buffer.indexOf("\n");
+    }
+  }
+  const rest = (buffer + decoder.decode()).trim();
+  if (rest) yield rest;
+}
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var worthRetrying = (status) => status === 429 || status >= 500;
 function parseThink(value) {
@@ -542,28 +558,31 @@ function parseThink(value) {
 }
 var rejectsThinking = (status, body) => status === 400 && /think/i.test(body);
 var rejectsThinkingValue = (body) => /invalid think value/i.test(body);
-async function chat(options) {
+async function attempt(options) {
   const started = Date.now();
-  const done = (payload) => ({
+  const payload = await request(options);
+  return {
     content: payload.message?.content ?? "",
     promptTokens: payload.prompt_eval_count ?? 0,
     evalTokens: payload.eval_count ?? 0,
     thinkingChars: payload.message?.thinking?.length ?? 0,
     durationMs: Date.now() - started
-  });
+  };
+}
+async function chat(options) {
   try {
-    return done(await request(options));
+    return await attempt(options);
   } catch (error) {
     if (!(error instanceof OllamaError)) throw error;
     if (error.thinkingRejected && options.think) {
       const fallback = rejectsThinkingValue(error.message) ? "true" : "";
       options.onDowngrade?.(error.message);
-      return done(await request({ ...options, think: fallback }));
+      return attempt({ ...options, think: fallback });
     }
     if (!error.retryable) throw error;
     options.onRetry?.(error.message);
     await sleep(options.retryDelayMs ?? RETRY_DELAY_MS);
-    return done(await request(options));
+    return attempt(options);
   }
 }
 async function request(options) {
@@ -579,7 +598,7 @@ async function request(options) {
       },
       body: JSON.stringify({
         model: options.model,
-        stream: false,
+        stream: true,
         ...options.think ? { think: parseThink(options.think) } : {},
         // Une review doit rester comparable d'un jour à l'autre : c'est la
         // graine qui s'en charge, pas une température nulle, qui sur un modèle
@@ -596,37 +615,82 @@ async function request(options) {
       signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    if (error instanceof Error && error.name === "TimeoutError") {
-      throw new OllamaError(`Ollama n'a pas r\xE9pondu en ${Math.round(timeoutMs / 6e4)} min`);
-    }
-    throw new OllamaError(`appel \xE0 Ollama impossible (${reason})`, true);
+    throw transportError(error, timeoutMs);
   }
-  const text = await response.text();
-  if (!response.ok) {
-    throw new OllamaError(
-      `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
-      worthRetrying(response.status),
-      rejectsThinking(response.status, text)
-    );
-  }
-  let payload;
   try {
-    payload = JSON.parse(text);
-  } catch {
-    throw new OllamaError(`r\xE9ponse illisible d'Ollama (${text.slice(0, 200)})`);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new OllamaError(
+        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
+        worthRetrying(response.status),
+        rejectsThinking(response.status, text)
+      );
+    }
+    return await collect(response);
+  } catch (error) {
+    if (error instanceof OllamaError) throw error;
+    throw transportError(error, timeoutMs);
   }
-  if (payload.error) {
-    throw new OllamaError(
-      `Ollama a r\xE9pondu une erreur : ${payload.error}`,
-      false,
-      /think/i.test(payload.error)
-    );
+}
+function transportError(error, timeoutMs) {
+  if (error instanceof Error && error.name === "TimeoutError") {
+    return new OllamaError(`Ollama n'a pas r\xE9pondu en ${Math.round(timeoutMs / 6e4)} min`);
   }
-  if (!payload.message?.content?.trim()) {
+  return new OllamaError(`appel \xE0 Ollama impossible (${describeCause(error)})`, true);
+}
+function describeCause(error) {
+  const chain = [];
+  const seen = /* @__PURE__ */ new Set();
+  let current = error;
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    const code = current.code;
+    chain.push(typeof code === "string" ? `${current.message} [${code}]` : current.message);
+    current = current.cause;
+  }
+  return redact(chain.length > 0 ? chain.join(" \u2190 ") : String(error));
+}
+var redact = (text) => text.replace(/\/\/[^/\s@]+@/g, "//***@");
+async function collect(response) {
+  let content = "";
+  let thinking = "";
+  let promptTokens = 0;
+  let evalTokens = 0;
+  let complete = false;
+  let fragments = 0;
+  for await (const line of streamLines(response.body)) {
+    let chunk;
+    try {
+      chunk = JSON.parse(line);
+    } catch {
+      if (fragments > 0) break;
+      throw new OllamaError(`r\xE9ponse illisible d'Ollama (${line.slice(0, 200)})`);
+    }
+    fragments += 1;
+    if (chunk.error) {
+      throw new OllamaError(
+        `Ollama a r\xE9pondu une erreur : ${chunk.error}`,
+        false,
+        /think/i.test(chunk.error)
+      );
+    }
+    content += chunk.message?.content ?? "";
+    thinking += chunk.message?.thinking ?? "";
+    if (chunk.prompt_eval_count !== void 0) promptTokens = chunk.prompt_eval_count;
+    if (chunk.eval_count !== void 0) evalTokens = chunk.eval_count;
+    if (chunk.done) complete = true;
+  }
+  if (!complete) {
+    throw new OllamaError("le flux d'Ollama s'est interrompu avant la fin de la r\xE9ponse", true);
+  }
+  if (!content.trim()) {
     throw new OllamaError("Ollama a rendu une r\xE9ponse vide");
   }
-  return payload;
+  return {
+    message: { content, thinking },
+    prompt_eval_count: promptTokens,
+    eval_count: evalTokens
+  };
 }
 function describeStatus(status) {
   if (status === 401 || status === 403) return "(cl\xE9 refus\xE9e)";
