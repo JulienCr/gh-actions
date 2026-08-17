@@ -98,7 +98,7 @@ describe('renderComment', () => {
   it('porte le marqueur, le titre et le pied de page', () => {
     const comment = renderComment({ ...OPTIONS, review: '## Verdict\nok', footer: FOOTER });
     expect(comment.startsWith(MARKER)).toBe(true);
-    expect(comment).toContain('## Review automatique');
+    expect(comment).toContain('## Aristarque — review automatique');
     expect(comment).toContain('glm-5.2:cloud via Ollama Cloud');
     expect(comment).toContain('2 min 14 s');
   });
@@ -183,6 +183,7 @@ describe('renderPartialComment', () => {
 
   it('rend les trouvailles déjà payées plutôt que de les jeter avec la fusion', () => {
     expect(comment.startsWith(MARKER)).toBe(true);
+    expect(comment).toContain('## Aristarque — review automatique');
     expect(comment).toContain("Ollama n'a pas répondu en 15 min");
     expect(comment).toContain('### régression fonctionnelle');
     expect(comment).toContain('### données et accès');
@@ -203,6 +204,7 @@ describe('renderFailureComment', () => {
   it('dit pourquoi la review manque, plutôt que de rester muet', () => {
     const comment = renderFailureComment('HTTP 429 (quota atteint)', 'glm-5.2:cloud');
     expect(comment.startsWith(MARKER)).toBe(true);
+    expect(comment).toContain('## Aristarque — review automatique');
     expect(comment).toContain('HTTP 429');
     expect(comment).toContain("n'est pas bloquante");
   });

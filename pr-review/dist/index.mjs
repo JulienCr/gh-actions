@@ -1016,7 +1016,8 @@ ${blocks}`;
 }
 
 // pr-review/src/render.ts
-var MARKER = "<!-- ollama-review -->";
+var MARKER = "<!-- aristarque -->";
+var HEADING = "## Aristarque \u2014 review automatique";
 var FIRST_HEADING = "## Verdict";
 var MAX_LENGTH = 12e3;
 function extractReview(content, heading = FIRST_HEADING) {
@@ -1085,7 +1086,7 @@ function enumerate(items) {
 function renderComment(input) {
   const body = linkifyPaths(extractReview(input.review), input);
   return `${MARKER}
-## Review automatique
+${HEADING}
 
 ${body}
 
@@ -1098,7 +1099,7 @@ function renderPartialComment(input) {
 
 ${linkifyPaths(pass.findings.trim(), input)}`).join("\n\n");
   return `${MARKER}
-## Review automatique
+${HEADING}
 
 _La synth\xE8se n'a pas pu \xEAtre produite (${input.reason}). Voici les trouvailles brutes des passes qui
 ont abouti : ni tri\xE9es, ni d\xE9dupliqu\xE9es, ni plafonn\xE9es._
@@ -1111,7 +1112,7 @@ ${renderFooter(input.footer)}`;
 }
 function renderFailureComment(reason, model) {
   return `${MARKER}
-## Review automatique
+${HEADING}
 
 La review n'a pas pu \xEAtre produite : ${reason}
 

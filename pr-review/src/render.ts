@@ -3,7 +3,17 @@
  */
 
 /** Permet de retrouver le commentaire de la review parmi les autres. */
-export const MARKER = '<!-- ollama-review -->';
+export const MARKER = '<!-- aristarque -->';
+
+/**
+ * Le titre que porte tout commentaire posté, review réussie ou non.
+ *
+ * Écrit une fois : les trois rendus ci-dessous en portaient chacun leur copie
+ * littérale, et trois copies d'un titre finissent par en faire trois. Le nom
+ * d'abord, la fonction ensuite, parce qu'« Aristarque » seul ne dit rien à qui
+ * croise le bot pour la première fois.
+ */
+const HEADING = '## Aristarque — review automatique';
 
 /** Première rubrique du gabarit : c'est elle qui sépare la réflexion de la review. */
 const FIRST_HEADING = '## Verdict';
@@ -166,7 +176,7 @@ export interface CommentInput extends LinkifyOptions {
 export function renderComment(input: CommentInput): string {
   const body = linkifyPaths(extractReview(input.review), input);
   return `${MARKER}
-## Review automatique
+${HEADING}
 
 ${body}
 
@@ -196,7 +206,7 @@ export function renderPartialComment(input: PartialCommentInput): string {
     .join('\n\n');
 
   return `${MARKER}
-## Review automatique
+${HEADING}
 
 _La synthèse n'a pas pu être produite (${input.reason}). Voici les trouvailles brutes des passes qui
 ont abouti : ni triées, ni dédupliquées, ni plafonnées._
@@ -216,7 +226,7 @@ ${renderFooter(input.footer)}`;
  */
 export function renderFailureComment(reason: string, model: string): string {
   return `${MARKER}
-## Review automatique
+${HEADING}
 
 La review n'a pas pu être produite : ${reason}
 

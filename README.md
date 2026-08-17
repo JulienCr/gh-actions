@@ -5,13 +5,18 @@ par des tags `vX.Y.Z` plus un tag majeur mobile `vX`.
 
 | Action | Ce qu'elle fait |
 | --- | --- |
-| [`pr-review`](#pr-review) | Relit une pull request avec un modèle Ollama Cloud, en trois passes, et poste un commentaire de synthèse. |
+| [`pr-review`](#pr-review) | **Aristarque** relit une pull request avec un modèle Ollama Cloud, en trois passes, et poste un commentaire de synthèse. |
 
 ## pr-review
 
 À l'ouverture d'une PR, un modèle la relit avec les conventions du dépôt sous les yeux et poste
-un commentaire. Ce qu'elle cherche est ce qu'un linter ne peut pas voir : les règles propres au
-projet, les régressions fonctionnelles, les fuites de données.
+un commentaire signé **Aristarque**. Ce qu'elle cherche est ce qu'un linter ne peut pas voir : les
+règles propres au projet, les régressions fonctionnelles, les fuites de données.
+
+Le nom vient d'Aristarque de Samothrace, qui relisait Homère au deuxième siècle avant notre ère en
+portant dans la marge des signes de sévérité : l'obèle pour le vers qu'il tenait pour faux,
+l'astérisque pour le doublon. C'est déjà « Bloquant », « À corriger » et la déduplication que fait
+ici la passe de fusion. Le mot a fini par désigner en français un critique sévère.
 
 La lecture est découpée en **trois passes indépendantes**, puis fusionnée : voir
 [Trois passes plutôt qu'une](#trois-passes-plutôt-quune).
