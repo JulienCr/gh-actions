@@ -164,6 +164,31 @@ l'onglet Actions : d'où la réaction `eyes` posée sur le commentaire déclench
 Cette étape est en `continue-on-error` : un accusé de réception qui ferait échouer le job emporterait
 la review avec lui, et il ne resterait alors ni réaction ni commentaire, donc aucun retour.
 
+### Ne pas lancer une review qu'on va remplacer
+
+Les trois passes partent en parallèle, chacune avec le contexte entier. L'entrée est donc dépensée
+dans les secondes qui suivent le lancement, pas au fil du raisonnement : entre 150 000 et 270 000
+tokens selon la PR, engagés d'un coup. Annuler un run devenu obsolète ne récupère que le
+raisonnement et la sortie, jamais l'entrée. **La seule décision qui coûte est le lancement.**
+
+Mesuré sur un dépôt piloté par plusieurs agents en parallèle : sur 43 runs réellement partis, 23 ont
+été annulés par un lancement plus récent sur la même PR. Environ quatre millions de tokens d'entrée
+pour des reviews que personne n'a lues.
+
+D'où la répartition des rôles. Copilot relit chaque push tout seul, en trois minutes et sans rien
+coûter : c'est lui qui porte le cycle corriger, pousser, relire, autant de fois qu'il le faut.
+Aristarque se lance **une fois**, quand ce cycle a convergé, c'est-à-dire quand la relecture
+automatique ne rend plus rien de neuf et qu'aucun correctif n'est en attente. Il est le seul à lire
+la doctrine du dépôt, donc il doit voir l'état final et non les états intermédiaires qu'il n'aura
+pas le temps de relire.
+
+Corollaire, si un correctif manque alors que la review est déjà partie : le pousser, mais ne pas
+redemander de review tout de suite. Attendre que le premier rapport tombe ou soit annulé, sinon la
+même lecture est payée deux fois.
+
+Le `cancel-in-progress: true` de l'exemple reste utile pour ce cas : il évite qu'un run condamné
+finisse de brûler son raisonnement. Il ne rattrape pas le lancement de trop.
+
 ### Inputs
 
 Seul `pr` est obligatoire.
