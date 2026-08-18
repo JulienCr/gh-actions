@@ -117,6 +117,16 @@ export interface Footer {
   omitted: string[];
   /** Fichiers fournis par extraits autour de leurs hunks, pas en entier. */
   windowed: string[];
+  /** Le cran qui a réglé l'ampleur des coupes : full, balanced ou lean. */
+  effort: string;
+  /**
+   * Passes qui n'ont PAS reçu les fichiers importés.
+   *
+   * Déclaré parce que le cran promet de dire ce qu'il retire. Sans cette ligne,
+   * trois passes paraissent avoir jugé sur le même contexte alors que l'une
+   * d'elles n'avait pas les appelants sous les yeux.
+   */
+  importsWithheld: string[];
   /**
    * Nombre de fichiers joints parce qu'un fichier touché les importe.
    *
@@ -148,6 +158,7 @@ const count = (value: number) => value.toLocaleString('fr-FR');
 function renderFooter(footer: Footer): string {
   const bits = [
     `${footer.model} via Ollama Cloud`,
+    `effort ${footer.effort}`,
     formatDuration(footer.durationMs),
     `${count(footer.promptTokens)} tokens en entrée, ${count(footer.evalTokens)} en sortie`,
   ];
@@ -155,7 +166,11 @@ function renderFooter(footer: Footer): string {
     bits.push(`${count(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
   }
   if (footer.imported > 0) {
-    bits.push(`${footer.imported} fichier(s) importés joints en contexte`);
+    const withheld =
+      footer.importsWithheld.length > 0
+        ? ` (hors ${footer.importsWithheld.map((label) => `« ${label} »`).join(', ')})`
+        : '';
+    bits.push(`${footer.imported} fichier(s) importés joints en contexte${withheld}`);
   }
   if (footer.skipped.length > 0) {
     bits.push(`${footer.skipped.length} fichier(s) générés ignorés`);

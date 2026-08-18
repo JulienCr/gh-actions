@@ -42,11 +42,13 @@ inputs:
   effort:
     description: >-
       Ampleur des coupes dans ce qui est envoyé au modèle : full, balanced ou
-      lean. « full » envoie tout à toutes les passes et ne saute aucune passe.
-      « balanced » n'envoie les fichiers importés qu'aux passes qui s'en servent
-      et ne lance pas une passe qu'une PR ne peut pas déclencher. « lean »
-      resserre encore le contexte et baisse d'un cran le raisonnement des passes
-      de doctrine et de données. Aucun cran ne supprime la passe « données et
+      lean. « full » envoie tout à toutes les passes ; la seule qu'il puisse
+      sauter est « doctrine », sur un dépôt qui n'en fournit aucune, son prompt
+      lui dictant alors sa sortie mot pour mot. « balanced » n'envoie les
+      fichiers importés qu'aux passes qui s'en servent et ne lance pas une passe
+      qu'une PR ne peut pas déclencher. « lean » resserre encore le contexte et
+      baisse le raisonnement de deux crans sur « doctrine » et d'un cran sur
+      « données et accès ». Aucun cran ne supprime la passe « données et
       accès », et tout ce qu'un cran retire est déclaré dans le commentaire.
       Nommé full/balanced/lean et non high/balanced/low pour ne pas se confondre
       avec « thinking », qui a déjà un « high » et un « low ».

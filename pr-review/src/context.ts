@@ -382,14 +382,22 @@ export function assembleContext({
     const extract = window ? windowFile(content, ranges.get(file.path) ?? [], window) : null;
     const rendered = extract ?? numberLines(content);
 
-    // Le budget porte sur ce qui PART, pas sur la matière brute. Conséquence
-    // désirable : un gros fichier qui tombait en « omitted », donc réduit au
-    // diff sans numéro citable, tient désormais sous forme d'extrait numéroté.
-    if (rendered.length > budget.perFileChars || used + rendered.length > budget.totalChars) {
+    // Un vrai extrait est budgété sur sa taille réduite : c'est tout l'intérêt,
+    // et un gros fichier qui tombait en « omitted », donc réduit au diff sans
+    // numéro citable, tient désormais sous cette forme.
+    //
+    // Un fichier entier, lui, reste pesé sur sa matière BRUTE. La gouttière de
+    // numérotation ajoute environ six caractères par ligne : la compter ferait
+    // basculer en « omitted » un fichier de 75 000 caractères sous un plafond
+    // de 80 000, alors qu'il passait avant ce commit. Le cran « full » promet
+    // le comportement d'avant, et un plafond qui se resserre tout seul le
+    // trahirait sans que personne ne l'ait demandé.
+    const weight = extract === null ? content.length : extract.length;
+    if (weight > budget.perFileChars || used + weight > budget.totalChars) {
       omitted.push(file.path);
       continue;
     }
-    used += rendered.length;
+    used += weight;
     sources.push({ path: file.path, content, rendered, windowed: extract !== null });
   }
 

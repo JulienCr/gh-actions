@@ -95,6 +95,8 @@ const FOOTER = {
   failedPasses: [],
   skippedPasses: [],
   windowed: [],
+  effort: 'balanced',
+  importsWithheld: [],
 };
 
 describe('renderComment', () => {
@@ -236,5 +238,30 @@ describe('le pied de page distingue la décision de l’incident', () => {
   /** Une passe qui échoue est un incident : elle garde son avertissement. */
   it('garde l’avertissement pour une passe lancée qui n’a pas abouti', () => {
     expect(footer({ failedPasses: ['données et accès'] })).toContain('⚠ passe');
+  });
+});
+
+
+describe('le pied de page déclare ce que le cran a retiré', () => {
+  const footer = (over: Partial<Footer>) =>
+    renderComment({ ...OPTIONS, review: '## Verdict\nok', footer: { ...FOOTER, ...over } });
+
+  it('nomme le cran, qui commande tout le reste', () => {
+    expect(footer({ effort: 'lean' })).toContain('effort lean');
+  });
+
+  /**
+   * Sans cette ligne, trois passes paraissent avoir jugé sur le même contexte
+   * alors que l'une d'elles n'avait pas les appelants sous les yeux.
+   */
+  it('dit à quelles passes les imports n’ont pas été joints', () => {
+    const comment = footer({ imported: 21, importsWithheld: ['doctrine du dépôt'] });
+    expect(comment).toContain('21 fichier(s) importés joints en contexte (hors « doctrine du dépôt »)');
+  });
+
+  it('ne dit rien de tel quand les trois passes les ont eus', () => {
+    const comment = footer({ imported: 21 });
+    expect(comment).toContain('21 fichier(s) importés joints en contexte');
+    expect(comment).not.toContain('hors «');
   });
 });

@@ -228,7 +228,7 @@ déclaré dans le pied de page du commentaire.
 | Fichiers touchés | entiers | par extraits au-delà de 250 lignes | par extraits au-delà de 120 lignes |
 | Fichiers importés | aux trois passes | pas à « doctrine » | à « régression » seule, budget 120 000 |
 | Passes | les trois | une passe qu'une PR ne peut pas déclencher n'est pas lancée | idem |
-| `thinking` | inchangé | inchangé | un cran plus bas sur « doctrine » et « données » |
+| `thinking` | inchangé | inchangé | deux crans plus bas sur « doctrine », un sur « données » |
 
 `full` reproduit le comportement d'avant ce réglage, à deux exceptions près qui valent à tous les
 crans : les doublons purs ne partent plus (contenu d'un fichier seulement renommé, corps du diff
@@ -287,9 +287,16 @@ La ventilation est ce qui dit où couper, et elle ne se devine pas : sur ce dép
 entre 10 et 33 % de l'entrée selon la PR, et les fichiers importés entre 0 et 11 %. Les tokens
 sont estimés à partir des caractères ; les caractères, eux, sont exacts.
 
-Chaque exécution imprime aussi une ligne `::stats::{…}` en JSON, greppable dans un journal de CI,
-qui porte les compteurs **et les trouvailles brutes de chaque passe**. Comparer deux réglages sur
-leurs tokens dit lequel est le moins cher, jamais lequel a perdu une trouvaille.
+Une review dont au moins une passe aboutit imprime aussi une ligne `::stats::{…}` en JSON,
+greppable dans un journal de CI, qui porte les compteurs. `--count-only`, qui n'appelle rien, n'en
+imprime pas.
+
+**Les trouvailles brutes n'y figurent qu'en local**, sous `--dry-run`. La passe « données et
+accès » cherche des secrets : une trouvaille qui en cite un le recopierait dans le journal d'un
+runner. Comparer deux réglages sur leurs trouvailles est un geste de réglage, qui se fait depuis un
+poste ; en CI la ligne garde les compteurs, qui ne citent rien. Et c'est bien sur les trouvailles
+qu'il faut comparer : les tokens disent lequel est le moins cher, jamais lequel a perdu quelque
+chose.
 
 ### Pourquoi pas une review agentique
 

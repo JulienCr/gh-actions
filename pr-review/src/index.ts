@@ -268,6 +268,8 @@ interface PassPrompt {
   system: string;
   user: string;
   think: string;
+  /** Le contexte que CETTE passe reçoit, imports retirés le cas échéant. */
+  seen: AssembledContext;
 }
 
 /**
@@ -294,6 +296,7 @@ function planPasses(
       system: buildPassSystemPrompt(pass, promptOptions, seen.imported.length > 0),
       user: buildUserPrompt(meta, seen),
       think: stepDown(config.thinking, pass.thinkingSteps[config.effort]),
+      seen,
     };
   });
 }
@@ -305,14 +308,20 @@ function planPasses(
  * petit qu'il ne l'est pour celle qui le reçoit : on couperait ailleurs qu'où il
  * faut.
  */
-function breakdown(plan: PassPrompt[], context: AssembledContext): InputBreakdown {
+function breakdown(plan: PassPrompt[]): InputBreakdown {
   const first = plan[0];
   const sum = (files: { numbered: string }[]) =>
     files.reduce((total, file) => total + file.numbered.length, 0);
+  // Le contexte de CETTE passe, pas le contexte global : depuis que le cran
+  // retire les imports à certaines passes, compter ceux du contexte global
+  // attribuerait des caractères qui ne partent pas, écraserait « meta » à zéro
+  // et rendrait la ventilation fausse précisément dans les réglages que
+  // « --count-only » sert à comparer.
+  const seen = first?.seen;
   const system = first?.system.length ?? 0;
-  const diff = context.diff.length;
-  const touched = sum(context.files);
-  const imported = sum(context.imported);
+  const diff = seen?.diff.length ?? 0;
+  const touched = sum(seen?.files ?? []);
+  const imported = sum(seen?.imported ?? []);
   return {
     system,
     diff,
@@ -352,7 +361,7 @@ function countOnly(config: Config, plan: PassPrompt[], context: AssembledContext
     `\nPR #${config.pr} · ${context.files.length} fichier(s) touchés · ` +
       `${context.imported.length} importé(s) · variante « ${config.variant} »\n`,
   );
-  console.log(renderBreakdown(calls, breakdown(plan, context)));
+  console.log(renderBreakdown(calls, breakdown(plan)));
   // La fusion ne se mesure pas à vide : son entrée est faite des trouvailles des
   // passes, qui n'existent qu'une fois les passes appelées. La taire vaut mieux
   // que la deviner, d'autant qu'elle ne pèse presque rien.
@@ -486,6 +495,13 @@ async function review(config: Config): Promise<void> {
       omitted: context.omitted,
       windowed: context.windowed,
       imported: context.imported.length,
+      effort: config.effort,
+      // Ce que le cran a retiré, nommément. Le pied de page promet de déclarer
+      // toute coupe ; taire à quelles passes les imports ont manqué laisserait
+      // le lecteur croire que les trois ont jugé sur le même contexte.
+      importsWithheld: selection.run
+        .filter((pass) => !pass.imports[config.effort])
+        .map((pass) => pass.label),
       // Les passes lancées qui n'ont pas abouti : un incident. Distinct de
       // celles qu'on n'a pas lancées, qui est une décision.
       failedPasses: selection.run
@@ -504,17 +520,23 @@ async function review(config: Config): Promise<void> {
         })
       : renderComment({ ...shared, review: merged.content });
 
-  // Une ligne, greppable dans un journal de CI comme en local. Les trouvailles
-  // brutes y sont : comparer deux réglages sur leurs tokens dit lequel est le
-  // moins cher, jamais lequel a perdu une trouvaille.
+  // Une ligne, greppable dans un journal de CI comme en local.
+  //
+  // Les trouvailles brutes n'y sont QU'EN LOCAL. La passe « données et accès »
+  // cherche des secrets, et une trouvaille qui en cite un le recopierait dans
+  // le journal d'un runner, que la doctrine du dépôt interdit. Comparer deux
+  // réglages sur leurs trouvailles est un geste de réglage, qui se fait depuis
+  // un poste ; en CI la ligne garde les compteurs, qui ne citent rien.
   console.log(
     statsLine({
       pr: config.pr,
       model: config.model,
       variant: config.variant,
       calls: run.calls,
-      blocks: breakdown(plan, context),
-      findings: Object.fromEntries(outcomes.map((outcome) => [outcome.pass.id, outcome.findings])),
+      blocks: breakdown(plan),
+      findings: config.dryRun
+        ? Object.fromEntries(outcomes.map((outcome) => [outcome.pass.id, outcome.findings]))
+        : {},
     }),
   );
 

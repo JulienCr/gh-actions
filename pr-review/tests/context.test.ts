@@ -517,3 +517,37 @@ describe('le fenêtrage à l’assemblage', () => {
       .toHaveLength(1);
   });
 });
+
+
+describe('ce que le budget pèse', () => {
+  /**
+   * La gouttière ajoute ~6 caractères par ligne. Les compter faisait basculer
+   * en « omitted » un fichier qui tenait avant, donc resserrait un plafond que
+   * personne n'avait touché — et « full » promet le comportement d'avant.
+   */
+  it('pèse un fichier entier sur sa matière brute, gouttière non comprise', () => {
+    const contenu = Array.from({ length: 100 }, () => 'x'.repeat(20)).join('\n');
+    const context = assemble({
+      rawDiff: 'diff --git a/src/a.ts b/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,1 @@\n+x',
+      prFiles: [file('src/a.ts')],
+      readFile: () => contenu,
+      // Juste assez pour le contenu brut, pas pour sa version numérotée.
+      budget: { totalChars: contenu.length, perFileChars: contenu.length, importedChars: 0 },
+    });
+    expect(context.omitted).toEqual([]);
+    expect(context.files).toHaveLength(1);
+  });
+
+  it('pèse un extrait sur sa taille réduite, qui est tout son intérêt', () => {
+    const gros = Array.from({ length: 600 }, (_, i) => `ligne ${i + 1}`).join('\n');
+    const context = assemble({
+      rawDiff: 'diff --git a/src/g.ts b/src/g.ts\n+++ b/src/g.ts\n@@ -300,1 +300,1 @@\n+x',
+      prFiles: [file('src/g.ts')],
+      readFile: () => gros,
+      budget: { totalChars: 3_000, perFileChars: 3_000, importedChars: 0 },
+      window: WINDOW,
+    });
+    expect(context.omitted).toEqual([]);
+    expect(context.windowed).toEqual(['src/g.ts']);
+  });
+});

@@ -152,8 +152,14 @@ export interface SelectionInput {
  * `.json`, `.yml` et `.toml` n'y sont PAS : un workflow, un `package.json` ou
  * une policy sont de la configuration exécutée, et une régression y vit très
  * bien.
+ *
+ * `.mdx` non plus, bien qu'il ressemble à du `.md` : il porte des imports, des
+ * expressions et des composants JSX, évalués à la compilation ou au rendu. Une
+ * signature cassée y casse la page, et ce n'est ni de la doctrine ni de l'accès
+ * aux données : sauter la passe de régression sur une PR de `.mdx` lui retire
+ * exactement le seul axe qui pouvait la relire.
  */
-const PROSE_ONLY = ['.md', '.mdx', '.txt', '.rst', '.adoc'];
+const PROSE_ONLY = ['.md', '.txt', '.rst', '.adoc'];
 
 /** L'extension d'un chemin, sans dépendre de `node:path` dans un module pur. */
 function extensionOf(path: string): string {
@@ -295,16 +301,28 @@ export interface SelectOptions {
  */
 export function selectPasses(input: SelectionInput, options: SelectOptions): Selection {
   if (options.forced.length > 0) {
-    const wanted = new Set(options.forced.map((id) => id.trim().toLowerCase()));
-    const run = PASSES.filter((pass) => wanted.has(pass.id));
-    // Celui qui écrit la liste sait ce qu'il fait : aucune règle ne s'y applique.
-    if (run.length > 0) {
-      return { run: [...run], skipped: [] };
+    const wanted = options.forced.map((id) => id.trim().toLowerCase());
+    const known = new Set(PASSES.map((pass) => pass.id));
+    const unknown = wanted.filter((id) => !known.has(id));
+
+    // Chaque identifiant est vérifié, pas seulement la liste entière. Une
+    // coquille dans « data » laissait passer une liste partiellement valide :
+    // la passe des fuites ne tournait pas, et rien ne le disait. C'est le seul
+    // chemin par lequel cet axe peut disparaître, il ne peut pas être muet.
+    if (unknown.length > 0) {
+      options.warn?.(
+        `input « passes » : identifiant(s) inconnu(s) : ${unknown.join(', ')}.\n` +
+          `  Connus : ${[...known].join(', ')}.`,
+      );
     }
-    options.warn?.(
-      `input « passes » : aucun identifiant connu dans « ${options.forced.join(', ')} ».\n` +
-        `  Connus : ${PASSES.map((pass) => pass.id).join(', ')}. On lance les trois.`,
-    );
+
+    const run = PASSES.filter((pass) => wanted.includes(pass.id));
+    // Celui qui écrit une liste valide sait ce qu'il fait : aucune règle ne s'y
+    // applique. Une liste dont rien n'est reconnu est une faute de frappe, pas
+    // une demande : on lance les trois plutôt que de ne rien relire.
+    if (run.length > 0) return { run: [...run], skipped: [] };
+
+    options.warn?.('  Aucun identifiant exploitable : on lance les trois passes.');
     return { run: [...PASSES], skipped: [] };
   }
 

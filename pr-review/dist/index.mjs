@@ -237,11 +237,12 @@ function assembleContext({
     if (content === null) continue;
     const extract = window ? windowFile(content, ranges.get(file.path) ?? [], window) : null;
     const rendered = extract ?? numberLines(content);
-    if (rendered.length > budget.perFileChars || used + rendered.length > budget.totalChars) {
+    const weight = extract === null ? content.length : extract.length;
+    if (weight > budget.perFileChars || used + weight > budget.totalChars) {
       omitted.push(file.path);
       continue;
     }
-    used += rendered.length;
+    used += weight;
     sources.push({ path: file.path, content, rendered, windowed: extract !== null });
   }
   const order = new Map(prFiles.map((file, index) => [file.path, index]));
@@ -616,7 +617,7 @@ function stepDown(level, steps) {
   if (index === -1) return level;
   return LEVELS[Math.max(0, index - steps)];
 }
-var PROSE_ONLY = [".md", ".mdx", ".txt", ".rst", ".adoc"];
+var PROSE_ONLY = [".md", ".txt", ".rst", ".adoc"];
 function extensionOf(path) {
   const dot = path.lastIndexOf(".");
   const slash = path.lastIndexOf("/");
@@ -723,15 +724,18 @@ Prove it from what you were given: a boundary crossing you cannot see in the exc
 ];
 function selectPasses(input, options) {
   if (options.forced.length > 0) {
-    const wanted = new Set(options.forced.map((id) => id.trim().toLowerCase()));
-    const run3 = PASSES.filter((pass) => wanted.has(pass.id));
-    if (run3.length > 0) {
-      return { run: [...run3], skipped: [] };
+    const wanted = options.forced.map((id) => id.trim().toLowerCase());
+    const known = new Set(PASSES.map((pass) => pass.id));
+    const unknown = wanted.filter((id) => !known.has(id));
+    if (unknown.length > 0) {
+      options.warn?.(
+        `input \xAB passes \xBB : identifiant(s) inconnu(s) : ${unknown.join(", ")}.
+  Connus : ${[...known].join(", ")}.`
+      );
     }
-    options.warn?.(
-      `input \xAB passes \xBB : aucun identifiant connu dans \xAB ${options.forced.join(", ")} \xBB.
-  Connus : ${PASSES.map((pass) => pass.id).join(", ")}. On lance les trois.`
-    );
+    const run3 = PASSES.filter((pass) => wanted.includes(pass.id));
+    if (run3.length > 0) return { run: [...run3], skipped: [] };
+    options.warn?.("  Aucun identifiant exploitable : on lance les trois passes.");
     return { run: [...PASSES], skipped: [] };
   }
   const run2 = [];
@@ -1311,6 +1315,7 @@ var count = (value) => value.toLocaleString("fr-FR");
 function renderFooter(footer) {
   const bits = [
     `${footer.model} via Ollama Cloud`,
+    `effort ${footer.effort}`,
     formatDuration(footer.durationMs),
     `${count(footer.promptTokens)} tokens en entr\xE9e, ${count(footer.evalTokens)} en sortie`
   ];
@@ -1318,7 +1323,8 @@ function renderFooter(footer) {
     bits.push(`${count(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
   }
   if (footer.imported > 0) {
-    bits.push(`${footer.imported} fichier(s) import\xE9s joints en contexte`);
+    const withheld = footer.importsWithheld.length > 0 ? ` (hors ${footer.importsWithheld.map((label) => `\xAB ${label} \xBB`).join(", ")})` : "";
+    bits.push(`${footer.imported} fichier(s) import\xE9s joints en contexte${withheld}`);
   }
   if (footer.skipped.length > 0) {
     bits.push(`${footer.skipped.length} fichier(s) g\xE9n\xE9r\xE9s ignor\xE9s`);
@@ -1570,17 +1576,19 @@ function planPasses(config, promptOptions, meta, context, passes) {
       // fichiers de contexte à lire : sinon elle désigne du vide.
       system: buildPassSystemPrompt(pass, promptOptions, seen.imported.length > 0),
       user: buildUserPrompt(meta, seen),
-      think: stepDown(config.thinking, pass.thinkingSteps[config.effort])
+      think: stepDown(config.thinking, pass.thinkingSteps[config.effort]),
+      seen
     };
   });
 }
-function breakdown(plan, context) {
+function breakdown(plan) {
   const first = plan[0];
   const sum = (files) => files.reduce((total, file) => total + file.numbered.length, 0);
+  const seen = first?.seen;
   const system = first?.system.length ?? 0;
-  const diff = context.diff.length;
-  const touched = sum(context.files);
-  const imported = sum(context.imported);
+  const diff = seen?.diff.length ?? 0;
+  const touched = sum(seen?.files ?? []);
+  const imported = sum(seen?.imported ?? []);
   return {
     system,
     diff,
@@ -1611,7 +1619,7 @@ function countOnly(config, plan, context) {
 PR #${config.pr} \xB7 ${context.files.length} fichier(s) touch\xE9s \xB7 ${context.imported.length} import\xE9(s) \xB7 variante \xAB ${config.variant} \xBB
 `
   );
-  console.log(renderBreakdown(calls, breakdown(plan, context)));
+  console.log(renderBreakdown(calls, breakdown(plan)));
   console.log(
     "\n  La fusion n\u2019est pas compt\xE9e : son entr\xE9e est faite des trouvailles des passes,\n  qui n\u2019existent pas sans appel. Mesur\xE9e en production, elle p\xE8se ~2 000 tokens."
   );
@@ -1722,6 +1730,11 @@ async function review(config) {
       omitted: context.omitted,
       windowed: context.windowed,
       imported: context.imported.length,
+      effort: config.effort,
+      // Ce que le cran a retiré, nommément. Le pied de page promet de déclarer
+      // toute coupe ; taire à quelles passes les imports ont manqué laisserait
+      // le lecteur croire que les trois ont jugé sur le même contexte.
+      importsWithheld: selection.run.filter((pass) => !pass.imports[config.effort]).map((pass) => pass.label),
       // Les passes lancées qui n'ont pas abouti : un incident. Distinct de
       // celles qu'on n'a pas lancées, qui est une décision.
       failedPasses: selection.run.filter((pass) => !outcomes.some((outcome) => outcome.pass === pass)).map((pass) => pass.label),
@@ -1739,8 +1752,8 @@ async function review(config) {
       model: config.model,
       variant: config.variant,
       calls: run2.calls,
-      blocks: breakdown(plan, context),
-      findings: Object.fromEntries(outcomes.map((outcome) => [outcome.pass.id, outcome.findings]))
+      blocks: breakdown(plan),
+      findings: config.dryRun ? Object.fromEntries(outcomes.map((outcome) => [outcome.pass.id, outcome.findings])) : {}
     })
   );
   if (config.dryRun) {

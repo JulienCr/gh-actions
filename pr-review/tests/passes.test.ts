@@ -219,7 +219,7 @@ describe('le choix des passes à lancer', () => {
   });
 
   it('n’ouvre pas la passe régression sur une PR de pure prose', () => {
-    const selection = auto({ files: [prFile('README.md'), prFile('docs/guide.mdx')] });
+    const selection = auto({ files: [prFile('README.md'), prFile('docs/guide.txt')] });
     expect(ids(selection.run)).toEqual(['doctrine', 'data']);
     expect(selection.skipped).toEqual([
       { label: 'régression fonctionnelle', reason: 'aucun fichier exécutable dans cette PR' },
@@ -235,6 +235,15 @@ describe('le choix des passes à lancer', () => {
     for (const path of ['package.json', '.github/workflows/ci.yml', 'Cargo.toml']) {
       expect(ids(auto({ files: [prFile(path)] }).run)).toContain('regression');
     }
+  });
+
+  /**
+   * `.mdx` ressemble à `.md` et n'en est pas : il porte des imports, des
+   * expressions et du JSX évalués au rendu. Le ranger dans la prose retirerait
+   * à ces PR le seul axe qui pouvait relire ce code.
+   */
+  it('tient un .mdx pour du code, malgré son air de markdown', () => {
+    expect(ids(auto({ files: [prFile('docs/guide.mdx')] }).run)).toContain('regression');
   });
 
   it('n’ouvre pas la passe doctrine quand le dépôt n’en fournit aucune', () => {
@@ -282,7 +291,7 @@ describe('le choix des passes à lancer', () => {
       { auto: true, forced: ['nawak'], warn: (message) => warnings.push(message) },
     );
     expect(ids(selection.run)).toEqual(['regression', 'doctrine', 'data']);
-    expect(warnings[0]).toContain('aucun identifiant connu');
+    expect(warnings.join('\n')).toContain('inconnu(s) : nawak');
   });
 
   /** Une optimisation ne doit jamais produire une review muette. */
@@ -324,5 +333,36 @@ describe('la consigne sur les doutes, quand il n’y a pas de fichiers de contex
 
   it('n’envoie pas le modèle chercher une section qu’il n’a pas', () => {
     expect(buildPassSystemPrompt(PASSES[0]!, OPTIONS, false)).not.toContain('context files above');
+  });
+});
+
+
+describe('une liste de passes partiellement fautive', () => {
+  const forced = (list: string[]) => {
+    const warnings: string[] = [];
+    const selection = selectPasses(
+      { files: [prFile('src/a.ts')], hasDoctrine: true },
+      { auto: true, forced: list, warn: (message) => warnings.push(message) },
+    );
+    return { ids: ids(selection.run), warnings };
+  };
+
+  /**
+   * Le cas qui coûtait cher : « datta » au lieu de « data » laissait tourner
+   * la seule passe régression, sans un mot. C'est le seul chemin par lequel
+   * l'axe des fuites peut disparaître, il ne peut pas être muet.
+   */
+  it('nomme l’identifiant fautif au lieu de l’avaler', () => {
+    const { ids: run, warnings } = forced(['regression', 'datta']);
+    expect(run).toEqual(['regression']);
+    expect(warnings.join('\n')).toContain('datta');
+  });
+
+  it('ne dit rien quand tout est reconnu', () => {
+    expect(forced(['regression', 'data']).warnings).toEqual([]);
+  });
+
+  it('lance les trois quand rien n’est reconnu', () => {
+    expect(forced(['nawak']).ids).toEqual(['regression', 'doctrine', 'data']);
   });
 });
