@@ -56,10 +56,6 @@ permissions:
   # PR est un commentaire d'issue au sens de l'API : « pull-requests » ne suffit pas.
   issues: write
 
-concurrency:
-  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
-  cancel-in-progress: true
-
 jobs:
   review:
     # Un brouillon ne consomme pas de quota : il sera relu au passage en « prêt ».
@@ -79,6 +75,14 @@ jobs:
           && github.event.comment.user.login == 'JulienCr'
           && contains(github.event.comment.body, '@aristarque review'))
     runs-on: ubuntu-latest
+    # Au niveau du job, pas du workflow. Un run dont le job est écarté par la
+    # garde ci-dessus n'entre jamais dans le groupe ; au niveau du workflow il y
+    # entrait avant que la garde soit évaluée, donc n'importe quel commentaire
+    # d'un inconnu annulait la review en cours via `cancel-in-progress`. La
+    # garde sur l'auteur empêchait de lancer une review, pas d'en tuer une.
+    concurrency:
+      group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+      cancel-in-progress: true
     # Trois passes en parallèle puis leur fusion : le mur vaut jusqu'à deux fois
     # le « timeout-minutes » de l'action, plus la marge du commentaire d'échec.
     timeout-minutes: 40
@@ -87,6 +91,10 @@ jobs:
       # sans cet accusé de réception, la mention se fait à l'aveugle.
       - name: Accuser réception de la mention
         if: github.event_name == 'issue_comment'
+        # Cosmétique, donc non bloquant : sans ceci un `gh api` qui échoue (rate
+        # limit, commentaire supprimé) sort en non-zéro, et checkout comme review
+        # sont skippés. La réaction manquerait ET la review avec.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -141,11 +149,20 @@ inconnu déclenche la review en boucle et vide la clé Ollama. L'exemple ci-dess
 unique ; `github.event.comment.author_association` comparé à `OWNER`, `MEMBER` ou `COLLABORATOR`
 convient mieux à un dépôt qui a plusieurs mainteneurs.
 
+**La concurrence descend au niveau du job**, et c'est la même histoire. Un run entre dans son
+groupe de concurrence à sa création, avant que la garde `if` du job soit évaluée. Laissée au niveau
+du workflow, elle faisait entrer dans le groupe le run né du commentaire de n'importe qui, qui
+annulait la review en cours via `cancel-in-progress` puis se faisait écarter. La garde sur l'auteur
+empêchait de lancer une review, pas d'en tuer une, ce qui rendait le déni de service trivial. Un job
+écarté, lui, n'entre jamais dans le groupe.
+
 Deux choses surprennent la première fois. GitHub n'exécute que la version du workflow présente sur
 la branche par défaut, donc le déclencheur ne marche qu'une fois mergé, jamais depuis la PR qui
 l'introduit. Et un run lancé par commentaire n'apparaît pas comme check sur la PR, seulement dans
 l'onglet Actions : d'où la réaction `eyes` posée sur le commentaire déclencheur, qui coûte la permission
 `issues: write`, un commentaire de conversation de PR étant un commentaire d'issue au sens de l'API.
+Cette étape est en `continue-on-error` : un accusé de réception qui ferait échouer le job emporterait
+la review avec lui, et il ne resterait alors ni réaction ni commentaire, donc aucun retour.
 
 ### Inputs
 
