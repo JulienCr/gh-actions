@@ -212,6 +212,7 @@ Seul `pr` est obligatoire.
 | `max-findings` | `20` | Plafond de puces pour Bloquant, À corriger et Suggestions. « À vérifier » a son propre plafond de cinq. |
 | `budget-chars` | `500000` | Plafond du contenu intégral des fichiers **touchés**. |
 | `per-file-chars` | `80000` | Plafond par fichier. |
+| `window-min-lines` | selon le cran | Taille à partir de laquelle un fichier part par extraits. `0` : jamais. |
 | `imports-budget-chars` | `300000` | Plafond des fichiers **importés**, joints en contexte. `0` : aucun. `120000` au cran `lean`. |
 | `timeout-minutes` | `15` | Délai d'**une** requête. La review en fait quatre ; voir le `timeout-minutes` du job. |
 | `dry-run` | `false` | `true` : la review part dans les logs, rien n'est posté. |
@@ -224,6 +225,7 @@ déclaré dans le pied de page du commentaire.
 
 | | `full` | `balanced` (défaut) | `lean` |
 | --- | --- | --- | --- |
+| Fichiers touchés | entiers | par extraits au-delà de 250 lignes | par extraits au-delà de 120 lignes |
 | Fichiers importés | aux trois passes | pas à « doctrine » | à « régression » seule, budget 120 000 |
 | Passes | les trois | une passe qu'une PR ne peut pas déclencher n'est pas lancée | idem |
 | `thinking` | inchangé | inchangé | un cran plus bas sur « doctrine » et « données » |
@@ -238,17 +240,24 @@ La passe « doctrine » ne tourne pas sur un dépôt qui ne fournit aucun fichie
 tous les crans y compris `full` : son prompt lui dicte alors sa sortie mot pour mot, et la lancer
 reviendrait à payer un contexte entier pour une réponse écrite d'avance.
 
-Mesuré sur ce dépôt, à contenu de disque identique :
+Mesuré sur ce dépôt, à contenu de disque identique, entrée par review :
 
-| PR | entrée avant | `full` | `balanced` | `lean` |
+| PR | avant | `full` | `balanced` | `lean` |
 | --- | --- | --- | --- | --- |
-| 18 fichiers, 5 importés | 1 053 538 car. | -8,8 % | -12,4 % | -15,9 % |
+| 18 fichiers, 5 importés | 841 060 car. | -11,0 % | -13,5 % | -16,0 % |
 | README seul | 108 115 car. | -0,3 % | **-33,7 %** | -33,7 % |
 | 2 fichiers, aucun import | 229 780 car. | -0,1 % | -0,1 % | -0,1 % |
 
 Le `-33,7 %` d'une PR de documentation est la passe « régression fonctionnelle » qu'on ne lance
 pas : elle ne pouvait rendre que « rien ». Le `-0,1 %` de la dernière ligne est honnête aussi : une
 PR sans fichier neuf, sans renommage et sans import n'a rien à rendre. Le cran ne l'invente pas.
+
+Ce que ces chiffres ne montrent pas, c'est le fenêtrage, qui vaut **zéro sur ce dépôt**. Ses
+fenêtres y couvrent 100 % de chaque fichier assez gros pour être candidat, donc il renonce et
+envoie le fichier entier. Avec soixante lignes de marge de part et d'autre, un seul hunk en couvre
+déjà cent vingt : sous quatre cents lignes, il n'y a rien à gagner. Le gain est à attendre d'un
+dépôt applicatif, dont les fichiers de mille lignes reçoivent des retouches localisées. Le garde-fou
+est là pour ça : mieux vaut un fichier entier qu'un fichier haché pour trois pour cent.
 
 ### Ce qu'une review coûterait, avant de la lancer
 
