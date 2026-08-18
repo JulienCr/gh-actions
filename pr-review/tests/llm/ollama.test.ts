@@ -504,3 +504,62 @@ describe('les secrets ne sortent pas dans un message d’erreur', () => {
     expect(error.message).not.toContain('cle-tres-secrete');
   });
 });
+
+/**
+ * Mesuré sur avolo-shorts#63 et #64, le 18 août : les deux passes en
+ * `deepseek-v4-flash:cloud` à `think: high` ont généré 203 s et 210 s, puis le
+ * flux s'est terminé proprement SANS aucun contenu. Les runs qui aboutissaient
+ * rendaient « ~99 % de raisonnement » : ces appels vivent à la limite, et le
+ * jour où le raisonnement déborde, la review est perdue en entier.
+ */
+describe('un raisonnement qui ne conclut jamais', () => {
+  const thinkingOnly = (thinking: string) =>
+    JSON.stringify({
+      message: { role: 'assistant', content: '', thinking },
+      done: true,
+      prompt_eval_count: 173_109,
+      eval_count: 36_000,
+    });
+
+  it('rejoue d’UN cran plus bas, plutôt que de perdre la passe', async () => {
+    queue.push({ status: 200, body: thinkingOnly('je réfléchis sans jamais conclure') });
+    queue.push({ status: 200, body: ok('## Trouvailles\n- [rien] : relu.') });
+    const downgrades: string[] = [];
+    const result = await call({ think: 'high', onDowngrade: (r) => downgrades.push(r) });
+    expect(result.content).toContain('Trouvailles');
+    expect(calls).toBe(2);
+    expect(lastBody.think).toBe('medium');
+    expect(downgrades[0]).toContain('medium');
+  });
+
+  /** Le compte des tokens brûlés : sans lui, l'incident est indiagnosticable. */
+  it('dit ce que l’appel perdu a coûté', async () => {
+    queue.push({ status: 200, body: thinkingOnly('x'.repeat(4_000)) });
+    queue.push({ status: 200, body: thinkingOnly('x'.repeat(4_000)) });
+    const error = await call({ think: 'low' }).then(
+      () => new Error('aurait dû échouer'),
+      (caught: Error) => caught,
+    );
+    expect(error.message).toContain('36000 tokens de sortie');
+    expect(error.message).toContain('4000 caractères de raisonnement');
+    expect(error.message).toContain('173109 en entrée');
+  });
+
+  /** Sous « low » il n'y a plus de cran : on retire le raisonnement. */
+  it('retire le raisonnement quand il n’y a plus de cran sous le pied', async () => {
+    queue.push({ status: 200, body: thinkingOnly('encore') });
+    queue.push({ status: 200, body: ok('ok') });
+    await call({ think: 'low' });
+    expect(lastBody.think).toBeUndefined();
+  });
+
+  /**
+   * Un vide SANS raisonnement n'a pas d'explication : baisser un cran ne
+   * réparerait rien et paierait un second appel pour le même vide.
+   */
+  it('ne rejoue pas un vide qui n’a rien produit du tout', async () => {
+    queue.push({ status: 200, body: thinkingOnly('') });
+    await expect(call({ think: 'high' })).rejects.toThrow(/vide/);
+    expect(calls).toBe(1);
+  });
+});

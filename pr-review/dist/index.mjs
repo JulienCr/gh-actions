@@ -439,11 +439,20 @@ var LlmError = class extends Error {
   retryable;
   /** Le modèle a refusé `think` : rejouer sans est la seule issue. */
   thinkingRejected;
-  constructor(message, retryable = false, thinkingRejected = false) {
+  /**
+   * Le raisonnement a consommé toute la génération, sans laisser de réponse.
+   *
+   * Distinct d'un refus : le modèle sait raisonner, il a même trop raisonné.
+   * Rejouer d'un cran plus bas est la réponse, là où retirer le raisonnement
+   * coûterait la profondeur qu'on paie précisément.
+   */
+  reasoningExhausted;
+  constructor(message, retryable = false, thinkingRejected = false, reasoningExhausted = false) {
     super(message);
     this.name = "LlmError";
     this.retryable = retryable;
     this.thinkingRejected = thinkingRejected;
+    this.reasoningExhausted = reasoningExhausted;
   }
 };
 
@@ -507,11 +516,22 @@ function describeCause(error) {
 }
 var redact = (text) => text.replace(/\/\/[^/\s@]+@/g, "//***@");
 var rejectsThinkingValue = (body) => /invalid (think|reasoning_effort) value/i.test(body);
+var LEVELS = ["low", "medium", "high", "max"];
+function oneLevelDown(level) {
+  const index = LEVELS.indexOf(level.trim().toLowerCase());
+  if (index === -1) return "";
+  return index === 0 ? "" : LEVELS[index - 1];
+}
 async function withRetries(attempt2, request) {
   try {
     return await attempt2(request);
   } catch (error) {
     if (!(error instanceof LlmError)) throw error;
+    if (error.reasoningExhausted && request.think) {
+      const lower = oneLevelDown(request.think);
+      request.onDowngrade?.(`${error.message} \u2014 on rejoue en \xAB ${lower || "sans raisonnement"} \xBB`);
+      return attempt2({ ...request, think: lower });
+    }
     if (error.thinkingRejected && request.think) {
       const fallback = rejectsThinkingValue(error.message) ? "true" : "";
       request.onDowngrade?.(error.message);
@@ -628,7 +648,15 @@ async function collect(response, apiKey) {
     throw new LlmError("le flux d'Ollama s'est interrompu avant la fin de la r\xE9ponse", true);
   }
   if (!content.trim()) {
-    throw new LlmError("Ollama a rendu une r\xE9ponse vide");
+    throw new LlmError(
+      `Ollama a rendu une r\xE9ponse vide (${evalTokens} tokens de sortie, dont ${thinking.length} caract\xE8res de raisonnement, sur ${promptTokens} en entr\xE9e)`,
+      false,
+      false,
+      // Du raisonnement mais pas de réponse : la génération s'est arrêtée AVANT
+      // de conclure. Un vide sans raisonnement, lui, n'a pas d'explication et
+      // ne se rejoue pas plus bas.
+      thinking.trim().length > 0
+    );
   }
   return {
     message: { content, thinking },
@@ -753,7 +781,12 @@ async function collect2(response, dialect, apiKey) {
     throw new LlmError(`${dialect.name} a coup\xE9 sa r\xE9ponse au plafond de tokens de sortie`);
   }
   if (!content.trim()) {
-    throw new LlmError(`${dialect.name} a rendu une r\xE9ponse vide`);
+    throw new LlmError(
+      `${dialect.name} a rendu une r\xE9ponse vide (${usage?.outputTokens ?? 0} tokens de sortie, dont ${thinking.length} caract\xE8res de raisonnement)`,
+      false,
+      false,
+      thinking.trim().length > 0
+    );
   }
   return {
     content,
@@ -997,12 +1030,12 @@ Found nothing? Return \`${PASS_HEADING}\` and a single bullet \xAB - [rien] : \x
 actually checked to be able to say it. Never an empty section.`;
 var EFFORTS = ["full", "balanced", "lean"];
 var isEffort = (value) => EFFORTS.includes(value);
-var LEVELS = ["low", "medium", "high", "max"];
+var LEVELS2 = ["low", "medium", "high", "max"];
 function stepDown(level, steps) {
   if (steps <= 0) return level;
-  const index = LEVELS.indexOf(level.trim().toLowerCase());
+  const index = LEVELS2.indexOf(level.trim().toLowerCase());
   if (index === -1) return level;
-  return LEVELS[Math.max(0, index - steps)];
+  return LEVELS2[Math.max(0, index - steps)];
 }
 var PROSE_ONLY = [".md", ".txt", ".rst", ".adoc"];
 function extensionOf(path) {

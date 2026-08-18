@@ -93,12 +93,26 @@ export class LlmError extends Error {
   readonly retryable: boolean;
   /** Le modèle a refusé `think` : rejouer sans est la seule issue. */
   readonly thinkingRejected: boolean;
+  /**
+   * Le raisonnement a consommé toute la génération, sans laisser de réponse.
+   *
+   * Distinct d'un refus : le modèle sait raisonner, il a même trop raisonné.
+   * Rejouer d'un cran plus bas est la réponse, là où retirer le raisonnement
+   * coûterait la profondeur qu'on paie précisément.
+   */
+  readonly reasoningExhausted: boolean;
 
-  constructor(message: string, retryable = false, thinkingRejected = false) {
+  constructor(
+    message: string,
+    retryable = false,
+    thinkingRejected = false,
+    reasoningExhausted = false,
+  ) {
     super(message);
     this.name = 'LlmError';
     this.retryable = retryable;
     this.thinkingRejected = thinkingRejected;
+    this.reasoningExhausted = reasoningExhausted;
   }
 }
 

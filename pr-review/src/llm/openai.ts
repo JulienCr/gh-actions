@@ -240,7 +240,13 @@ async function collect(
   if (!content.trim()) {
     // Un contenu vide arrive quand tout est parti dans le raisonnement : le
     // dire vaut mieux que poster un commentaire vide.
-    throw new LlmError(`${dialect.name} a rendu une réponse vide`);
+    throw new LlmError(
+      `${dialect.name} a rendu une réponse vide (${usage?.outputTokens ?? 0} tokens de sortie, ` +
+        `dont ${thinking.length} caractères de raisonnement)`,
+      false,
+      false,
+      thinking.trim().length > 0,
+    );
   }
 
   return {
