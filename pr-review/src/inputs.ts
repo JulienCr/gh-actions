@@ -111,6 +111,8 @@ export const DEFAULTS = {
    */
   temperature: 1,
   seed: 1,
+  /** Nom du bras quand on n'en donne pas : celui du réglage livré. */
+  variant: 'default',
 } as const;
 
 export interface Config {
@@ -138,6 +140,10 @@ export interface Config {
   projectSummary: string;
   apiKey: string;
   githubToken: string;
+  /** Imprimer ce qui partirait, et ne rien envoyer. Réglage local seulement. */
+  countOnly: boolean;
+  /** Nom libre du bras mesuré, repris dans la ligne « ::stats:: ». */
+  variant: string;
 }
 
 /**
@@ -260,14 +266,25 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   let pr: number | null = null;
   let dryRun = readBoolean(env, 'dry-run');
   let model = readInput(env, 'model') || env.OLLAMA_REVIEW_MODEL?.trim() || DEFAULTS.model;
+  let countOnly = false;
+  let variant = readInput(env, 'variant') || DEFAULTS.variant;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
     if (arg === '--dry-run') dryRun = true;
-    else if (arg === '--model') {
+    // Ne rien envoyer implique ne rien poster : sans ça, une faute de frappe sur
+    // un drapeau de mesure irait commenter une PR.
+    else if (arg === '--count-only') {
+      countOnly = true;
+      dryRun = true;
+    } else if (arg === '--model') {
       const value = argv[++index];
       if (!value) throw new UsageError('« --model » attend un nom de modèle.');
       model = value;
+    } else if (arg === '--variant') {
+      const value = argv[++index];
+      if (!value) throw new UsageError('« --variant » attend un nom.');
+      variant = value;
     } else if (/^#?\d+$/.test(arg)) pr = Number(arg.replace('#', ''));
     else throw new UsageError(`argument inconnu : ${arg}`);
   }
@@ -313,6 +330,8 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     // Le plancher d'abord : ce qui suit ne peut qu'ajouter, jamais retirer.
     skip: [...ALWAYS_SKIPPED, ...parseList(readInput(env, 'skip'))],
     projectSummary: readInput(env, 'project-summary'),
+    countOnly,
+    variant,
     apiKey: readInput(env, 'ollama-api-key') || env.OLLAMA_API_KEY?.trim() || '',
     githubToken: readInput(env, 'github-token') || env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || '',
   };

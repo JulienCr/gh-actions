@@ -411,7 +411,9 @@ var DEFAULTS = {
    * la graine, qui la sert sans coûter en profondeur.
    */
   temperature: 1,
-  seed: 1
+  seed: 1,
+  /** Nom du bras quand on n'en donne pas : celui du réglage livré. */
+  variant: "default"
 };
 var UsageError = class extends Error {
 };
@@ -465,13 +467,22 @@ function resolveConfig({ argv, env, warn = () => {
   let pr = null;
   let dryRun = readBoolean(env, "dry-run");
   let model = readInput(env, "model") || env.OLLAMA_REVIEW_MODEL?.trim() || DEFAULTS.model;
+  let countOnly2 = false;
+  let variant = readInput(env, "variant") || DEFAULTS.variant;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--dry-run") dryRun = true;
-    else if (arg === "--model") {
+    else if (arg === "--count-only") {
+      countOnly2 = true;
+      dryRun = true;
+    } else if (arg === "--model") {
       const value = argv[++index];
       if (!value) throw new UsageError("\xAB --model \xBB attend un nom de mod\xE8le.");
       model = value;
+    } else if (arg === "--variant") {
+      const value = argv[++index];
+      if (!value) throw new UsageError("\xAB --variant \xBB attend un nom.");
+      variant = value;
     } else if (/^#?\d+$/.test(arg)) pr = Number(arg.replace("#", ""));
     else throw new UsageError(`argument inconnu : ${arg}`);
   }
@@ -514,6 +525,8 @@ function resolveConfig({ argv, env, warn = () => {
     // Le plancher d'abord : ce qui suit ne peut qu'ajouter, jamais retirer.
     skip: [...ALWAYS_SKIPPED, ...parseList(readInput(env, "skip"))],
     projectSummary: readInput(env, "project-summary"),
+    countOnly: countOnly2,
+    variant,
     apiKey: readInput(env, "ollama-api-key") || env.OLLAMA_API_KEY?.trim() || "",
     githubToken: readInput(env, "github-token") || env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || ""
   };
@@ -1122,6 +1135,67 @@ La review n'a pas pu \xEAtre produite : ${reason}
 <sub>Mod\xE8le vis\xE9 : ${model}. Le check reste vert, cette review n'est pas bloquante.</sub>`;
 }
 
+// pr-review/src/stats.ts
+var CHARS_PER_TOKEN = 3.5;
+var estimateTokens = (chars) => Math.round(chars / CHARS_PER_TOKEN);
+var count2 = (value) => value.toLocaleString("fr-FR");
+function totals(calls) {
+  return calls.reduce(
+    (sum, call) => ({
+      promptTokens: sum.promptTokens + call.promptTokens,
+      evalTokens: sum.evalTokens + call.evalTokens,
+      thinkingChars: sum.thinkingChars + call.thinkingChars
+    }),
+    { promptTokens: 0, evalTokens: 0, thinkingChars: 0 }
+  );
+}
+function reasoningShare(call) {
+  const total = call.thinkingChars + call.contentChars;
+  if (call.thinkingChars === 0 || total === 0) return null;
+  return call.thinkingChars / total;
+}
+function describeCall(call) {
+  const share = reasoningShare(call);
+  const reasoning = share === null ? "" : ` dont ~${Math.round(share * 100)} % de raisonnement`;
+  const think = call.think ? `, think=${call.think}` : "";
+  return `${call.label} en ${Math.round(call.durationMs / 1e3)} s (${count2(call.promptTokens)} tokens en entr\xE9e, ${count2(call.evalTokens)} en sortie${reasoning}${think}).`;
+}
+var pad = (text, width) => text.padEnd(width);
+var padStart = (text, width) => text.padStart(width);
+function renderBreakdown(calls, blocks) {
+  const labels = calls.map((call) => call.label);
+  const width = Math.max(...labels.map((label) => label.length), "appel".length);
+  const rows = calls.map((call) => {
+    const total = call.systemChars + call.userChars;
+    return `  ${pad(call.label, width)}  ${padStart(count2(call.systemChars), 9)}  ${padStart(count2(call.userChars), 10)}  ${padStart(count2(total), 10)}  ${padStart(`~${count2(estimateTokens(total))}`, 10)}`;
+  });
+  const grand = calls.reduce((sum, call) => sum + call.systemChars + call.userChars, 0);
+  const header = `  ${pad("appel", width)}  ${padStart("syst\xE8me", 9)}  ${padStart("user", 10)}  ${padStart("total", 10)}  ${padStart("\u2248 tokens", 10)}`;
+  const rule = `  ${"\u2500".repeat(width + 46)}`;
+  return [
+    header,
+    ...rows,
+    rule,
+    `  ${pad("total entr\xE9e", width)}  ${padStart("", 9)}  ${padStart("", 10)}  ${padStart(count2(grand), 10)}  ${padStart(`~${count2(estimateTokens(grand))}`, 10)}`,
+    `  dont : ${describeBlocks(blocks)}`,
+    "",
+    "  Tokens estim\xE9s : caract\xE8res \xF7 " + CHARS_PER_TOKEN + ". Les caract\xE8res, eux, sont exacts."
+  ].join("\n");
+}
+function describeBlocks(blocks) {
+  const total = blocks.system + blocks.diff + blocks.touched + blocks.imported + blocks.meta;
+  if (total === 0) return "rien";
+  const share = (value) => `${Math.round(value / total * 100)} %`;
+  return [
+    `diff ${share(blocks.diff)}`,
+    `fichiers touch\xE9s ${share(blocks.touched)}`,
+    `imports ${share(blocks.imported)}`,
+    `syst\xE8me ${share(blocks.system)}`,
+    `reste ${share(blocks.meta)}`
+  ].join(" \xB7 ");
+}
+var statsLine = (payload) => `::stats::${JSON.stringify(payload)}`;
+
 // pr-review/src/index.ts
 var DEFAULT_KEY_REF = "op://Personal/Ollama/add more/api_key";
 function repoRoot() {
@@ -1164,6 +1238,7 @@ async function keyFrom1Password() {
   }
 }
 async function callModel(config, run2, args) {
+  const sizes = { systemChars: args.system.length, userChars: args.user.length };
   let result;
   try {
     result = await chat({
@@ -1185,23 +1260,44 @@ async function callModel(config, run2, args) {
     const reason = error instanceof OllamaError ? error.message : String(error);
     console.error(`\u2717 ${args.label} : ${reason}`);
     run2.failures.push(reason);
+    run2.calls.push({
+      id: args.id,
+      label: args.label,
+      think: args.think,
+      ...sizes,
+      promptTokens: 0,
+      evalTokens: 0,
+      thinkingChars: 0,
+      contentChars: 0,
+      durationMs: 0,
+      ok: false
+    });
     return null;
   }
-  run2.promptTokens += result.promptTokens;
-  run2.evalTokens += result.evalTokens;
-  run2.thinkingChars += result.thinkingChars;
-  console.log(
-    `\u2713 ${args.label} en ${Math.round(result.durationMs / 1e3)} s (${result.promptTokens} tokens en entr\xE9e, ${result.evalTokens} en sortie).`
-  );
+  const stat = {
+    id: args.id,
+    label: args.label,
+    think: args.think,
+    ...sizes,
+    promptTokens: result.promptTokens,
+    evalTokens: result.evalTokens,
+    thinkingChars: result.thinkingChars,
+    contentChars: result.content.length,
+    durationMs: result.durationMs,
+    ok: true
+  };
+  run2.calls.push(stat);
+  console.log(`\u2713 ${describeCall(stat)}`);
   return result;
 }
-async function runPasses(config, run2, promptOptions, user) {
+async function runPasses(config, run2, plan) {
   const results = await Promise.all(
-    PASSES.map(async (pass) => {
+    plan.map(async ({ pass, system, user, think }) => {
       const result = await callModel(config, run2, {
-        system: buildPassSystemPrompt(pass, promptOptions),
+        id: pass.id,
+        system,
         user,
-        think: config.thinking,
+        think,
         label: `passe ${pass.label}`
       });
       if (result === null) return null;
@@ -1209,6 +1305,56 @@ async function runPasses(config, run2, promptOptions, user) {
     })
   );
   return results.filter((result) => result !== null);
+}
+function planPasses(config, promptOptions, user) {
+  return PASSES.map((pass) => ({
+    pass,
+    system: buildPassSystemPrompt(pass, promptOptions),
+    user,
+    think: config.thinking
+  }));
+}
+function breakdown(plan, context) {
+  const first = plan[0];
+  const sum = (files) => files.reduce((total, file) => total + file.numbered.length, 0);
+  const system = first?.system.length ?? 0;
+  const diff = context.diff.length;
+  const touched = sum(context.files);
+  const imported = sum(context.imported);
+  return {
+    system,
+    diff,
+    touched,
+    imported,
+    // Ce qui reste du prompt user : titre, description, liste des fichiers et
+    // consignes. Déduit plutôt que recompté, pour que la somme des parts fasse
+    // toujours exactement le prompt envoyé.
+    meta: Math.max(0, (first?.user.length ?? 0) - diff - touched - imported)
+  };
+}
+function countOnly(config, plan, context) {
+  const calls = plan.map(({ pass, system, user, think }) => ({
+    id: pass.id,
+    label: `passe ${pass.label}`,
+    think,
+    systemChars: system.length,
+    userChars: user.length,
+    promptTokens: 0,
+    evalTokens: 0,
+    thinkingChars: 0,
+    contentChars: 0,
+    durationMs: 0,
+    ok: true
+  }));
+  console.log(
+    `
+PR #${config.pr} \xB7 ${context.files.length} fichier(s) touch\xE9s \xB7 ${context.imported.length} import\xE9(s) \xB7 variante \xAB ${config.variant} \xBB
+`
+  );
+  console.log(renderBreakdown(calls, breakdown(plan, context)));
+  console.log(
+    "\n  La fusion n\u2019est pas compt\xE9e : son entr\xE9e est faite des trouvailles des passes,\n  qui n\u2019existent pas sans appel. Mesur\xE9e en production, elle p\xE8se ~2 000 tokens."
+  );
 }
 async function review(config) {
   const root = repoRoot();
@@ -1255,12 +1401,17 @@ async function review(config) {
     doctrine: readDoctrine(root, config.doctrine)
   };
   const user = buildUserPrompt(meta, context);
+  const plan = planPasses(config, promptOptions, user);
   console.log(
-    `Contexte : ${context.files.length} fichier(s) touch\xE9s, ${context.imported.length} import\xE9(s), ~${Math.round(user.length / 1024)} Ko par passe, ${PASSES.length} passes + fusion (${config.model}).`
+    `Contexte : ${context.files.length} fichier(s) touch\xE9s, ${context.imported.length} import\xE9(s), ${plan.length} passes + fusion (${config.model}).`
   );
+  if (config.countOnly) {
+    countOnly(config, plan, context);
+    return;
+  }
   const started = Date.now();
-  const run2 = { promptTokens: 0, evalTokens: 0, thinkingChars: 0, failures: [] };
-  const outcomes = await runPasses(config, run2, promptOptions, user);
+  const run2 = { calls: [], failures: [] };
+  const outcomes = await runPasses(config, run2, plan);
   if (outcomes.length === 0) {
     const reason = run2.failures[0] ?? "raison inconnue";
     console.error(`\xC9chec de la review : aucune passe n'a abouti (${reason}).`);
@@ -1268,6 +1419,7 @@ async function review(config) {
     return;
   }
   const merged = await callModel(config, run2, {
+    id: "merge",
     system: buildMergeSystemPrompt({ repo, maxFindings: config.maxFindings }),
     user: buildMergeUserPrompt(meta, outcomes),
     think: config.mergeThinking,
@@ -1283,9 +1435,7 @@ async function review(config) {
     footer: {
       model: config.model,
       durationMs: Date.now() - started,
-      promptTokens: run2.promptTokens,
-      evalTokens: run2.evalTokens,
-      thinkingChars: run2.thinkingChars,
+      ...totals(run2.calls),
       skipped: context.skipped,
       omitted: context.omitted,
       imported: context.imported.length,
@@ -1299,6 +1449,16 @@ async function review(config) {
     reason: run2.failures.at(-1) ?? "raison inconnue",
     passes: outcomes.map((outcome) => ({ label: outcome.pass.label, findings: outcome.findings }))
   }) : renderComment({ ...shared, review: merged.content });
+  console.log(
+    statsLine({
+      pr: config.pr,
+      model: config.model,
+      variant: config.variant,
+      calls: run2.calls,
+      blocks: breakdown(plan, context),
+      findings: Object.fromEntries(outcomes.map((outcome) => [outcome.pass.id, outcome.findings]))
+    })
+  );
   if (config.dryRun) {
     console.log("\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 review (dry-run, non post\xE9e) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n");
     console.log(comment);
@@ -1324,8 +1484,8 @@ async function main() {
     warn: (message) => console.warn(`\u26A0 ${message}`)
   });
   if (config.githubToken) process.env.GH_TOKEN = config.githubToken;
-  if (!config.apiKey) config.apiKey = await keyFrom1Password();
-  if (!config.apiKey) {
+  if (!config.apiKey && !config.countOnly) config.apiKey = await keyFrom1Password();
+  if (!config.apiKey && !config.countOnly) {
     console.log("Cl\xE9 Ollama absente : review ignor\xE9e.");
     return;
   }
