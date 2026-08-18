@@ -295,23 +295,42 @@ permet de partager ce cache. Deux conditions, que l'action tient toutes les deux
    cette propriété, sans appeler personne.
 2. **Le second appel doit partir après le premier**, un cache s'écrivant à la fin de l'entrée qui
    l'a produit. Les passes qui partagent une destination **s'enchaînent** donc, la plus courte
-   d'abord. Ce séquencement ne s'applique qu'aux providers dont le cache existe : sur Ollama, qui
-   n'expose aucun compteur de cache ([#15600](https://github.com/ollama/ollama/issues/15600),
-   [#16714](https://github.com/ollama/ollama/issues/16714)), les passes restent parallèles, parce
-   que les sérialiser coûterait du temps contre une économie invérifiable.
+   d'abord.
+
+#### Deux appels ne partent jamais ensemble vers le même modèle
+
+Le séquencement vaut pour **tous** les providers, y compris ceux qui n'ont pas de cache. Ce n'est
+pas ce que faisait la première version : elle n'enchaînait que ce qui avait un cache à gagner, et
+laissait donc partir ensemble deux requêtes qu'Ollama ne sait pas servir en même temps.
+
+Mesuré sur `avolo-shorts`, trois PR de suite : trois grosses requêtes simultanées sur un même
+compte, et les deux qui partagent un modèle rendent un contenu **vide** après trois minutes de
+génération. Deux passes sur trois perdues, à chaque review.
+
+| Appel | En parallèle de | Entrée | Résultat |
+| --- | --- | --- | --- |
+| doctrine (flash), en local | rien | **173 109** | aboutit |
+| doctrine (flash), en CI | 2 autres appels | ~134 000 | **vide** |
+| données (flash), en CI | 2 autres appels | ~134 000 | **vide** |
+| régression (glm-5.2), en CI | 2 autres appels | 366 547 | aboutit |
+
+La ligne qui tranche est la première : le prompt **le plus gros** aboutit quand il part seul, et le
+plus petit échoue quand il part accompagné. Ce n'est donc pas la taille du contexte, c'est la
+concurrence. Chez un provider qui cache, la mise en file achète des tokens ; chez les autres, elle
+achète des passes qui aboutissent.
 
 ⚠️ **Le séquencement change l'arithmétique du `timeout-minutes` du job.** Le mur vaut
 `(taille du plus gros groupe séquencé + 1) × timeout-minutes`, la fusion étant le `+ 1` :
 
 | Configuration | Plus gros groupe | Mur théorique |
 | --- | --- | --- |
-| défaut, sans clé DeepSeek | 1 (rien n'est séquencé) | 2 × 15 = **30 min** |
-| défaut, avec clé DeepSeek | 2 (doctrine puis données) | 3 × 15 = **45 min** |
-| `provider: deepseek` global | 3 (les trois passes) | 4 × 15 = **60 min** |
+| défaut (mix actif) | 2 (doctrine puis données) | 3 × 15 = **45 min** |
+| `model:` écrit à la main | 3 (les trois passes, même modèle) | 4 × 15 = **60 min** |
 
-La dernière ligne est le piège : un provider global qui cache met les trois passes dans le même
-groupe. Un `timeout-minutes: 45` y couperait la review pendant la fusion, sans laisser le temps de
-poster le commentaire d'échec. Baisse `timeout-minutes` ou monte le budget du job.
+La seconde ligne est le piège : écrire `model:` remet les quatre appels sur un seul modèle, donc
+les trois passes dans le même groupe. Un `timeout-minutes: 45` y couperait la review pendant la
+fusion, sans laisser le temps de poster le commentaire d'échec. Baisse `timeout-minutes` ou monte
+le budget du job.
 
 Mesuré sur cette PR, on est loin du pire cas, la régression pesant à elle seule cinq fois les deux
 autres réunies :

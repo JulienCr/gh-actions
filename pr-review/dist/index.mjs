@@ -1180,10 +1180,10 @@ function buildPassMessages(pass, options, meta, seen) {
 ${passOutput(seen.imported.length > 0)}` }
   ];
 }
-function groupForCache(items) {
+function groupByDestination(items) {
   const groups = /* @__PURE__ */ new Map();
-  for (const [index, item] of items.entries()) {
-    const key = item.cacheable ? `${item.provider}/${item.model}` : `seul:${index}`;
+  for (const item of items) {
+    const key = `${item.provider}/${item.model}`;
     const group = groups.get(key);
     if (group) group.push(item);
     else groups.set(key, [item]);
@@ -2007,7 +2007,7 @@ function planPasses(config, promptOptions, meta, context, passes) {
 }
 async function runPasses(config, run2, plan) {
   const groups = await Promise.all(
-    groupForCache(plan).map(async (group) => {
+    groupByDestination(plan).map(async (group) => {
       const outcomes = [];
       for (const { pass, target, messages } of group) {
         const result = await callModel(config, run2, {
@@ -2085,13 +2085,14 @@ PR #${config.pr} \xB7 ${context.files.length} fichier(s) touch\xE9s \xB7 ${conte
   console.log(
     "\n  La fusion n\u2019est pas compt\xE9e : son entr\xE9e est faite des trouvailles des passes,\n  qui n\u2019existent pas sans appel. Mesur\xE9e en production, elle p\xE8se ~2 000 tokens."
   );
-  for (const group of groupForCache(plan).filter((chain) => chain.length > 1)) {
+  for (const group of groupByDestination(plan).filter((chain) => chain.length > 1)) {
+    const why = group[0].cacheable ? "pour que la seconde rejoue le pr\xE9fixe de la premi\xE8re en cache" : "parce qu'un m\xEAme mod\xE8le ne sert pas deux gros contextes \xE0 la fois";
     console.log(
       `
   ${group.map(({ pass }) => `\xAB ${pass.label} \xBB`).join(" puis ")} : m\xEAme destination,
-  donc lanc\xE9es \xE0 la suite pour que la seconde rejoue le pr\xE9fixe de la premi\xE8re en cache.`
+  donc lanc\xE9es \xE0 la suite ${why}.`
     );
-    console.log(`  ${describePrefix(group)}`);
+    if (group[0].cacheable) console.log(`  ${describePrefix(group)}`);
   }
 }
 function describePrefix(group) {

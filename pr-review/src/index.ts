@@ -48,7 +48,7 @@ import {
   buildMergeSystemPrompt,
   buildMergeUserPrompt,
   buildPassMessages,
-  groupForCache,
+  groupByDestination,
   PASS_HEADING,
   selectPasses,
   type Pass,
@@ -359,7 +359,7 @@ interface PassPrompt {
   messages: ChatMessage[];
   /** Le contexte que CETTE passe reçoit, imports retirés le cas échéant. */
   seen: AssembledContext;
-  /** Pour `groupForCache` : deux appels de même destination partagent un cache. */
+  /** Pour `groupByDestination` : deux appels de même destination partagent une file. */
   provider: string;
   model: string;
   /** Taille totale de l'entrée. Le plus court part en premier dans son groupe. */
@@ -422,7 +422,7 @@ interface PassOutcome {
  */
 async function runPasses(config: Config, run: Run, plan: PassPrompt[]): Promise<PassOutcome[]> {
   const groups = await Promise.all(
-    groupForCache(plan).map(async (group) => {
+    groupByDestination(plan).map(async (group) => {
       const outcomes: PassOutcome[] = [];
       for (const { pass, target, messages } of group) {
         const result = await callModel(config, run, {
@@ -531,12 +531,18 @@ function countOnly(config: Config, plan: PassPrompt[], context: AssembledContext
     '\n  La fusion n\u2019est pas comptée : son entrée est faite des trouvailles des passes,\n' +
       '  qui n\u2019existent pas sans appel. Mesurée en production, elle pèse ~2 000 tokens.',
   );
-  for (const group of groupForCache(plan).filter((chain) => chain.length > 1)) {
+  for (const group of groupByDestination(plan).filter((chain) => chain.length > 1)) {
+    // Deux motifs de mise en file, et ils ne s'annoncent pas pareil : chez un
+    // provider qui cache, elle achète des tokens ; chez les autres, elle achète
+    // des passes qui aboutissent.
+    const why = group[0]!.cacheable
+      ? 'pour que la seconde rejoue le préfixe de la première en cache'
+      : "parce qu'un même modèle ne sert pas deux gros contextes à la fois";
     console.log(
       `\n  ${group.map(({ pass }) => `« ${pass.label} »`).join(' puis ')} : même destination,\n` +
-        '  donc lancées à la suite pour que la seconde rejoue le préfixe de la première en cache.',
+        `  donc lancées à la suite ${why}.`,
     );
-    console.log(`  ${describePrefix(group)}`);
+    if (group[0]!.cacheable) console.log(`  ${describePrefix(group)}`);
   }
 }
 

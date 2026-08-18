@@ -130,7 +130,7 @@ reader doubt the whole finding, and a true finding dies with its invented suppor
  * 2. Les fichiers importés se rendent en DERNIER, pour que le prompt d'une
  *    passe qui ne les reçoit pas soit un préfixe **strict** de celui d'une
  *    passe qui les reçoit. C'est ce qui rend le cran « balanced » compatible
- *    avec le cache. Voir `groupForCache` dans `passes.ts`.
+ *    avec le cache. Voir `groupByDestination` dans `passes.ts`.
  */
 export function buildUserPrompt(meta: PrMeta, context: AssembledContext): string {
   const fileList = meta.files

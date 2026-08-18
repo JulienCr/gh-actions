@@ -6,7 +6,7 @@ import {
   buildMergeSystemPrompt,
   buildMergeUserPrompt,
   buildPassMessages,
-  groupForCache,
+  groupByDestination,
   PASSES,
   PASS_HEADING,
   selectPasses,
@@ -427,8 +427,8 @@ describe('le regroupement par destination', () => {
     cacheable,
   });
 
-  it('sépare les destinations, qui ne partagent aucun cache', () => {
-    const groups = groupForCache([
+  it('sépare les destinations, qui ne se disputent rien', () => {
+    const groups = groupByDestination([
       item('regression', 'ollama', 'glm-5.2:cloud', 300_000),
       item('doctrine', 'deepseek', 'deepseek-v4-flash', 200_000),
     ]);
@@ -445,7 +445,7 @@ describe('le regroupement par destination', () => {
    * n'a rien à réutiliser.
    */
   it('range le prompt le plus court en tête de son groupe', () => {
-    const groups = groupForCache([
+    const groups = groupByDestination([
       item('data', 'deepseek', 'deepseek-v4-flash', 320_000),
       item('doctrine', 'deepseek', 'deepseek-v4-flash', 210_000),
     ]);
@@ -455,7 +455,7 @@ describe('le regroupement par destination', () => {
 
   /** Un même modèle chez deux providers ne partage rien : la clé porte les deux. */
   it('ne regroupe pas deux providers qui servent le même nom de modèle', () => {
-    const groups = groupForCache([
+    const groups = groupByDestination([
       item('doctrine', 'deepseek', 'deepseek-v4-flash', 200_000),
       item('data', 'openai', 'deepseek-v4-flash', 200_000),
     ]);
@@ -463,7 +463,7 @@ describe('le regroupement par destination', () => {
   });
 
   it('garde l’ordre des passes quand deux entrées pèsent pareil', () => {
-    const groups = groupForCache([
+    const groups = groupByDestination([
       item('doctrine', 'deepseek', 'm', 100),
       item('data', 'deepseek', 'm', 100),
     ]);
@@ -471,7 +471,7 @@ describe('le regroupement par destination', () => {
   });
 
   it('ne perd aucune entrée', () => {
-    const groups = groupForCache([
+    const groups = groupByDestination([
       item('regression', 'ollama', 'glm', 3, false),
       item('doctrine', 'deepseek', 'ds', 2),
       item('data', 'deepseek', 'ds', 1),
@@ -480,18 +480,38 @@ describe('le regroupement par destination', () => {
   });
 
   /**
-   * Sans ce garde-fou, un dépôt sans clé DeepSeek verrait ses trois passes,
-   * toutes sur Ollama, se sérialiser : le mur du job triplerait en échange d'un
-   * cache qu'Ollama n'expose pas. Un input neuf doit reproduire le comportement
-   * d'avant, pas le ralentir.
+   * Le contraire de ce que ce test épinglait d'abord, et le renversement a
+   * coûté trois reviews. On croyait qu'un provider sans cache n'avait aucune
+   * raison de sérialiser, donc on laissait partir ses passes ensemble.
+   *
+   * Mesuré sur avolo-shorts#63, #64 et #68 : trois grosses requêtes simultanées
+   * sur un même compte Ollama, et les deux qui partagent un modèle rendent un
+   * contenu VIDE après trois minutes de génération. La même passe lancée seule,
+   * avec un contexte PLUS GROS (173 109 tokens contre ~134 000), aboutit. La
+   * mise en file n'achète pas un cache ici, elle achète des passes qui
+   * aboutissent, ce qui vaut largement le mur de job qu'elle coûte.
    */
-  it('laisse en parallèle les appels qui n’ont aucun cache à gagner', () => {
-    const groups = groupForCache([
+  it('met en file les appels de même destination, cache ou pas', () => {
+    const groups = groupByDestination([
       item('regression', 'ollama', 'glm-5.2:cloud', 300_000, false),
       item('doctrine', 'ollama', 'glm-5.2:cloud', 200_000, false),
       item('data', 'ollama', 'glm-5.2:cloud', 300_000, false),
     ]);
-    expect(groups).toHaveLength(3);
-    expect(groups.map((group) => group[0]!.id)).toEqual(['regression', 'doctrine', 'data']);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.map((entry) => entry.id)).toEqual(['doctrine', 'regression', 'data']);
+  });
+
+  /** Des destinations distinctes ne se disputent rien : elles restent parallèles. */
+  it('garde en parallèle ce qui ne partage pas de destination', () => {
+    const groups = groupByDestination([
+      item('regression', 'ollama', 'glm-5.2:cloud', 300_000, false),
+      item('doctrine', 'ollama', 'deepseek-v4-flash:cloud', 200_000, false),
+      item('data', 'ollama', 'deepseek-v4-flash:cloud', 300_000, false),
+    ]);
+    expect(groups).toHaveLength(2);
+    expect(groups.map((group) => group.map((entry) => entry.id))).toEqual([
+      ['regression'],
+      ['doctrine', 'data'],
+    ]);
   });
 });
