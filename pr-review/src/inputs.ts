@@ -238,9 +238,11 @@ export interface Config {
   /**
    * L'endpoint générique cache-t-il les préfixes ?
    *
-   * Faux par défaut, parce que « OpenAI-compatible » décrit un protocole et pas
-   * une garantie de cache : sérialiser deux passes chez un endpoint qui ne
-   * cache rien coûte du temps contre rien.
+   * Ne pilote PAS le séquencement, qui vaut pour tout provider : deux appels de
+   * même destination s'enchaînent de toute façon. Ne change que ce qu'on
+   * annonce du gain, et le relevé de préfixe partagé de `--count-only`. Faux
+   * par défaut : « OpenAI-compatible » décrit un protocole, pas une garantie
+   * de cache.
    */
   openaiPrefixCache: boolean;
   temperature: number;

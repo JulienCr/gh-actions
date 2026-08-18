@@ -206,7 +206,22 @@ async function collect(response: Response, apiKey: string): Promise<ChatPayload>
   if (!content.trim()) {
     // Un contenu vide arrive quand tout est parti dans `thinking` : le dire
     // vaut mieux que poster un commentaire vide.
-    throw new LlmError('Ollama a rendu une réponse vide');
+    //
+    // Les compteurs sont RECOPIÉS dans le message, et ce n'est pas cosmétique :
+    // sans eux, un « réponse vide » dans un journal de CI ne dit pas si le
+    // modèle a rendu trois tokens ou brûlé trente mille à réfléchir sans
+    // conclure. Ce sont deux pannes opposées, et on ne peut pas les distinguer
+    // après coup, l'appel ayant été payé pour rien dans les deux cas.
+    throw new LlmError(
+      `Ollama a rendu une réponse vide (${evalTokens} tokens de sortie, ` +
+        `dont ${thinking.length} caractères de raisonnement, sur ${promptTokens} en entrée)`,
+      false,
+      false,
+      // Du raisonnement mais pas de réponse : la génération s'est arrêtée AVANT
+      // de conclure. Un vide sans raisonnement, lui, n'a pas d'explication et
+      // ne se rejoue pas plus bas.
+      thinking.trim().length > 0,
+    );
   }
   return {
     message: { content, thinking },

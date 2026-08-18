@@ -57,11 +57,10 @@ inputs:
 
   openai-prefix-cache:
     description: >-
-      true : l'endpoint « openai » générique cache les préfixes, et deux passes
-      de même destination peuvent s'enchaîner pour se le partager. Faux par
-      défaut, parce qu'« OpenAI-compatible » décrit un protocole et pas une
-      garantie de cache : séquencer chez un endpoint qui ne cache rien coûte du
-      temps de job contre une économie imaginaire.
+      true : l'endpoint « openai » générique cache les préfixes. N'change PAS
+      le séquencement, qui vaut pour tout provider ; ne change que le coût qu'on
+      annonce et le relevé de préfixe partagé. Faux par défaut, parce
+      qu'« OpenAI-compatible » décrit un protocole et pas une garantie de cache.
     required: false
     default: 'false'
 
@@ -276,13 +275,15 @@ inputs:
     description: >-
       Délai maximum d'UNE requête au modèle. La review en fait quatre. Les
       passes tournent en parallèle, sauf celles qui partagent un provider ET un
-      modèle CHEZ UN PROVIDER QUI CACHE LES PRÉFIXES : celles-là s'enchaînent,
-      pour que la seconde rejoue le préfixe de la première. Le mur du job vaut
-      donc « (taille du plus gros groupe séquencé + 1) × cette valeur ». Soit
-      deux fois sans séquencement, trois fois quand deux passes s'enchaînent, et
-      QUATRE fois si un provider global qui cache met les trois passes dans le
-      même groupe. Le timeout-minutes du job doit rester au-dessus, sinon le
-      commentaire d'échec n'a pas le temps d'être posté.
+      modèle : celles-là s'enchaînent toujours, pour que la seconde rejoue le
+      préfixe de la première quand le provider cache, et parce qu'un même modèle
+      ne sert pas deux gros contextes à la fois quand il ne cache pas. Le mur du
+      job vaut
+      donc « (taille du plus gros groupe + 1) × cette valeur » : trois fois avec
+      le mix, où doctrine et données s'enchaînent, et QUATRE fois si un « model »
+      écrit à la main remet les trois passes sur un seul modèle. Le
+      timeout-minutes du job doit rester au-dessus, sinon le commentaire d'échec
+      n'a pas le temps d'être posté.
     required: false
     default: '15'
 

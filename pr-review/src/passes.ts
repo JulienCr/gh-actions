@@ -382,11 +382,11 @@ export interface Sequenceable {
   /** Taille de l'entrée, en caractères. */
   chars: number;
   /**
-   * Enchaîner cet appel derrière un autre achète-t-il un préfixe en cache ?
+   * Les enchaîner achète-t-il un préfixe en cache ?
    *
-   * Faux chez Ollama, qui n'expose aucun cache : y sérialiser trois passes
-   * triplerait le mur du job en échange de rien. C'est ce drapeau qui garantit
-   * qu'un dépôt sans clé DeepSeek retrouve exactement le comportement d'avant.
+   * Ne décide plus du groupement, seulement de ce qu'on en DIT : chez un
+   * provider qui cache, la mise en file achète des tokens ; chez les autres,
+   * elle achète des passes qui aboutissent. Voir `groupByDestination`.
    */
   cacheable: boolean;
 }
@@ -394,24 +394,35 @@ export interface Sequenceable {
 /**
  * Regroupe les appels par destination, et ordonne chaque groupe.
  *
- * Deux passes qui visent le même couple provider+modèle peuvent se partager le
- * gros contexte, à deux conditions : que la seconde parte APRÈS la première,
- * puisqu'un cache s'écrit à la fin de l'entrée qui l'a produit, et que son
- * prompt commence par exactement les mêmes octets. D'où le tri par taille
- * croissante : au cran `balanced`, « doctrine » ne reçoit pas les fichiers
- * importés et « données » les reçoit, or ils sont rendus en dernier. Le prompt
- * de doctrine est alors un préfixe strict de celui de données, et le passer en
- * premier rend le second presque gratuit.
+ * Deux appels qui visent le même couple provider+modèle ne partent plus
+ * ensemble. Deux raisons, et la seconde a coûté trois reviews avant d'être
+ * comprise :
  *
- * Les groupes, eux, restent parallèles entre eux : ils ne partagent rien, et
- * les sérialiser ne ferait qu'additionner leurs durées.
+ * 1. **Le cache.** Chez un provider qui cache les préfixes, la seconde requête
+ *    rejoue le gros contexte commun à un trente-et-unième du tarif, à condition
+ *    de partir APRÈS : un cache s'écrit à la fin de l'entrée qui l'a produit.
+ *    D'où le tri par taille croissante, au cran `balanced` : « doctrine » ne
+ *    reçoit pas les fichiers importés et « données » les reçoit, or ils sont
+ *    rendus en dernier. Le prompt de doctrine est alors un préfixe strict de
+ *    celui de données.
+ * 2. **La capacité.** Mesuré sur avolo-shorts#63, #64 et #68 : trois grosses
+ *    requêtes simultanées sur un même compte Ollama, et les deux qui partagent
+ *    un modèle rendent un contenu VIDE après trois minutes de génération. La
+ *    même passe lancée SEULE, avec un contexte plus gros (173 109 tokens contre
+ *    ~134 000), aboutit. Ce n'est donc pas la taille du contexte, c'est la
+ *    concurrence.
+ *
+ * Le groupement ne regarde donc plus `cacheable`. La version précédente y
+ * voyait le seul motif de sérialiser, et laissait par conséquent partir
+ * ensemble deux appels qu'Ollama ne savait pas servir en même temps.
+ *
+ * Les groupes, eux, restent parallèles entre eux : destinations distinctes,
+ * rien à se disputer.
  */
-export function groupForCache<T extends Sequenceable>(items: readonly T[]): T[][] {
+export function groupByDestination<T extends Sequenceable>(items: readonly T[]): T[][] {
   const groups = new Map<string, T[]>();
-  for (const [index, item] of items.entries()) {
-    // Un appel qui n'a aucun cache à gagner reste seul dans son groupe, donc
-    // parallèle : l'index le rend unique sans lui donner de voisin.
-    const key = item.cacheable ? `${item.provider}/${item.model}` : `seul:${index}`;
+  for (const item of items) {
+    const key = `${item.provider}/${item.model}`;
     const group = groups.get(key);
     if (group) group.push(item);
     else groups.set(key, [item]);

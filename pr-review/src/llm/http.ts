@@ -171,6 +171,23 @@ const rejectsThinkingValue = (body: string) => /invalid (think|reasoning_effort)
  * sans `think` plutôt que de rendre l'action inutilisable dès que le dépôt
  * appelant change de modèle.
  */
+/**
+ * Un cran de raisonnement en dessous, sans jamais descendre sous « low ».
+ *
+ * Volontairement recopié ici plutôt qu'importé de `passes.ts` : la couche
+ * transport ne doit rien savoir des passes de review, et cette échelle est
+ * celle des providers, pas celle du découpage.
+ */
+const LEVELS = ['low', 'medium', 'high', 'max'];
+
+function oneLevelDown(level: string): string {
+  const index = LEVELS.indexOf(level.trim().toLowerCase());
+  // Hors échelle (un booléen, le niveau d'un modèle qu'on ne connaît pas) : on
+  // ne devine pas, on retire le raisonnement. C'est le seul repli sûr.
+  if (index === -1) return '';
+  return index === 0 ? '' : LEVELS[index - 1]!;
+}
+
 export async function withRetries(
   attempt: (request: ChatRequest) => Promise<ChatResult>,
   request: ChatRequest,
@@ -179,6 +196,14 @@ export async function withRetries(
     return await attempt(request);
   } catch (error) {
     if (!(error instanceof LlmError)) throw error;
+    // Le raisonnement a tout mangé : on rejoue d'UN cran plus bas. Une passe
+    // rendue à « medium » vaut incomparablement mieux qu'une passe perdue, et
+    // retirer le raisonnement d'un coup coûterait la profondeur qu'on paie.
+    if (error.reasoningExhausted && request.think) {
+      const lower = oneLevelDown(request.think);
+      request.onDowngrade?.(`${error.message} — on rejoue en « ${lower || 'sans raisonnement'} »`);
+      return attempt({ ...request, think: lower });
+    }
     if (error.thinkingRejected && request.think) {
       // Un niveau mal orthographié ne coûte que le niveau ; un modèle qui ne
       // raisonne pas coûte le raisonnement. Deux replis, pas un.
