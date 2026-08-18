@@ -31,6 +31,22 @@ export function hasContent(file: PrFile, isSkipped: SkipPredicate): boolean {
   return !isSkipped(file.path) && file.status !== 'removed';
 }
 
+/**
+ * Ce fichier a-t-il une ligne de changée ?
+ *
+ * Un renommage pur ou un changement de mode arrive avec `+0 / -0` : son contenu
+ * intégral est du code que la PR n'a pas touché, et il partait une fois par
+ * passe. Sur un refactor qui déplace trente fichiers, c'était trente fichiers
+ * entiers payés trois fois pour un diff qui ne dit que `rename from/to`.
+ *
+ * Rien à déclarer au lecteur : le diff porte déjà le renommage, et la liste des
+ * fichiers modifiés annonce le `+0 / -0`. Un fichier neuf mais vide reste
+ * fourni, parce que « vide » est justement ce qu'il faut pouvoir constater.
+ */
+export function touchesLines(file: PrFile): boolean {
+  return file.additions + file.deletions > 0 || file.status === 'added';
+}
+
 export interface DiffChunk {
   path: string;
   body: string;
@@ -92,6 +108,41 @@ export function filterDiff(diff: string, isSkipped: SkipPredicate): { diff: stri
     else kept.push(chunk.body);
   }
   return { diff: kept.join('\n'), skipped };
+}
+
+/**
+ * Le renvoi qui remplace le corps du diff d'un fichier neuf.
+ *
+ * En anglais, comme le reste des consignes : un prompt bilingue force le modèle
+ * à changer de registre au milieu du contexte.
+ */
+const FOLDED_NOTE = '(entirely new file: every line is an addition, see its full numbered content below)';
+
+/**
+ * Remplace le corps du diff des fichiers neufs par un renvoi.
+ *
+ * Pour un fichier ajouté, le diff redonne chaque ligne préfixée `+` quand la
+ * section suivante rend les mêmes lignes en mieux : numérotées, donc citables,
+ * et sans le bruit du préfixe. C'est un doublon exact, payé une fois par passe.
+ *
+ * Ne s'applique qu'aux fichiers dont le contenu intégral part réellement. Un
+ * fichier neuf trop gros pour le budget garde son diff entier, sans quoi la PR
+ * l'aurait ajouté sans que personne ne puisse le lire.
+ */
+export function foldAddedFiles(diff: string, folded: Set<string>): string {
+  if (folded.size === 0) return diff;
+
+  return splitDiffByFile(diff)
+    .map((chunk) => {
+      if (!folded.has(chunk.path)) return chunk.body;
+      const lines = chunk.body.split('\n');
+      const firstHunk = lines.findIndex((line) => line.startsWith('@@'));
+      // Sans hunk, il n'y a rien à replier : on ne touche pas à ce qu'on ne
+      // reconnaît pas.
+      if (firstHunk === -1) return chunk.body;
+      return [...lines.slice(0, firstHunk), FOLDED_NOTE].join('\n');
+    })
+    .join('\n');
 }
 
 /** Numérote les lignes, pour que le modèle puisse citer un `chemin:ligne` juste. */
@@ -178,7 +229,7 @@ export function assembleContext({
   // Les plus petits d'abord : à budget égal, mieux vaut le contexte complet de
   // huit fichiers que celui d'un seul gros.
   const candidates = prFiles
-    .filter((file) => hasContent(file, isSkipped))
+    .filter((file) => hasContent(file, isSkipped) && touchesLines(file))
     .sort((a, b) => a.additions + a.deletions - (b.additions + b.deletions));
 
   for (const file of candidates) {
@@ -204,7 +255,14 @@ export function assembleContext({
 
   const imported = readImported({ sources, readFile, exists, isSkipped, budget });
 
-  return { diff, files, imported, skipped, omitted };
+  // Le repli du diff se décide APRÈS la sélection des contenus : seul un fichier
+  // neuf dont le contenu part vraiment a un diff redondant.
+  const supplied = new Set(sources.map((source) => source.path));
+  const added = new Set(
+    prFiles.filter((file) => file.status === 'added' && supplied.has(file.path)).map((file) => file.path),
+  );
+
+  return { diff: foldAddedFiles(diff, added), files, imported, skipped, omitted };
 }
 
 interface ImportedOptions {

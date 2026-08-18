@@ -3,9 +3,11 @@ import { describe, expect, it } from 'vitest';
 import {
   assembleContext,
   filterDiff,
+  foldAddedFiles,
   hasContent,
   numberLines,
   splitDiffByFile,
+  touchesLines,
   type AssembleOptions,
   type ContextBudget,
 } from '../src/context';
@@ -234,5 +236,90 @@ describe('les fichiers importés, joints en second rang', () => {
     expect(imported({ prFiles: [file('src/app/page.tsx'), file('src/lib/format.ts')] })).toEqual([
       'src/app/status.ts',
     ]);
+  });
+});
+
+
+describe('les fichiers dont pas une ligne ne bouge', () => {
+  it('écarte un renommage pur : son contenu est du code que la PR n’a pas touché', () => {
+    expect(touchesLines(file('src/b.ts', { additions: 0, deletions: 0, status: 'renamed' }))).toBe(false);
+  });
+
+  it('garde un renommage assorti d’une retouche', () => {
+    expect(touchesLines(file('src/b.ts', { additions: 3, deletions: 1, status: 'renamed' }))).toBe(true);
+  });
+
+  /** « Vide » est justement ce que la review doit pouvoir constater. */
+  it('garde un fichier neuf mais vide', () => {
+    expect(touchesLines(file('src/vide.ts', { additions: 0, deletions: 0, status: 'added' }))).toBe(true);
+  });
+
+  it('ne lit pas le contenu d’un fichier seulement déplacé', () => {
+    const context = assemble({
+      rawDiff: 'diff --git a/src/a.ts b/src/b.ts\nsimilarity index 100%\nrename from src/a.ts\nrename to src/b.ts',
+      prFiles: [file('src/b.ts', { additions: 0, deletions: 0, status: 'renamed' })],
+      readFile: () => 'const nonLu = 1;',
+    });
+    expect(context.files).toEqual([]);
+    // Ni une troncature ni un oubli : le diff porte déjà le renommage.
+    expect(context.omitted).toEqual([]);
+  });
+});
+
+describe('le diff d’un fichier neuf, doublon de son contenu numéroté', () => {
+  const diff = [
+    'diff --git a/src/neuf.ts b/src/neuf.ts',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/src/neuf.ts',
+    '@@ -0,0 +1,2 @@',
+    '+const a = 1;',
+    '+const b = 2;',
+  ].join('\n');
+
+  it('remplace le corps par un renvoi, en gardant les en-têtes', () => {
+    const folded = foldAddedFiles(diff, new Set(['src/neuf.ts']));
+    expect(folded).toContain('+++ b/src/neuf.ts');
+    expect(folded).toContain('see its full numbered content below');
+    expect(folded).not.toContain('+const a = 1;');
+  });
+
+  it('laisse intact un fichier qu’on ne lui a pas désigné', () => {
+    expect(foldAddedFiles(diff, new Set(['src/autre.ts']))).toBe(diff);
+  });
+
+  it('rend le diff tel quel quand il n’y a rien à replier', () => {
+    expect(foldAddedFiles(diff, new Set())).toBe(diff);
+  });
+
+  /** Sans hunk, il n'y a pas de corps à replier : on ne touche pas à l'inconnu. */
+  it('ne touche pas à un bloc sans hunk', () => {
+    const sansHunk = 'diff --git a/src/neuf.ts b/src/neuf.ts\nnew file mode 100644';
+    expect(foldAddedFiles(sansHunk, new Set(['src/neuf.ts']))).toBe(sansHunk);
+  });
+
+  it('replie à l’assemblage quand le contenu intégral part bien', () => {
+    const context = assemble({
+      rawDiff: diff,
+      prFiles: [file('src/neuf.ts', { additions: 2, deletions: 0, status: 'added' })],
+      readFile: () => 'const a = 1;\nconst b = 2;',
+    });
+    expect(context.diff).toContain('see its full numbered content below');
+    expect(context.files[0]?.numbered).toContain('const a = 1;');
+  });
+
+  /**
+   * Un fichier neuf trop gros pour le budget garde son diff entier : sans quoi
+   * la PR l'aurait ajouté sans que personne ne puisse le lire.
+   */
+  it('garde le diff entier d’un fichier neuf que le budget a écarté', () => {
+    const context = assemble({
+      rawDiff: diff,
+      prFiles: [file('src/neuf.ts', { additions: 2, deletions: 0, status: 'added' })],
+      readFile: () => 'x'.repeat(200),
+      budget: { totalChars: 10, perFileChars: 10, importedChars: 0 },
+    });
+    expect(context.omitted).toEqual(['src/neuf.ts']);
+    expect(context.diff).toContain('+const a = 1;');
   });
 });

@@ -99,6 +99,9 @@ function collectImports(sources, options) {
 function hasContent(file, isSkipped) {
   return !isSkipped(file.path) && file.status !== "removed";
 }
+function touchesLines(file) {
+  return file.additions + file.deletions > 0 || file.status === "added";
+}
 function splitDiffByFile(diff) {
   const chunks = [];
   const lines = diff.split("\n");
@@ -142,6 +145,17 @@ function filterDiff(diff, isSkipped) {
   }
   return { diff: kept.join("\n"), skipped };
 }
+var FOLDED_NOTE = "(entirely new file: every line is an addition, see its full numbered content below)";
+function foldAddedFiles(diff, folded) {
+  if (folded.size === 0) return diff;
+  return splitDiffByFile(diff).map((chunk) => {
+    if (!folded.has(chunk.path)) return chunk.body;
+    const lines = chunk.body.split("\n");
+    const firstHunk = lines.findIndex((line) => line.startsWith("@@"));
+    if (firstHunk === -1) return chunk.body;
+    return [...lines.slice(0, firstHunk), FOLDED_NOTE].join("\n");
+  }).join("\n");
+}
 function numberLines(content) {
   const lines = content.split("\n");
   if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
@@ -160,7 +174,7 @@ function assembleContext({
   const sources = [];
   const omitted = [];
   let used = 0;
-  const candidates2 = prFiles.filter((file) => hasContent(file, isSkipped)).sort((a, b) => a.additions + a.deletions - (b.additions + b.deletions));
+  const candidates2 = prFiles.filter((file) => hasContent(file, isSkipped) && touchesLines(file)).sort((a, b) => a.additions + a.deletions - (b.additions + b.deletions));
   for (const file of candidates2) {
     const content = readFile(file.path);
     if (content === null) continue;
@@ -178,7 +192,11 @@ function assembleContext({
     numbered: numberLines(source.content)
   }));
   const imported = readImported({ sources, readFile, exists, isSkipped, budget });
-  return { diff, files, imported, skipped, omitted };
+  const supplied = new Set(sources.map((source) => source.path));
+  const added = new Set(
+    prFiles.filter((file) => file.status === "added" && supplied.has(file.path)).map((file) => file.path)
+  );
+  return { diff: foldAddedFiles(diff, added), files, imported, skipped, omitted };
 }
 function readImported({ sources, readFile, exists, isSkipped, budget }) {
   if (budget.importedChars <= 0) return [];
@@ -233,6 +251,18 @@ ${stderr.slice(-2e3)}`));
 }
 
 // pr-review/src/gh.ts
+function statusOf(changeType) {
+  switch (changeType?.toUpperCase()) {
+    case "ADDED":
+      return "added";
+    case "DELETED":
+      return "removed";
+    case "RENAMED":
+      return "renamed";
+    default:
+      return "modified";
+  }
+}
 async function fetchPrMeta(pr) {
   const stdout = await run("gh", [
     "pr",
@@ -253,7 +283,7 @@ async function fetchPrMeta(pr) {
       path: file.path,
       additions: file.additions,
       deletions: file.deletions,
-      status: file.status ?? "modified"
+      status: statusOf(file.changeType)
     }))
   };
 }
@@ -883,6 +913,7 @@ var PASSES = [
   {
     id: "regression",
     label: "r\xE9gression fonctionnelle",
+    axis: "functional regressions",
     objective: `# Your one job in this pass: functional regressions
 
 You are not looking at conventions, style, or data access. Another pass covers those. You are
@@ -906,6 +937,7 @@ production.
   {
     id: "doctrine",
     label: "doctrine du d\xE9p\xF4t",
+    axis: "the repository's own conventions",
     objective: `# Your one job in this pass: the repository's own rules
 
 Judge this PR against the doctrine quoted above, and against nothing else. Other passes cover
@@ -927,6 +959,7 @@ substitute your own conventions for the ones it did not write.`
   {
     id: "data",
     label: "donn\xE9es et acc\xE8s",
+    axis: "data access",
     objective: `# Your one job in this pass: data, secrets, and access boundaries
 
 Not runtime bugs, not conventions. Who can read what, and what escapes to where.
@@ -969,9 +1002,21 @@ Une seule phrase : ce que tu retiens de cette PR.
 ## \xC0 v\xE9rifier
 - \`chemin/fichier.ts:120\` : ce que tu soup\xE7onnes sans pouvoir le prouver ici, et ce qu'il
   faudrait regarder pour trancher.`;
+function enumerate(items) {
+  if (items.length < 2) return items.join("");
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+var WORDS = ["no", "a single", "two", "three", "four", "five"];
+function opening(repo, passes) {
+  const axes = enumerate(passes.map((pass) => pass.axis));
+  if (passes.length === 1) {
+    return `One reviewer has just read a pull request on \`${repo}\`, on a single axis: ${axes}.`;
+  }
+  const word = WORDS[passes.length] ?? String(passes.length);
+  return `${word[0].toUpperCase()}${word.slice(1)} reviewers have just read the same pull request on \`${repo}\`, each on one axis: ${axes}.`;
+}
 function buildMergeSystemPrompt(options) {
-  return `Three reviewers have just read the same pull request on \`${options.repo}\`, each on one axis:
-functional regressions, the repository's own conventions, and data access. You are assembling
+  return `${opening(options.repo, options.passes)} You are assembling
 their findings into the single comment that gets posted on the PR.
 
 **You do not have the code.** You only have what they wrote. So:
@@ -1091,11 +1136,11 @@ function renderFooter(footer) {
   if (footer.failedPasses.length > 0) {
     const quoted = footer.failedPasses.map((pass) => `\xAB ${pass} \xBB`);
     const plural = quoted.length > 1 ? "s" : "";
-    bits.push(`\u26A0 passe${plural} ${enumerate(quoted)} non aboutie${plural}`);
+    bits.push(`\u26A0 passe${plural} ${enumerate2(quoted)} non aboutie${plural}`);
   }
   return `<sub>${bits.join(" \xB7 ")}</sub>`;
 }
-function enumerate(items) {
+function enumerate2(items) {
   if (items.length < 2) return items.join("");
   return `${items.slice(0, -1).join(", ")} et ${items[items.length - 1]}`;
 }
@@ -1420,7 +1465,13 @@ async function review(config) {
   }
   const merged = await callModel(config, run2, {
     id: "merge",
-    system: buildMergeSystemPrompt({ repo, maxFindings: config.maxFindings }),
+    // Les passes qui ont abouti, pas celles qui étaient prévues : annoncer un
+    // relecteur qui n'a rien rendu ferait chercher à la fusion un axe absent.
+    system: buildMergeSystemPrompt({
+      repo,
+      maxFindings: config.maxFindings,
+      passes: outcomes.map((outcome) => outcome.pass)
+    }),
     user: buildMergeUserPrompt(meta, outcomes),
     think: config.mergeThinking,
     label: "fusion"
