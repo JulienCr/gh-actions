@@ -265,6 +265,18 @@ export function assembleContext({
   return { diff: foldAddedFiles(diff, added), files, imported, skipped, omitted };
 }
 
+/**
+ * Le contexte tel qu'une passe doit le voir.
+ *
+ * Ne relit rien et ne recopie rien : c'est une projection. Le budget a déjà été
+ * dépensé à l'assemblage ; ce qui se décide ici est seulement ce qui part, et à
+ * qui. Une passe qui n'a rien à tirer des fichiers importés les payait une fois
+ * par appel, sans avoir le droit d'y relever quoi que ce soit.
+ */
+export function contextFor(context: AssembledContext, imports: boolean): AssembledContext {
+  return imports ? context : { ...context, imported: [] };
+}
+
 interface ImportedOptions {
   sources: { path: string; content: string }[];
   readFile: (path: string) => string | null;

@@ -13,6 +13,7 @@
  */
 
 import { parseList } from './globs';
+import { EFFORTS, isEffort, type Effort } from './passes';
 
 /**
  * Fichiers jamais relus, quels que soient les inputs.
@@ -113,6 +114,16 @@ export const DEFAULTS = {
   seed: 1,
   /** Nom du bras quand on n'en donne pas : celui du réglage livré. */
   variant: 'default',
+  /**
+   * Le cran par défaut.
+   *
+   * « balanced » et non « full » : ce que `full` garde en plus, ce sont des
+   * envois dont la mesure n'a pas montré qu'ils rapportaient une trouvaille.
+   * Un dépôt qui veut la lecture la plus large l'écrit, et le sait.
+   */
+  effort: 'balanced' as Effort,
+  /** Plafond des imports au cran « lean », où le contexte se resserre. */
+  leanImportsBudgetChars: 120_000,
 } as const;
 
 export interface Config {
@@ -131,6 +142,10 @@ export interface Config {
   perFileChars: number;
   /** Plafond des fichiers importés joints en contexte. `0` : aucun. */
   importsBudgetChars: number;
+  /** L'ampleur des coupes. Voir `Effort` dans `passes.ts`. */
+  effort: Effort;
+  /** Passes imposées par l'input `passes`. Vide : la règle décide. */
+  passes: string[];
   timeoutMs: number;
   /** Chemins de doctrine, dans l'ordre où ils seront injectés dans le prompt. */
   doctrine: string[];
@@ -192,6 +207,23 @@ function readNumber(
     return fallback;
   }
   return parsed;
+}
+
+/**
+ * Le cran demandé, ou le défaut.
+ *
+ * Un cran inconnu ne doit pas annuler la review : on prévient et on garde le
+ * défaut, comme pour tout input illisible.
+ */
+function readEffort(env: Env, warn: (message: string) => void): Effort {
+  const raw = readInput(env, 'effort').toLowerCase();
+  if (raw === '') return DEFAULTS.effort;
+  if (isEffort(raw)) return raw;
+  warn(
+    `input « effort » inconnu (« ${raw} ») : on garde ${DEFAULTS.effort}.\n` +
+      `  Valeurs acceptées : ${EFFORTS.join(', ')}.`,
+  );
+  return DEFAULTS.effort;
 }
 
 function readBoolean(env: Env, name: string): boolean {
@@ -304,6 +336,7 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   }
 
   const doctrineInput = parseList(readInput(env, 'doctrine'));
+  const effort = readEffort(env, warn);
 
   return {
     pr,
@@ -318,10 +351,14 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     maxFindings: readNumber(env, 'max-findings', DEFAULTS.maxFindings, warn),
     budgetChars: readNumber(env, 'budget-chars', DEFAULTS.budgetChars, warn),
     perFileChars: readNumber(env, 'per-file-chars', DEFAULTS.perFileChars, warn),
+    effort,
+    passes: parseList(readInput(env, 'passes')),
+    // Le cran pose le défaut, l'input explicite l'écrase : régler « effort » ne
+    // doit pas rendre un budget écrit à la main silencieusement inopérant.
     importsBudgetChars: readNumber(
       env,
       'imports-budget-chars',
-      DEFAULTS.importsBudgetChars,
+      effort === 'lean' ? DEFAULTS.leanImportsBudgetChars : DEFAULTS.importsBudgetChars,
       warn,
       0,
     ),

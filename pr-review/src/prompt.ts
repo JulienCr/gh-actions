@@ -154,8 +154,9 @@ ${context.diff}
 
 ## Full content of the changed files, after the change
 
-Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from this
-section and from the next one was not given to you: do not describe its contents.
+Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from ${
+    context.imported.length > 0 ? 'this section and from the next one' : 'this section'
+  } was not given to you: do not describe its contents.
 
 ${contents}${renderImported(context.imported)}`;
 }

@@ -125,6 +125,14 @@ export interface Footer {
   imported: number;
   /** Passes qui n'ont pas abouti. Une review partielle doit se déclarer. */
   failedPasses: string[];
+  /**
+   * Passes délibérément non lancées, avec leur raison.
+   *
+   * Champ distinct de `failedPasses`, et rendu sans avertissement : une passe
+   * qui échoue est un incident, une passe qu'on ne lance pas est une décision.
+   * Les confondre ferait lire un choix comme une panne, et l'inverse.
+   */
+  skippedPasses: { label: string; reason: string }[];
 }
 
 function formatDuration(ms: number): string {
@@ -153,6 +161,9 @@ function renderFooter(footer: Footer): string {
   if (footer.omitted.length > 0) {
     // Dit explicitement : une review partielle ne doit pas se lire comme une review complète.
     bits.push(`diff seul (sans contexte complet) pour ${footer.omitted.join(', ')}`);
+  }
+  for (const { label, reason } of footer.skippedPasses) {
+    bits.push(`passe « ${label} » non lancée (${reason})`);
   }
   if (footer.failedPasses.length > 0) {
     const quoted = footer.failedPasses.map((pass) => `« ${pass} »`);

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   assembleContext,
+  contextFor,
   filterDiff,
   foldAddedFiles,
   hasContent,
@@ -321,5 +322,27 @@ describe('le diff d’un fichier neuf, doublon de son contenu numéroté', () =>
     });
     expect(context.omitted).toEqual(['src/neuf.ts']);
     expect(context.diff).toContain('+const a = 1;');
+  });
+});
+
+
+describe('le contexte tel qu’une passe le voit', () => {
+  const base = {
+    diff: 'd',
+    files: [{ path: 'src/a.ts', numbered: '1| a' }],
+    imported: [{ path: 'src/b.ts', numbered: '1| b' }],
+    skipped: [],
+    omitted: [],
+  };
+
+  it('laisse tout passer à une passe qui se sert des imports', () => {
+    expect(contextFor(base, true)).toBe(base);
+  });
+
+  it('retire les imports à une passe qui n’en tire rien, et rien d’autre', () => {
+    const seen = contextFor(base, false);
+    expect(seen.imported).toEqual([]);
+    expect(seen.files).toBe(base.files);
+    expect(seen.diff).toBe(base.diff);
   });
 });

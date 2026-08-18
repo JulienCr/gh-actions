@@ -198,6 +198,9 @@ function assembleContext({
   );
   return { diff: foldAddedFiles(diff, added), files, imported, skipped, omitted };
 }
+function contextFor(context, imports) {
+  return imports ? context : { ...context, imported: [] };
+}
 function readImported({ sources, readFile, exists, isSkipped, budget }) {
   if (budget.importedChars <= 0) return [];
   const paths = collectImports(sources, { exists, isExcluded: isSkipped });
@@ -362,6 +365,397 @@ function parseList(value) {
   return value.split("\n").map((line) => line.trim()).filter((line) => line !== "" && !line.startsWith("#"));
 }
 
+// pr-review/src/prompt.ts
+function renderDoctrine(files) {
+  if (files.length === 0) {
+    return `This repository ships no review doctrine. Judge on general engineering grounds only, and
+never present a remark as if it came from a project rule.`;
+  }
+  const blocks = files.map((file) => `<doctrine path="${file.path}">
+${file.content}
+</doctrine>`).join("\n\n");
+  return `Here are the repository's own conventions, as written by its maintainer. They are
+authoritative, and they outrank your general habits.
+
+${blocks}`;
+}
+function buildPreamble(options) {
+  const summary = options.projectSummary.trim();
+  return `You are reviewing a pull request on the \`${options.repo}\` repository.
+${summary ? `
+${summary}
+` : ""}
+You run when the PR is opened, before any human reads it. Your job is to catch what a generic
+linter cannot see: this project's own rules, functional regressions, and data leaks.
+
+${renderDoctrine(options.doctrine)}
+
+# How hard to look
+
+Your job is coverage, not curation. A finding you swallowed because you were not sure enough
+is a bug that ships. Report what you find and let its label carry your confidence: a doubt is
+reported as a doubt, never dropped.
+
+- **Read every file you were given in full**, not only the changed lines. The diff says what
+  moved; the code around it says what that broke. A reviewer who only reads \xAB + \xBB lines finds
+  only typos.
+- **Do not soften a finding into silence.** When something looks wrong but you cannot prove it
+  from what you were given, say what you saw, what you suspect, and which file would settle it.
+- **Finding nothing is a claim, not a default.** If this pass turns up nothing, say what you
+  checked in order to say it. If you cannot name what you checked, you have not checked.
+
+# Citing code
+
+- Every finding starts with a \`path:line\` in backticks, path relative to the repository root.
+- A line number is read, never estimated. Only cite numbers visible in the numbered excerpts you
+  were given. When a file comes as diff only, cite the path with no line number.
+- **Never state what a file contains unless that file was included in your context**, not even
+  to support a comparison. If your point depends on a file you were not given, say so.
+
+# Two habits that ruin a review
+
+Both are confabulation: a plausible sentence you did not verify. One wrong detail makes the
+reader doubt the whole finding, and a true finding dies with its invented supporting evidence.
+
+1. **Padding a line list.** You read one occurrence, then list neighbours you assume are alike.
+
+   WRONG \u2014 \xAB le fichier dit encore \xAB page 2 \xBB (lignes 10, 28, 52, 384) \xBB
+   RIGHT \u2014 \xAB le fichier dit encore \xAB page 2 \xBB, par exemple ligne 10, et probablement ailleurs \xBB
+
+   Cite exactly one line number per finding: the one you actually read. Say the rest in words.
+
+2. **Inventing the contrast.** A rename in this PR does not tell you what any other file says
+   now. Do not complete the story.
+
+   WRONG \u2014 \xAB alors que template.md dit d\xE9sormais \xAB partie 2 \xBB \xBB
+   RIGHT \u2014 \xAB \xE0 confronter au vocabulaire retenu ailleurs, que je n'ai pas sous les yeux \xBB
+
+   Assert a file's contents only by quoting a string you can see in one of its excerpts.`;
+}
+function buildUserPrompt(meta, context) {
+  const fileList = meta.files.map((file) => {
+    const flag = context.skipped.includes(file.path) ? " (not reviewed)" : "";
+    return `- ${file.path} (+${file.additions} / -${file.deletions}, ${file.status})${flag}`;
+  }).join("\n");
+  const contents = context.files.length > 0 ? context.files.map(renderFile).join("\n\n") : "(no full content available, work from the diff alone)";
+  const omitted = context.omitted.length > 0 ? `
+
+No full content for these files, for lack of room. You only have their diff, so cite them without a line number:
+${context.omitted.map((path) => `- ${path}`).join("\n")}` : "";
+  return `# PR #${meta.number} \u2014 ${meta.title}
+
+Base branch: ${meta.baseRefName}
+
+## Author's description
+
+${meta.body.trim() || "(empty)"}
+
+## Changed files
+
+${fileList}${omitted}
+
+## Diff
+
+\`\`\`diff
+${context.diff}
+\`\`\`
+
+## Full content of the changed files, after the change
+
+Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from ${context.imported.length > 0 ? "this section and from the next one" : "this section"} was not given to you: do not describe its contents.
+
+${contents}${renderImported(context.imported)}`;
+}
+var renderFile = (file) => `### ${file.path}
+
+\`\`\`
+${file.numbered}
+\`\`\``;
+function renderImported(files) {
+  if (files.length === 0) return "";
+  return `
+
+## Context files, NOT modified by this PR
+
+These are here so you can settle a question instead of asking it: what a caller expects, what an
+enum actually contains, whether a helper counts characters or bytes. Same numbering, and you may
+cite them as evidence.
+
+**Do not review them.** Every finding must be about a changed file listed above. A defect that
+lives only in one of these files is out of scope: this PR did not introduce it, and its author
+did not ask. Use them to prove or to kill a doubt about the change itself.
+
+${files.map(renderFile).join("\n\n")}`;
+}
+
+// pr-review/src/passes.ts
+var PASS_HEADING = "## Trouvailles";
+var passOutput = (hasImports) => `# What to return
+
+Return \`${PASS_HEADING}\` followed by one bullet per finding, in French, nothing else. No verdict,
+no summary, no closing paragraph: another pass writes those.
+
+${PASS_HEADING}
+- [bloquant] \`chemin/fichier.ts:42\` : ce qui casse, et ce que \xE7a produit ici.
+- [corriger] \`chemin/fichier.tsx:17\` : \u2026
+- [suggestion] \`chemin/fichier.ts:88\` : \u2026
+- [doute] \`chemin/fichier.ts:120\` : ce que tu soup\xE7onnes sans pouvoir le prouver, et ce qu'il
+  faudrait regarder pour trancher.
+
+Labels, one per bullet:
+
+- **bloquant**: breaks production, loses or exposes data, leaks a secret or personal data, or
+  introduces a certain functional regression.
+- **corriger**: breaks a rule from the doctrine above, or a probable but undemonstrated bug.
+- **suggestion**: optional improvement, debt, test blind spot. A finding outside this PR's scope
+  goes here, labelled as such, and proposes opening an issue. It never blocks.
+- **doute**: what you cannot settle with the files you were given. Say what would settle it.${hasImports ? "\n  A doubt that the context files above DO settle is not a doubt: read them and conclude." : ""}
+
+No ceiling on this pass: report everything you found on your axis. Ranking happens later.
+
+Do not recite the rule, say what breaks HERE and what it produces. \xAB Cha\xEEne FR en dur \xBB is
+worthless; \xAB ce libell\xE9 de bouton est \xE9ditorial, il doit vivre dans le contenu sinon il \xE9chappe \xE0
+l'admin et \xE0 la traduction \xBB is worth something.
+
+Never use an em dash. The merge pass is told not to rewrite your wording, so anything you write
+here reaches the posted comment as is.
+
+Found nothing? Return \`${PASS_HEADING}\` and a single bullet \xAB - [rien] : \xBB followed by what you
+actually checked to be able to say it. Never an empty section.`;
+var EFFORTS = ["full", "balanced", "lean"];
+var isEffort = (value) => EFFORTS.includes(value);
+var LEVELS = ["low", "medium", "high", "max"];
+function stepDown(level, steps) {
+  if (steps <= 0) return level;
+  const index = LEVELS.indexOf(level.trim().toLowerCase());
+  if (index === -1) return level;
+  return LEVELS[Math.max(0, index - steps)];
+}
+var PROSE_ONLY = [".md", ".mdx", ".txt", ".rst", ".adoc"];
+function extensionOf(path) {
+  const dot = path.lastIndexOf(".");
+  const slash = path.lastIndexOf("/");
+  return dot > slash ? path.slice(dot).toLowerCase() : "";
+}
+var runsSomething = (files) => files.some((file) => !PROSE_ONLY.includes(extensionOf(file.path)));
+var PASSES = [
+  {
+    id: "regression",
+    label: "r\xE9gression fonctionnelle",
+    axis: "functional regressions",
+    // Sa matière première : son premier axe s'appelle « The caller's side ».
+    imports: { full: true, balanced: true, lean: true },
+    // L'axe le plus coûteux à creuser, et celui qui le mérite : tracer un
+    // appelant, un chemin d'erreur ou une course est une recherche, pas un
+    // parcours de liste. Il garde son raisonnement à tous les crans.
+    thinkingSteps: { full: 0, balanced: 0, lean: 0 },
+    skipWhen: ({ files }) => runsSomething(files) ? null : "aucun fichier ex\xE9cutable dans cette PR",
+    objective: `# Your one job in this pass: functional regressions
+
+You are not looking at conventions, style, or data access. Another pass covers those. You are
+looking for code that will misbehave at runtime. Walk these deliberately, on every changed file.
+None of them is visible in a diff read line by line, which is exactly why they survive until
+production.
+
+1. **The caller's side.** A changed signature, return shape, thrown error or nullability breaks
+   whoever calls it. The context files include what the changed files import: use them. When the
+   caller is genuinely absent from your context, report a doubt.
+2. **Error paths.** What happens when this throws, returns null, times out, or gets an empty
+   list? An error caught, logged and swallowed is a silent failure: the feature is dead and
+   nobody is told.
+3. **Edge inputs.** Empty, zero, one element, duplicates, very large. Boundaries of a loop, a
+   slice, a pagination. Off-by-one on both ends.
+4. **State and ordering.** Two runs racing, a retry replaying a side effect, a cache or a ledger
+   written before the thing it records actually succeeded, a missing await.
+5. **What the change forgot.** A rename applied in two places out of three, a new branch with no
+   test, a migration with no way back, a flag read but never set.`
+  },
+  {
+    id: "doctrine",
+    label: "doctrine du d\xE9p\xF4t",
+    axis: "the repository's own conventions",
+    // Elle juge la PR contre un document qu'elle a déjà sous les yeux, et son
+    // prompt lui interdit de relever quoi que ce soit dans un fichier non
+    // modifié : les appelants et les enums ne lui apprennent rien.
+    imports: { full: true, balanced: false, lean: false },
+    thinkingSteps: { full: 0, balanced: 0, lean: 2 },
+    // Son propre prompt lui dicte alors sa sortie mot pour mot (« say so in a
+    // single « - [rien] : » bullet and stop »). La lancer revient à payer un
+    // contexte entier et un raisonnement pour une réponse écrite d'avance,
+    // ce qui n'a de sens à aucun cran.
+    skipWhen: ({ hasDoctrine }) => hasDoctrine ? null : "ce d\xE9p\xF4t ne fournit aucun fichier de doctrine",
+    objective: `# Your one job in this pass: the repository's own rules
+
+Judge this PR against the doctrine quoted above, and against nothing else. Other passes cover
+runtime bugs and data access; a remark of yours that does not trace back to a written rule of
+this repository does not belong in this pass.
+
+- Go rule by rule through the doctrine, and check the changed files against each one that
+  applies. A rule nobody checks is a rule that decays.
+- **Quote the rule you are applying**, in a few words, so the author can tell a project rule from
+  a personal habit. If you cannot point to the rule, you are inventing it.
+- Silence is a claim here too: if the PR respects the doctrine, say which rules you actually
+  checked it against.
+- Ignore formatting and style that lint and Prettier already settle. A doctrine is what a linter
+  cannot enforce.
+
+If this repository ships no doctrine, say so in a single \xAB - [rien] : \xBB bullet and stop. Do not
+substitute your own conventions for the ones it did not write.`
+  },
+  {
+    id: "data",
+    label: "donn\xE9es et acc\xE8s",
+    axis: "data access",
+    // Son cinquième axe compare la forme exposée avant et après, et sa règle de
+    // preuve renvoie aux extraits fournis : lui couper le contexte
+    // transformerait des trouvailles en « doute », soit exactement le régime que
+    // le contexte importé a été introduit pour supprimer.
+    imports: { full: true, balanced: true, lean: false },
+    thinkingSteps: { full: 0, balanced: 0, lean: 1 },
+    // Aucune règle, à aucun cran. Un README fuit une clé aussi bien qu'un .ts,
+    // une doc d'API publie un endpoint interne, une capture collée porte une
+    // adresse. Le coût d'une fuite dépasse de plusieurs ordres celui d'une
+    // passe : ce trou ne doit pas être « optimisé » dans six mois.
+    objective: `# Your one job in this pass: data, secrets, and access boundaries
+
+Not runtime bugs, not conventions. Who can read what, and what escapes to where.
+
+1. **Role boundaries.** A query that returns rows the caller has no right to see. A filter on
+   tenant, owner or role that the change dropped, widened, or moved after the fetch instead of
+   into it. An admin path reachable without the check.
+2. **Secrets.** A key, token or password reaching a log, an error message, a client bundle, a URL
+   or a third party. A secret read from the wrong place, or committed.
+3. **Personal data.** An email, a phone number, an address, an IP in a log line, an analytics
+   payload, a redirect, or a message to an external service. Ask what the recipient can see.
+4. **Trust in inputs.** Data from a request used unvalidated in a query, a path, a redirect, a
+   command, or rendered as HTML.
+5. **What the endpoint exposes.** A new route, field or serializer that widens what leaves the
+   server. Compare with what the previous shape returned.
+
+Prove it from what you were given: a boundary crossing you cannot see in the excerpts is a
+\xAB doute \xBB, with the file that would settle it named.`
+  }
+];
+function selectPasses(input, options) {
+  if (options.forced.length > 0) {
+    const wanted = new Set(options.forced.map((id) => id.trim().toLowerCase()));
+    const run3 = PASSES.filter((pass) => wanted.has(pass.id));
+    if (run3.length > 0) {
+      return { run: [...run3], skipped: [] };
+    }
+    options.warn?.(
+      `input \xAB passes \xBB : aucun identifiant connu dans \xAB ${options.forced.join(", ")} \xBB.
+  Connus : ${PASSES.map((pass) => pass.id).join(", ")}. On lance les trois.`
+    );
+    return { run: [...PASSES], skipped: [] };
+  }
+  const run2 = [];
+  const skipped = [];
+  for (const pass of PASSES) {
+    const applies = options.auto || pass.id === "doctrine";
+    const reason = applies ? pass.skipWhen?.(input) ?? null : null;
+    if (reason === null) run2.push(pass);
+    else skipped.push({ label: pass.label, reason });
+  }
+  if (run2.length === 0) return { run: [...PASSES], skipped: [] };
+  return { run: run2, skipped };
+}
+function buildPassSystemPrompt(pass, options, hasImports) {
+  return `${buildPreamble(options)}
+
+${pass.objective}
+
+${passOutput(hasImports)}`;
+}
+var OUTPUT_TEMPLATE = `## Verdict
+Une seule phrase : ce que tu retiens de cette PR.
+
+## Bloquant
+- \`chemin/fichier.ts:42\` : ce qui casse, et pourquoi ici.
+
+## \xC0 corriger
+- \`chemin/fichier.tsx:17\` : \u2026
+
+## Suggestions
+- \`chemin/fichier.ts:88\` : \u2026
+
+## \xC0 v\xE9rifier
+- \`chemin/fichier.ts:120\` : ce que tu soup\xE7onnes sans pouvoir le prouver ici, et ce qu'il
+  faudrait regarder pour trancher.`;
+function enumerate(items) {
+  if (items.length < 2) return items.join("");
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+var WORDS = ["no", "a single", "two", "three", "four", "five"];
+function opening(repo, passes) {
+  const axes = enumerate(passes.map((pass) => pass.axis));
+  if (passes.length === 1) {
+    return `One reviewer has just read a pull request on \`${repo}\`, on a single axis: ${axes}.`;
+  }
+  const word = WORDS[passes.length] ?? String(passes.length);
+  return `${word[0].toUpperCase()}${word.slice(1)} reviewers have just read the same pull request on \`${repo}\`, each on one axis: ${axes}.`;
+}
+function buildMergeSystemPrompt(options) {
+  return `${opening(options.repo, options.passes)} You are assembling
+their findings into the single comment that gets posted on the PR.
+
+**You do not have the code.** You only have what they wrote. So:
+
+- Never add a finding. If it is not in their lists, it does not exist.
+- Never invent a line number, a path, or a detail to make a bullet sound firmer. Keep the
+  \`path:line\` they wrote, exactly as they wrote it.
+- When a bullet is too vague to be useful, keep it as is or drop it. Do not complete it.
+
+# What to do with their findings
+
+1. **Deduplicate.** Two reviewers describe the same defect in different words: keep one bullet,
+   the one that says best what breaks and what it produces. Two defects in the same file are not
+   duplicates.
+2. **Arbitrate the label.** They each judged on their own axis and could not see the others. A
+   \xAB corriger \xBB that turns out to lose data is \xAB Bloquant \xBB. A \xAB bloquant \xBB resting on an
+   unverified assumption belongs under \xAB \xC0 v\xE9rifier \xBB.
+3. **Rank, then cut.** ${options.maxFindings} bullets maximum across Bloquant, \xC0 corriger and
+   Suggestions, plus at most five under \xC0 v\xE9rifier. Past that nobody reads. Keep the costly ones.
+   **When you cut, say so in the Verdict**: this ceiling ranks findings, it never justifies
+   dropping one in silence.
+4. **Drop the \xAB rien \xBB bullets**, but remember what they checked: that is what makes a
+   \xAB Rien \xE0 signaler \xBB credible.
+
+# Expected output
+
+Return exactly these five sections, in this order, as markdown, and nothing before them.
+
+${OUTPUT_TEMPLATE}
+
+- A section with nothing in it says what was checked, on the same line:
+  \xAB Rien \xE0 signaler (chemins d'erreur et valeurs de retour relus) \xBB. Take that from what the
+  reviewers said they checked. If they said nothing, write \xAB Rien \xE0 signaler \xBB.
+- No summary of the PR, no compliments, no closing paragraph. The author wrote it.
+- Write in French. Never use an em dash.`;
+}
+function buildMergeUserPrompt(meta, results) {
+  const blocks = results.map((result) => `## Reviewer: ${result.pass.label}
+
+${result.findings.trim()}`).join("\n\n");
+  const fileList = meta.files.map((file) => `- ${file.path} (+${file.additions} / -${file.deletions}, ${file.status})`).join("\n");
+  return `# PR #${meta.number} \u2014 ${meta.title}
+
+## Author's description
+
+${meta.body.trim() || "(empty)"}
+
+## Files changed by this PR
+
+Every finding you keep must be about one of these. A path that is not in this list came from a
+context file, which this PR does not touch: drop that finding.
+
+${fileList}
+
+# What the reviewers found
+
+${blocks}`;
+}
+
 // pr-review/src/inputs.ts
 var ALWAYS_SKIPPED = [
   "pnpm-lock.yaml",
@@ -443,7 +837,17 @@ var DEFAULTS = {
   temperature: 1,
   seed: 1,
   /** Nom du bras quand on n'en donne pas : celui du réglage livré. */
-  variant: "default"
+  variant: "default",
+  /**
+   * Le cran par défaut.
+   *
+   * « balanced » et non « full » : ce que `full` garde en plus, ce sont des
+   * envois dont la mesure n'a pas montré qu'ils rapportaient une trouvaille.
+   * Un dépôt qui veut la lecture la plus large l'écrit, et le sait.
+   */
+  effort: "balanced",
+  /** Plafond des imports au cran « lean », où le contexte se resserre. */
+  leanImportsBudgetChars: 12e4
 };
 var UsageError = class extends Error {
 };
@@ -459,6 +863,16 @@ function readNumber(env, name, fallback, warn, minimum = 1) {
     return fallback;
   }
   return parsed;
+}
+function readEffort(env, warn) {
+  const raw = readInput(env, "effort").toLowerCase();
+  if (raw === "") return DEFAULTS.effort;
+  if (isEffort(raw)) return raw;
+  warn(
+    `input \xAB effort \xBB inconnu (\xAB ${raw} \xBB) : on garde ${DEFAULTS.effort}.
+  Valeurs accept\xE9es : ${EFFORTS.join(", ")}.`
+  );
+  return DEFAULTS.effort;
 }
 function readBoolean(env, name) {
   return /^(true|1|yes)$/i.test(readInput(env, name));
@@ -530,6 +944,7 @@ function resolveConfig({ argv, env, warn = () => {
     );
   }
   const doctrineInput = parseList(readInput(env, "doctrine"));
+  const effort = readEffort(env, warn);
   return {
     pr,
     dryRun,
@@ -543,10 +958,14 @@ function resolveConfig({ argv, env, warn = () => {
     maxFindings: readNumber(env, "max-findings", DEFAULTS.maxFindings, warn),
     budgetChars: readNumber(env, "budget-chars", DEFAULTS.budgetChars, warn),
     perFileChars: readNumber(env, "per-file-chars", DEFAULTS.perFileChars, warn),
+    effort,
+    passes: parseList(readInput(env, "passes")),
+    // Le cran pose le défaut, l'input explicite l'écrase : régler « effort » ne
+    // doit pas rendre un budget écrit à la main silencieusement inopérant.
     importsBudgetChars: readNumber(
       env,
       "imports-budget-chars",
-      DEFAULTS.importsBudgetChars,
+      effort === "lean" ? DEFAULTS.leanImportsBudgetChars : DEFAULTS.importsBudgetChars,
       warn,
       0
     ),
@@ -750,332 +1169,6 @@ function detail(body) {
   return trimmed ? ` : ${trimmed.slice(0, 300)}` : "";
 }
 
-// pr-review/src/prompt.ts
-function renderDoctrine(files) {
-  if (files.length === 0) {
-    return `This repository ships no review doctrine. Judge on general engineering grounds only, and
-never present a remark as if it came from a project rule.`;
-  }
-  const blocks = files.map((file) => `<doctrine path="${file.path}">
-${file.content}
-</doctrine>`).join("\n\n");
-  return `Here are the repository's own conventions, as written by its maintainer. They are
-authoritative, and they outrank your general habits.
-
-${blocks}`;
-}
-function buildPreamble(options) {
-  const summary = options.projectSummary.trim();
-  return `You are reviewing a pull request on the \`${options.repo}\` repository.
-${summary ? `
-${summary}
-` : ""}
-You run when the PR is opened, before any human reads it. Your job is to catch what a generic
-linter cannot see: this project's own rules, functional regressions, and data leaks.
-
-${renderDoctrine(options.doctrine)}
-
-# How hard to look
-
-Your job is coverage, not curation. A finding you swallowed because you were not sure enough
-is a bug that ships. Report what you find and let its label carry your confidence: a doubt is
-reported as a doubt, never dropped.
-
-- **Read every file you were given in full**, not only the changed lines. The diff says what
-  moved; the code around it says what that broke. A reviewer who only reads \xAB + \xBB lines finds
-  only typos.
-- **Do not soften a finding into silence.** When something looks wrong but you cannot prove it
-  from what you were given, say what you saw, what you suspect, and which file would settle it.
-- **Finding nothing is a claim, not a default.** If this pass turns up nothing, say what you
-  checked in order to say it. If you cannot name what you checked, you have not checked.
-
-# Citing code
-
-- Every finding starts with a \`path:line\` in backticks, path relative to the repository root.
-- A line number is read, never estimated. Only cite numbers visible in the numbered excerpts you
-  were given. When a file comes as diff only, cite the path with no line number.
-- **Never state what a file contains unless that file was included in your context**, not even
-  to support a comparison. If your point depends on a file you were not given, say so.
-
-# Two habits that ruin a review
-
-Both are confabulation: a plausible sentence you did not verify. One wrong detail makes the
-reader doubt the whole finding, and a true finding dies with its invented supporting evidence.
-
-1. **Padding a line list.** You read one occurrence, then list neighbours you assume are alike.
-
-   WRONG \u2014 \xAB le fichier dit encore \xAB page 2 \xBB (lignes 10, 28, 52, 384) \xBB
-   RIGHT \u2014 \xAB le fichier dit encore \xAB page 2 \xBB, par exemple ligne 10, et probablement ailleurs \xBB
-
-   Cite exactly one line number per finding: the one you actually read. Say the rest in words.
-
-2. **Inventing the contrast.** A rename in this PR does not tell you what any other file says
-   now. Do not complete the story.
-
-   WRONG \u2014 \xAB alors que template.md dit d\xE9sormais \xAB partie 2 \xBB \xBB
-   RIGHT \u2014 \xAB \xE0 confronter au vocabulaire retenu ailleurs, que je n'ai pas sous les yeux \xBB
-
-   Assert a file's contents only by quoting a string you can see in one of its excerpts.`;
-}
-function buildUserPrompt(meta, context) {
-  const fileList = meta.files.map((file) => {
-    const flag = context.skipped.includes(file.path) ? " (not reviewed)" : "";
-    return `- ${file.path} (+${file.additions} / -${file.deletions}, ${file.status})${flag}`;
-  }).join("\n");
-  const contents = context.files.length > 0 ? context.files.map(renderFile).join("\n\n") : "(no full content available, work from the diff alone)";
-  const omitted = context.omitted.length > 0 ? `
-
-No full content for these files, for lack of room. You only have their diff, so cite them without a line number:
-${context.omitted.map((path) => `- ${path}`).join("\n")}` : "";
-  return `# PR #${meta.number} \u2014 ${meta.title}
-
-Base branch: ${meta.baseRefName}
-
-## Author's description
-
-${meta.body.trim() || "(empty)"}
-
-## Changed files
-
-${fileList}${omitted}
-
-## Diff
-
-\`\`\`diff
-${context.diff}
-\`\`\`
-
-## Full content of the changed files, after the change
-
-Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from this
-section and from the next one was not given to you: do not describe its contents.
-
-${contents}${renderImported(context.imported)}`;
-}
-var renderFile = (file) => `### ${file.path}
-
-\`\`\`
-${file.numbered}
-\`\`\``;
-function renderImported(files) {
-  if (files.length === 0) return "";
-  return `
-
-## Context files, NOT modified by this PR
-
-These are here so you can settle a question instead of asking it: what a caller expects, what an
-enum actually contains, whether a helper counts characters or bytes. Same numbering, and you may
-cite them as evidence.
-
-**Do not review them.** Every finding must be about a changed file listed above. A defect that
-lives only in one of these files is out of scope: this PR did not introduce it, and its author
-did not ask. Use them to prove or to kill a doubt about the change itself.
-
-${files.map(renderFile).join("\n\n")}`;
-}
-
-// pr-review/src/passes.ts
-var PASS_HEADING = "## Trouvailles";
-var PASS_OUTPUT = `# What to return
-
-Return \`${PASS_HEADING}\` followed by one bullet per finding, in French, nothing else. No verdict,
-no summary, no closing paragraph: another pass writes those.
-
-${PASS_HEADING}
-- [bloquant] \`chemin/fichier.ts:42\` : ce qui casse, et ce que \xE7a produit ici.
-- [corriger] \`chemin/fichier.tsx:17\` : \u2026
-- [suggestion] \`chemin/fichier.ts:88\` : \u2026
-- [doute] \`chemin/fichier.ts:120\` : ce que tu soup\xE7onnes sans pouvoir le prouver, et ce qu'il
-  faudrait regarder pour trancher.
-
-Labels, one per bullet:
-
-- **bloquant**: breaks production, loses or exposes data, leaks a secret or personal data, or
-  introduces a certain functional regression.
-- **corriger**: breaks a rule from the doctrine above, or a probable but undemonstrated bug.
-- **suggestion**: optional improvement, debt, test blind spot. A finding outside this PR's scope
-  goes here, labelled as such, and proposes opening an issue. It never blocks.
-- **doute**: what you cannot settle with the files you were given. Say what would settle it.
-  A doubt that the context files above DO settle is not a doubt: read them and conclude.
-
-No ceiling on this pass: report everything you found on your axis. Ranking happens later.
-
-Do not recite the rule, say what breaks HERE and what it produces. \xAB Cha\xEEne FR en dur \xBB is
-worthless; \xAB ce libell\xE9 de bouton est \xE9ditorial, il doit vivre dans le contenu sinon il \xE9chappe \xE0
-l'admin et \xE0 la traduction \xBB is worth something.
-
-Never use an em dash. The merge pass is told not to rewrite your wording, so anything you write
-here reaches the posted comment as is.
-
-Found nothing? Return \`${PASS_HEADING}\` and a single bullet \xAB - [rien] : \xBB followed by what you
-actually checked to be able to say it. Never an empty section.`;
-var PASSES = [
-  {
-    id: "regression",
-    label: "r\xE9gression fonctionnelle",
-    axis: "functional regressions",
-    objective: `# Your one job in this pass: functional regressions
-
-You are not looking at conventions, style, or data access. Another pass covers those. You are
-looking for code that will misbehave at runtime. Walk these deliberately, on every changed file.
-None of them is visible in a diff read line by line, which is exactly why they survive until
-production.
-
-1. **The caller's side.** A changed signature, return shape, thrown error or nullability breaks
-   whoever calls it. The context files include what the changed files import: use them. When the
-   caller is genuinely absent from your context, report a doubt.
-2. **Error paths.** What happens when this throws, returns null, times out, or gets an empty
-   list? An error caught, logged and swallowed is a silent failure: the feature is dead and
-   nobody is told.
-3. **Edge inputs.** Empty, zero, one element, duplicates, very large. Boundaries of a loop, a
-   slice, a pagination. Off-by-one on both ends.
-4. **State and ordering.** Two runs racing, a retry replaying a side effect, a cache or a ledger
-   written before the thing it records actually succeeded, a missing await.
-5. **What the change forgot.** A rename applied in two places out of three, a new branch with no
-   test, a migration with no way back, a flag read but never set.`
-  },
-  {
-    id: "doctrine",
-    label: "doctrine du d\xE9p\xF4t",
-    axis: "the repository's own conventions",
-    objective: `# Your one job in this pass: the repository's own rules
-
-Judge this PR against the doctrine quoted above, and against nothing else. Other passes cover
-runtime bugs and data access; a remark of yours that does not trace back to a written rule of
-this repository does not belong in this pass.
-
-- Go rule by rule through the doctrine, and check the changed files against each one that
-  applies. A rule nobody checks is a rule that decays.
-- **Quote the rule you are applying**, in a few words, so the author can tell a project rule from
-  a personal habit. If you cannot point to the rule, you are inventing it.
-- Silence is a claim here too: if the PR respects the doctrine, say which rules you actually
-  checked it against.
-- Ignore formatting and style that lint and Prettier already settle. A doctrine is what a linter
-  cannot enforce.
-
-If this repository ships no doctrine, say so in a single \xAB - [rien] : \xBB bullet and stop. Do not
-substitute your own conventions for the ones it did not write.`
-  },
-  {
-    id: "data",
-    label: "donn\xE9es et acc\xE8s",
-    axis: "data access",
-    objective: `# Your one job in this pass: data, secrets, and access boundaries
-
-Not runtime bugs, not conventions. Who can read what, and what escapes to where.
-
-1. **Role boundaries.** A query that returns rows the caller has no right to see. A filter on
-   tenant, owner or role that the change dropped, widened, or moved after the fetch instead of
-   into it. An admin path reachable without the check.
-2. **Secrets.** A key, token or password reaching a log, an error message, a client bundle, a URL
-   or a third party. A secret read from the wrong place, or committed.
-3. **Personal data.** An email, a phone number, an address, an IP in a log line, an analytics
-   payload, a redirect, or a message to an external service. Ask what the recipient can see.
-4. **Trust in inputs.** Data from a request used unvalidated in a query, a path, a redirect, a
-   command, or rendered as HTML.
-5. **What the endpoint exposes.** A new route, field or serializer that widens what leaves the
-   server. Compare with what the previous shape returned.
-
-Prove it from what you were given: a boundary crossing you cannot see in the excerpts is a
-\xAB doute \xBB, with the file that would settle it named.`
-  }
-];
-function buildPassSystemPrompt(pass, options) {
-  return `${buildPreamble(options)}
-
-${pass.objective}
-
-${PASS_OUTPUT}`;
-}
-var OUTPUT_TEMPLATE = `## Verdict
-Une seule phrase : ce que tu retiens de cette PR.
-
-## Bloquant
-- \`chemin/fichier.ts:42\` : ce qui casse, et pourquoi ici.
-
-## \xC0 corriger
-- \`chemin/fichier.tsx:17\` : \u2026
-
-## Suggestions
-- \`chemin/fichier.ts:88\` : \u2026
-
-## \xC0 v\xE9rifier
-- \`chemin/fichier.ts:120\` : ce que tu soup\xE7onnes sans pouvoir le prouver ici, et ce qu'il
-  faudrait regarder pour trancher.`;
-function enumerate(items) {
-  if (items.length < 2) return items.join("");
-  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
-}
-var WORDS = ["no", "a single", "two", "three", "four", "five"];
-function opening(repo, passes) {
-  const axes = enumerate(passes.map((pass) => pass.axis));
-  if (passes.length === 1) {
-    return `One reviewer has just read a pull request on \`${repo}\`, on a single axis: ${axes}.`;
-  }
-  const word = WORDS[passes.length] ?? String(passes.length);
-  return `${word[0].toUpperCase()}${word.slice(1)} reviewers have just read the same pull request on \`${repo}\`, each on one axis: ${axes}.`;
-}
-function buildMergeSystemPrompt(options) {
-  return `${opening(options.repo, options.passes)} You are assembling
-their findings into the single comment that gets posted on the PR.
-
-**You do not have the code.** You only have what they wrote. So:
-
-- Never add a finding. If it is not in their lists, it does not exist.
-- Never invent a line number, a path, or a detail to make a bullet sound firmer. Keep the
-  \`path:line\` they wrote, exactly as they wrote it.
-- When a bullet is too vague to be useful, keep it as is or drop it. Do not complete it.
-
-# What to do with their findings
-
-1. **Deduplicate.** Two reviewers describe the same defect in different words: keep one bullet,
-   the one that says best what breaks and what it produces. Two defects in the same file are not
-   duplicates.
-2. **Arbitrate the label.** They each judged on their own axis and could not see the others. A
-   \xAB corriger \xBB that turns out to lose data is \xAB Bloquant \xBB. A \xAB bloquant \xBB resting on an
-   unverified assumption belongs under \xAB \xC0 v\xE9rifier \xBB.
-3. **Rank, then cut.** ${options.maxFindings} bullets maximum across Bloquant, \xC0 corriger and
-   Suggestions, plus at most five under \xC0 v\xE9rifier. Past that nobody reads. Keep the costly ones.
-   **When you cut, say so in the Verdict**: this ceiling ranks findings, it never justifies
-   dropping one in silence.
-4. **Drop the \xAB rien \xBB bullets**, but remember what they checked: that is what makes a
-   \xAB Rien \xE0 signaler \xBB credible.
-
-# Expected output
-
-Return exactly these five sections, in this order, as markdown, and nothing before them.
-
-${OUTPUT_TEMPLATE}
-
-- A section with nothing in it says what was checked, on the same line:
-  \xAB Rien \xE0 signaler (chemins d'erreur et valeurs de retour relus) \xBB. Take that from what the
-  reviewers said they checked. If they said nothing, write \xAB Rien \xE0 signaler \xBB.
-- No summary of the PR, no compliments, no closing paragraph. The author wrote it.
-- Write in French. Never use an em dash.`;
-}
-function buildMergeUserPrompt(meta, results) {
-  const blocks = results.map((result) => `## Reviewer: ${result.pass.label}
-
-${result.findings.trim()}`).join("\n\n");
-  const fileList = meta.files.map((file) => `- ${file.path} (+${file.additions} / -${file.deletions}, ${file.status})`).join("\n");
-  return `# PR #${meta.number} \u2014 ${meta.title}
-
-## Author's description
-
-${meta.body.trim() || "(empty)"}
-
-## Files changed by this PR
-
-Every finding you keep must be about one of these. A path that is not in this list came from a
-context file, which this PR does not touch: drop that finding.
-
-${fileList}
-
-# What the reviewers found
-
-${blocks}`;
-}
-
 // pr-review/src/render.ts
 var MARKER = "<!-- aristarque -->";
 var HEADING = "## Aristarque \u2014 review automatique";
@@ -1132,6 +1225,9 @@ function renderFooter(footer) {
   }
   if (footer.omitted.length > 0) {
     bits.push(`diff seul (sans contexte complet) pour ${footer.omitted.join(", ")}`);
+  }
+  for (const { label, reason } of footer.skippedPasses) {
+    bits.push(`passe \xAB ${label} \xBB non lanc\xE9e (${reason})`);
   }
   if (footer.failedPasses.length > 0) {
     const quoted = footer.failedPasses.map((pass) => `\xAB ${pass} \xBB`);
@@ -1351,13 +1447,19 @@ async function runPasses(config, run2, plan) {
   );
   return results.filter((result) => result !== null);
 }
-function planPasses(config, promptOptions, user) {
-  return PASSES.map((pass) => ({
-    pass,
-    system: buildPassSystemPrompt(pass, promptOptions),
-    user,
-    think: config.thinking
-  }));
+function planPasses(config, promptOptions, meta, context, passes) {
+  return passes.map((pass) => {
+    const wantsImports = pass.imports[config.effort];
+    const seen = contextFor(context, wantsImports);
+    return {
+      pass,
+      // La consigne sur les doutes ne s'écrit que s'il y a bien une section de
+      // fichiers de contexte à lire : sinon elle désigne du vide.
+      system: buildPassSystemPrompt(pass, promptOptions, seen.imported.length > 0),
+      user: buildUserPrompt(meta, seen),
+      think: stepDown(config.thinking, pass.thinkingSteps[config.effort])
+    };
+  });
 }
 function breakdown(plan, context) {
   const first = plan[0];
@@ -1410,10 +1512,11 @@ async function review(config) {
     fetchPrDiff(config.pr)
   ]);
   await warnOnDetachedContext(meta.headSha);
+  const isSkipped = compileMatcher(config.skip);
   const context = assembleContext({
     rawDiff,
     prFiles: meta.files,
-    isSkipped: compileMatcher(config.skip),
+    isSkipped,
     budget: {
       totalChars: config.budgetChars,
       perFileChars: config.perFileChars,
@@ -1445,11 +1548,22 @@ async function review(config) {
     projectSummary: config.projectSummary,
     doctrine: readDoctrine(root, config.doctrine)
   };
-  const user = buildUserPrompt(meta, context);
-  const plan = planPasses(config, promptOptions, user);
-  console.log(
-    `Contexte : ${context.files.length} fichier(s) touch\xE9s, ${context.imported.length} import\xE9(s), ${plan.length} passes + fusion (${config.model}).`
+  const doctrine = promptOptions.doctrine;
+  const selection = selectPasses(
+    { files: meta.files.filter((file) => !isSkipped(file.path)), hasDoctrine: doctrine.length > 0 },
+    {
+      auto: config.effort !== "full",
+      forced: config.passes,
+      warn: (message) => console.warn(`\u26A0 ${message}`)
+    }
   );
+  const plan = planPasses(config, promptOptions, meta, context, selection.run);
+  console.log(
+    `Contexte : ${context.files.length} fichier(s) touch\xE9s, ${context.imported.length} import\xE9(s), ${plan.length} passe(s) + fusion (${config.model}, effort ${config.effort}).`
+  );
+  for (const { label, reason } of selection.skipped) {
+    console.log(`\xB7 passe \xAB ${label} \xBB non lanc\xE9e : ${reason}.`);
+  }
   if (config.countOnly) {
     countOnly(config, plan, context);
     return;
@@ -1490,9 +1604,10 @@ async function review(config) {
       skipped: context.skipped,
       omitted: context.omitted,
       imported: context.imported.length,
-      failedPasses: PASSES.filter((pass) => !outcomes.some((outcome) => outcome.pass === pass)).map(
-        (pass) => pass.label
-      )
+      // Les passes lancées qui n'ont pas abouti : un incident. Distinct de
+      // celles qu'on n'a pas lancées, qui est une décision.
+      failedPasses: selection.run.filter((pass) => !outcomes.some((outcome) => outcome.pass === pass)).map((pass) => pass.label),
+      skippedPasses: selection.skipped
     }
   };
   const comment = merged === null ? renderPartialComment({

@@ -6,6 +6,7 @@ import {
   renderComment,
   renderFailureComment,
   renderPartialComment,
+  type Footer,
 } from '../src/render';
 
 const OPTIONS = {
@@ -92,6 +93,7 @@ const FOOTER = {
   omitted: [],
   imported: 0,
   failedPasses: [],
+  skippedPasses: [],
 };
 
 describe('renderComment', () => {
@@ -214,5 +216,24 @@ describe('linkifyPaths · blocs de code mal clos', () => {
   it('respecte un bloc dont la fermeture porte une espace de fin', () => {
     const markdown = '```ts\n// `src/app/page.tsx:1`\n``` ';
     expect(linkifyPaths(markdown, OPTIONS)).toBe(markdown);
+  });
+});
+
+
+describe('le pied de page distingue la décision de l’incident', () => {
+  const footer = (over: Partial<Footer>) =>
+    renderComment({ ...OPTIONS, review: '## Verdict\nok', footer: { ...FOOTER, ...over } });
+
+  it('dit sans avertissement qu’une passe n’a pas été lancée, et pourquoi', () => {
+    const comment = footer({
+      skippedPasses: [{ label: 'régression fonctionnelle', reason: 'aucun fichier exécutable dans cette PR' }],
+    });
+    expect(comment).toContain('passe « régression fonctionnelle » non lancée (aucun fichier exécutable');
+    expect(comment).not.toContain('⚠ passe');
+  });
+
+  /** Une passe qui échoue est un incident : elle garde son avertissement. */
+  it('garde l’avertissement pour une passe lancée qui n’a pas abouti', () => {
+    expect(footer({ failedPasses: ['données et accès'] })).toContain('⚠ passe');
   });
 });

@@ -21,7 +21,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { assembleContext, type AssembledContext } from './context';
+import { assembleContext, contextFor, type AssembledContext } from './context';
 import { run } from './exec';
 import { currentHeadSha, fetchPrDiff, fetchPrMeta, postComment, resolveRepo, type PrMeta } from './gh';
 import { compileMatcher } from './globs';
@@ -32,8 +32,9 @@ import {
   buildMergeSystemPrompt,
   buildMergeUserPrompt,
   buildPassSystemPrompt,
-  PASSES,
   PASS_HEADING,
+  selectPasses,
+  stepDown,
   type Pass,
 } from './passes';
 import { extractReview, renderComment, renderFailureComment, renderPartialComment } from './render';
@@ -253,13 +254,32 @@ interface PassPrompt {
   think: string;
 }
 
-function planPasses(config: Config, promptOptions: PromptOptions, user: string): PassPrompt[] {
-  return PASSES.map((pass) => ({
-    pass,
-    system: buildPassSystemPrompt(pass, promptOptions),
-    user,
-    think: config.thinking,
-  }));
+/**
+ * Ce qui partira, passe par passe.
+ *
+ * Un prompt par passe et non un seul partagé : le contexte que chacune reçoit
+ * dépend désormais d'elle et du cran, et la construction doit rester le seul
+ * chemin vers l'envoi, pour que `--count-only` mesure ce qui partirait vraiment.
+ */
+function planPasses(
+  config: Config,
+  promptOptions: PromptOptions,
+  meta: PrMeta,
+  context: AssembledContext,
+  passes: readonly Pass[],
+): PassPrompt[] {
+  return passes.map((pass) => {
+    const wantsImports = pass.imports[config.effort];
+    const seen = contextFor(context, wantsImports);
+    return {
+      pass,
+      // La consigne sur les doutes ne s'écrit que s'il y a bien une section de
+      // fichiers de contexte à lire : sinon elle désigne du vide.
+      system: buildPassSystemPrompt(pass, promptOptions, seen.imported.length > 0),
+      user: buildUserPrompt(meta, seen),
+      think: stepDown(config.thinking, pass.thinkingSteps[config.effort]),
+    };
+  });
 }
 
 /**
@@ -337,10 +357,11 @@ async function review(config: Config): Promise<void> {
   ]);
   await warnOnDetachedContext(meta.headSha);
 
+  const isSkipped = compileMatcher(config.skip);
   const context = assembleContext({
     rawDiff,
     prFiles: meta.files,
-    isSkipped: compileMatcher(config.skip),
+    isSkipped,
     budget: {
       totalChars: config.budgetChars,
       perFileChars: config.perFileChars,
@@ -374,12 +395,25 @@ async function review(config: Config): Promise<void> {
     projectSummary: config.projectSummary,
     doctrine: readDoctrine(root, config.doctrine),
   };
-  const user = buildUserPrompt(meta, context);
-  const plan = planPasses(config, promptOptions, user);
+
+  const doctrine = promptOptions.doctrine;
+  const selection = selectPasses(
+    { files: meta.files.filter((file) => !isSkipped(file.path)), hasDoctrine: doctrine.length > 0 },
+    {
+      auto: config.effort !== 'full',
+      forced: config.passes,
+      warn: (message) => console.warn(`⚠ ${message}`),
+    },
+  );
+  const plan = planPasses(config, promptOptions, meta, context, selection.run);
+
   console.log(
     `Contexte : ${context.files.length} fichier(s) touchés, ${context.imported.length} importé(s), ` +
-      `${plan.length} passes + fusion (${config.model}).`,
+      `${plan.length} passe(s) + fusion (${config.model}, effort ${config.effort}).`,
   );
+  for (const { label, reason } of selection.skipped) {
+    console.log(`· passe « ${label} » non lancée : ${reason}.`);
+  }
 
   if (config.countOnly) {
     countOnly(config, plan, context);
@@ -425,9 +459,12 @@ async function review(config: Config): Promise<void> {
       skipped: context.skipped,
       omitted: context.omitted,
       imported: context.imported.length,
-      failedPasses: PASSES.filter((pass) => !outcomes.some((outcome) => outcome.pass === pass)).map(
-        (pass) => pass.label,
-      ),
+      // Les passes lancées qui n'ont pas abouti : un incident. Distinct de
+      // celles qu'on n'a pas lancées, qui est une décision.
+      failedPasses: selection.run
+        .filter((pass) => !outcomes.some((outcome) => outcome.pass === pass))
+        .map((pass) => pass.label),
+      skippedPasses: selection.skipped,
     },
   };
 
