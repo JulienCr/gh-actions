@@ -13,6 +13,7 @@
  */
 
 import { parseList } from './globs';
+import { EFFORTS, isEffort, type Effort } from './passes';
 
 /**
  * Fichiers jamais relus, quels que soient les inputs.
@@ -111,6 +112,26 @@ export const DEFAULTS = {
    */
   temperature: 1,
   seed: 1,
+  /** Nom du bras quand on n'en donne pas : celui du réglage livré. */
+  variant: 'default',
+  /**
+   * Le cran par défaut.
+   *
+   * « balanced » et non « full » : ce que `full` garde en plus, ce sont des
+   * envois dont la mesure n'a pas montré qu'ils rapportaient une trouvaille.
+   * Un dépôt qui veut la lecture la plus large l'écrit, et le sait.
+   */
+  effort: 'balanced' as Effort,
+  /** Plafond des imports au cran « lean », où le contexte se resserre. */
+  leanImportsBudgetChars: 120_000,
+  /**
+   * Taille à partir de laquelle un fichier part par extraits, selon le cran.
+   *
+   * `0` au cran `full` : aucun fenêtrage. Le seuil reste haut ailleurs, parce
+   * que fenêtrer un petit fichier économise quelques lignes et coûte une lecture
+   * morcelée, plus le risque qu'une conclusion soit tirée d'un trou.
+   */
+  windowMinLines: { full: 0, balanced: 250, lean: 120 } as Record<Effort, number>,
 } as const;
 
 export interface Config {
@@ -129,6 +150,12 @@ export interface Config {
   perFileChars: number;
   /** Plafond des fichiers importés joints en contexte. `0` : aucun. */
   importsBudgetChars: number;
+  /** L'ampleur des coupes. Voir `Effort` dans `passes.ts`. */
+  effort: Effort;
+  /** Passes imposées par l'input `passes`. Vide : la règle décide. */
+  passes: string[];
+  /** Taille au-delà de laquelle un fichier part par extraits. `0` : jamais. */
+  windowMinLines: number;
   timeoutMs: number;
   /** Chemins de doctrine, dans l'ordre où ils seront injectés dans le prompt. */
   doctrine: string[];
@@ -138,6 +165,10 @@ export interface Config {
   projectSummary: string;
   apiKey: string;
   githubToken: string;
+  /** Imprimer ce qui partirait, et ne rien envoyer. Réglage local seulement. */
+  countOnly: boolean;
+  /** Nom libre du bras mesuré, repris dans la ligne « ::stats:: ». */
+  variant: string;
 }
 
 /**
@@ -186,6 +217,23 @@ function readNumber(
     return fallback;
   }
   return parsed;
+}
+
+/**
+ * Le cran demandé, ou le défaut.
+ *
+ * Un cran inconnu ne doit pas annuler la review : on prévient et on garde le
+ * défaut, comme pour tout input illisible.
+ */
+function readEffort(env: Env, warn: (message: string) => void): Effort {
+  const raw = readInput(env, 'effort').toLowerCase();
+  if (raw === '') return DEFAULTS.effort;
+  if (isEffort(raw)) return raw;
+  warn(
+    `input « effort » inconnu (« ${raw} ») : on garde ${DEFAULTS.effort}.\n` +
+      `  Valeurs acceptées : ${EFFORTS.join(', ')}.`,
+  );
+  return DEFAULTS.effort;
 }
 
 function readBoolean(env: Env, name: string): boolean {
@@ -260,14 +308,25 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   let pr: number | null = null;
   let dryRun = readBoolean(env, 'dry-run');
   let model = readInput(env, 'model') || env.OLLAMA_REVIEW_MODEL?.trim() || DEFAULTS.model;
+  let countOnly = false;
+  let variant = readInput(env, 'variant') || DEFAULTS.variant;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
     if (arg === '--dry-run') dryRun = true;
-    else if (arg === '--model') {
+    // Ne rien envoyer implique ne rien poster : sans ça, une faute de frappe sur
+    // un drapeau de mesure irait commenter une PR.
+    else if (arg === '--count-only') {
+      countOnly = true;
+      dryRun = true;
+    } else if (arg === '--model') {
       const value = argv[++index];
       if (!value) throw new UsageError('« --model » attend un nom de modèle.');
       model = value;
+    } else if (arg === '--variant') {
+      const value = argv[++index];
+      if (!value) throw new UsageError('« --variant » attend un nom.');
+      variant = value;
     } else if (/^#?\d+$/.test(arg)) pr = Number(arg.replace('#', ''));
     else throw new UsageError(`argument inconnu : ${arg}`);
   }
@@ -287,6 +346,7 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   }
 
   const doctrineInput = parseList(readInput(env, 'doctrine'));
+  const effort = readEffort(env, warn);
 
   return {
     pr,
@@ -301,10 +361,21 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     maxFindings: readNumber(env, 'max-findings', DEFAULTS.maxFindings, warn),
     budgetChars: readNumber(env, 'budget-chars', DEFAULTS.budgetChars, warn),
     perFileChars: readNumber(env, 'per-file-chars', DEFAULTS.perFileChars, warn),
+    effort,
+    passes: parseList(readInput(env, 'passes')),
+    windowMinLines: readNumber(
+      env,
+      'window-min-lines',
+      DEFAULTS.windowMinLines[effort],
+      warn,
+      0,
+    ),
+    // Le cran pose le défaut, l'input explicite l'écrase : régler « effort » ne
+    // doit pas rendre un budget écrit à la main silencieusement inopérant.
     importsBudgetChars: readNumber(
       env,
       'imports-budget-chars',
-      DEFAULTS.importsBudgetChars,
+      effort === 'lean' ? DEFAULTS.leanImportsBudgetChars : DEFAULTS.importsBudgetChars,
       warn,
       0,
     ),
@@ -313,6 +384,8 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     // Le plancher d'abord : ce qui suit ne peut qu'ajouter, jamais retirer.
     skip: [...ALWAYS_SKIPPED, ...parseList(readInput(env, 'skip'))],
     projectSummary: readInput(env, 'project-summary'),
+    countOnly,
+    variant,
     apiKey: readInput(env, 'ollama-api-key') || env.OLLAMA_API_KEY?.trim() || '',
     githubToken: readInput(env, 'github-token') || env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || '',
   };

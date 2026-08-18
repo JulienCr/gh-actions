@@ -23,6 +23,7 @@ const CONTEXT: AssembledContext = {
   imported: [],
   skipped: ['pnpm-lock.yaml'],
   omitted: [],
+    windowed: [],
 };
 
 const preamble = (over: Partial<PromptOptions> = {}) =>
@@ -119,5 +120,24 @@ describe('buildUserPrompt', () => {
 
   it('n’ouvre pas de section de contexte quand aucun import n’a été résolu', () => {
     expect(buildUserPrompt(META, CONTEXT)).not.toContain('Context files');
+  });
+});
+
+
+describe('la phrase qui désigne les sections fournies', () => {
+  const build = (imported: { path: string; numbered: string }[]) =>
+    buildUserPrompt(META, { diff: 'd', files: [], imported, skipped: [], omitted: [], windowed: [] });
+
+  it('annonce deux sections quand des fichiers de contexte suivent', () => {
+    expect(build([{ path: 'src/b.ts', numbered: '1| b' }])).toContain(
+      'absent from this section and from the next one',
+    );
+  });
+
+  /** Sans section suivante, la phrase désignerait du vide. */
+  it('n’en annonce qu’une quand la passe ne reçoit pas d’imports', () => {
+    const prompt = build([]);
+    expect(prompt).toContain('absent from this section was not given to you');
+    expect(prompt).not.toContain('from the next one');
   });
 });

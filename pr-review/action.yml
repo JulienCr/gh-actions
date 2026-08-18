@@ -39,6 +39,31 @@ inputs:
     required: false
     default: 'glm-5.2:cloud'
 
+  effort:
+    description: >-
+      Ampleur des coupes dans ce qui est envoyé au modèle : full, balanced ou
+      lean. « full » envoie tout à toutes les passes ; la seule qu'il puisse
+      sauter est « doctrine », sur un dépôt qui n'en fournit aucune, son prompt
+      lui dictant alors sa sortie mot pour mot. « balanced » n'envoie les
+      fichiers importés qu'aux passes qui s'en servent et ne lance pas une passe
+      qu'une PR ne peut pas déclencher. « lean » resserre encore le contexte et
+      baisse le raisonnement de deux crans sur « doctrine » et d'un cran sur
+      « données et accès ». Aucun cran ne supprime la passe « données et
+      accès », et tout ce qu'un cran retire est déclaré dans le commentaire.
+      Nommé full/balanced/lean et non high/balanced/low pour ne pas se confondre
+      avec « thinking », qui a déjà un « high » et un « low ».
+    required: false
+    default: 'balanced'
+
+  passes:
+    description: >-
+      Passes à lancer, un identifiant par ligne parmi regression, doctrine et
+      data. Vide : la règle d'« effort » décide. Une liste explicite court-circuite
+      toutes les règles, y compris celles qui sauteraient une passe : utile sur un
+      dépôt de contenu dont les .md SONT le produit, ou pour régler un prompt.
+    required: false
+    default: ''
+
   thinking:
     description: >-
       Effort de raisonnement des trois passes de lecture : low, medium, high,
@@ -116,14 +141,25 @@ inputs:
     required: false
     default: '80000'
 
+  window-min-lines:
+    description: >-
+      Taille en lignes à partir de laquelle un fichier touché part par extraits
+      autour de ses changements, au lieu d'être envoyé en entier. Les numéros de
+      ligne restent ceux du fichier, donc un chemin:ligne cité reste juste, et
+      chaque trou est déclaré au modèle comme au lecteur. 0 désactive. Laissé
+      vide, il vaut 0 au cran « full », 250 en « balanced » et 120 en « lean ».
+    required: false
+    default: ''
+
   imports-budget-chars:
     description: >-
       Plafond des fichiers que les fichiers touchés importent, joints en
       contexte pour que le modèle tranche un doute au lieu de le signaler. Budget
       distinct de « budget-chars » : les fichiers de la PR gardent le leur quoi
-      qu'il arrive. 0 désactive le contexte importé.
+      qu'il arrive. 0 désactive le contexte importé. Laissé vide, il vaut 300000,
+      ou 120000 au cran « lean » ; renseigné, il l'emporte sur le cran.
     required: false
-    default: '300000'
+    default: ''
 
   timeout-minutes:
     description: >-

@@ -77,7 +77,7 @@ Your job is coverage, not curation. A finding you swallowed because you were not
 is a bug that ships. Report what you find and let its label carry your confidence: a doubt is
 reported as a doubt, never dropped.
 
-- **Read every file you were given in full**, not only the changed lines. The diff says what
+- **Read every excerpt you were given in full**, not only the changed lines. The diff says what
   moved; the code around it says what that broke. A reviewer who only reads « + » lines finds
   only typos.
 - **Do not soften a finding into silence.** When something looks wrong but you cannot prove it
@@ -154,14 +154,44 @@ ${context.diff}
 
 ## Full content of the changed files, after the change
 
-Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from this
-section and from the next one was not given to you: do not describe its contents.
-
+Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from ${
+    context.imported.length > 0 ? 'this section and from the next one' : 'this section'
+  } was not given to you: do not describe its contents.
+${renderGaps(context.windowed.length > 0)}
 ${contents}${renderImported(context.imported)}`;
 }
 
-const renderFile = (file: { path: string; numbered: string }) =>
-  `### ${file.path}\n\n\`\`\`\n${file.numbered}\n\`\`\``;
+const renderFile = (file: { path: string; numbered: string; windowed?: boolean }) => {
+  // Redit sur le titre ce que la bannière dit dans le corps : un modèle qui
+  // traverse quatre-vingt-dix kilo-octets oublie une consigne lue plus haut.
+  const note = file.windowed ? ' (excerpt: the lines around the changes only)' : '';
+  return `### ${file.path}${note}\n\n\`\`\`\n${file.numbered}\n\`\`\``;
+};
+
+/**
+ * Ce qu'est un trou, et ce qu'on n'a pas le droit d'en conclure.
+ *
+ * La consigne la plus importante du fenêtrage. Sans elle, « je ne vois pas le
+ * filtre sur le tenant » devient une trouvaille alors que le filtre est
+ * peut-être dans le trou : on troque des tokens contre des faux positifs, ce
+ * qui coûte bien plus cher que ce qu'on économise.
+ */
+function renderGaps(hasWindows: boolean): string {
+  if (!hasWindows) return '';
+
+  return `
+Large files are given as excerpts around the changed lines, not in full. A line reading
+
+    ==== lines 43-317 of this file were NOT given to you (275 lines) ====
+
+means those 275 lines exist in the file and were withheld from you. It does not mean the file
+stops there, and it does not mean the code you expected there is missing.
+
+**Never conclude from a gap.** « I do not see the tenant filter » is not a finding when the filter
+could be sitting in a gap: it is a « doute », and you name the gap that would settle it. What you
+may conclude from a gap is nothing at all.
+`;
+}
 
 /**
  * Les fichiers importés, dans une section à part et étiquetée comme telle.

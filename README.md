@@ -200,6 +200,8 @@ Seul `pr` est obligatoire.
 | `ollama-api-key` | `''` | Clé Ollama Cloud. Vide : review ignorée sans bruit, job vert. |
 | `github-token` | `${{ github.token }}` | Jeton du CLI `gh`. Le jeton du job suffit, avec `pull-requests: write`. |
 | `model` | `glm-5.2:cloud` | Modèle Ollama Cloud. |
+| `effort` | `balanced` | Ampleur des coupes dans ce qui est envoyé : `full`, `balanced`, `lean`. Voir ci-dessous. |
+| `passes` | `''` | Passes à lancer (`regression`, `doctrine`, `data`), une par ligne. Vide : `effort` décide. |
 | `thinking` | `max` | Effort de raisonnement des trois passes : `low`, `medium`, `high`, `max`, `off`. Un modèle qui refuse est relancé sans. |
 | `merge-thinking` | `high` | Idem pour la fusion, qui trie sans avoir le code sous les yeux. |
 | `temperature` | `1` | **Ne pas mettre 0** : voir ci-dessous. |
@@ -210,9 +212,110 @@ Seul `pr` est obligatoire.
 | `max-findings` | `20` | Plafond de puces pour Bloquant, À corriger et Suggestions. « À vérifier » a son propre plafond de cinq. |
 | `budget-chars` | `500000` | Plafond du contenu intégral des fichiers **touchés**. |
 | `per-file-chars` | `80000` | Plafond par fichier. |
-| `imports-budget-chars` | `300000` | Plafond des fichiers **importés**, joints en contexte. `0` : aucun. |
+| `window-min-lines` | selon le cran | Taille à partir de laquelle un fichier part par extraits. `0` : jamais. |
+| `imports-budget-chars` | `300000` | Plafond des fichiers **importés**, joints en contexte. `0` : aucun. `120000` au cran `lean`. |
 | `timeout-minutes` | `15` | Délai d'**une** requête. La review en fait quatre ; voir le `timeout-minutes` du job. |
 | `dry-run` | `false` | `true` : la review part dans les logs, rien n'est posté. |
+
+### Le cran d'effort
+
+L'entrée d'une review se dépense d'un coup, dans les secondes qui suivent le lancement. L'input
+`effort` règle son ampleur, et rien n'est économisé en douce : tout ce qu'un cran retire est
+déclaré dans le pied de page du commentaire.
+
+| | `full` | `balanced` (défaut) | `lean` |
+| --- | --- | --- | --- |
+| Fichiers touchés | entiers | par extraits au-delà de 250 lignes | par extraits au-delà de 120 lignes |
+| Fichiers importés | aux trois passes | pas à « doctrine » | à « régression » seule, budget 120 000 |
+| Passes | les trois | une passe qu'une PR ne peut pas déclencher n'est pas lancée | idem |
+| `thinking` | inchangé | inchangé | deux crans plus bas sur « doctrine », un sur « données » |
+
+`full` reproduit le comportement d'avant ce réglage, à deux exceptions près qui valent à tous les
+crans : les doublons purs ne partent plus (contenu d'un fichier seulement renommé, corps du diff
+d'un fichier neuf dont le contenu numéroté suit), et la passe « doctrine » ne tourne pas sans
+doctrine. Aucune de ces deux coupes ne retire au modèle quoi que ce soit qu'il n'ait déjà.
+
+Deux garde-fous que le cran ne lève jamais. **La passe « données et accès » tourne toujours** : un
+README fuit une clé aussi bien qu'un `.ts`, et une doc d'API publie un endpoint interne. Une
+fuite coûte incomparablement plus cher qu'une passe. Et **aucun cran ne supprime un axe** :
+`lean` rétrécit le contexte, il ne repasse pas à deux passes, parce qu'un modèle qui porte
+plusieurs axes à la fois expédie les derniers.
+
+La passe « doctrine » ne tourne pas sur un dépôt qui ne fournit aucun fichier de doctrine, à
+tous les crans y compris `full` : son prompt lui dicte alors sa sortie mot pour mot, et la lancer
+reviendrait à payer un contexte entier pour une réponse écrite d'avance.
+
+Mesuré sur ce dépôt, à contenu de disque identique, entrée par review :
+
+| PR | avant | `full` | `balanced` | `lean` |
+| --- | --- | --- | --- | --- |
+| 18 fichiers, 5 importés | 841 060 car. | -11,0 % | -13,5 % | -16,0 % |
+| README seul | 108 115 car. | -0,3 % | **-33,7 %** | -33,7 % |
+| 2 fichiers, aucun import | 229 780 car. | -0,1 % | -0,1 % | -0,1 % |
+
+Le `-33,7 %` d'une PR de documentation est la passe « régression fonctionnelle » qu'on ne lance
+pas : elle ne pouvait rendre que « rien ». Le `-0,1 %` de la dernière ligne est honnête aussi : une
+PR sans fichier neuf, sans renommage et sans import n'a rien à rendre. Le cran ne l'invente pas.
+
+Ce que ces chiffres ne montrent pas, c'est le fenêtrage, qui vaut **zéro sur ce dépôt**. Ses
+fenêtres y couvrent 100 % de chaque fichier assez gros pour être candidat, donc il renonce et
+envoie le fichier entier. Avec soixante lignes de marge de part et d'autre, un seul hunk en couvre
+déjà cent vingt : sous quatre cents lignes, il n'y a rien à gagner. Le gain est à attendre d'un
+dépôt applicatif, dont les fichiers de mille lignes reçoivent des retouches localisées. Le garde-fou
+est là pour ça : mieux vaut un fichier entier qu'un fichier haché pour trois pour cent.
+
+### Ce qu'une review coûterait, avant de la lancer
+
+`--count-only` assemble le contexte, construit les prompts, imprime la ventilation et **n'appelle
+rien**. Ni clé ni quota : l'entrée est déterministe, donc elle se compte.
+
+```
+pr-review 154 --count-only
+```
+
+```
+  appel                             système        user       total    ≈ tokens
+  passe régression fonctionnelle      8 207     139 316     147 523     ~42 149
+  passe doctrine du dépôt             7 916     139 316     147 232     ~42 066
+  passe données et accès              8 091     139 316     147 407     ~42 116
+  ──────────────────────────────────────────────────────────────────────────
+  total entrée                                              442 162    ~126 332
+  dont : diff 23 % · fichiers touchés 69 % · imports 0 % · système 6 % · reste 2 %
+```
+
+La ventilation est ce qui dit où couper, et elle ne se devine pas : sur ce dépôt le diff pèse
+entre 10 et 33 % de l'entrée selon la PR, et les fichiers importés entre 0 et 11 %. Les tokens
+sont estimés à partir des caractères ; les caractères, eux, sont exacts.
+
+Une review dont au moins une passe aboutit imprime aussi une ligne `::stats::{…}` en JSON,
+greppable dans un journal de CI, qui porte les compteurs. `--count-only`, qui n'appelle rien, n'en
+imprime pas.
+
+**Les trouvailles brutes n'y figurent qu'en local**, sous `--dry-run`. La passe « données et
+accès » cherche des secrets : une trouvaille qui en cite un le recopierait dans le journal d'un
+runner. Comparer deux réglages sur leurs trouvailles est un geste de réglage, qui se fait depuis un
+poste ; en CI la ligne garde les compteurs, qui ne citent rien. Et c'est bien sur les trouvailles
+qu'il faut comparer : les tokens disent lequel est le moins cher, jamais lequel a perdu quelque
+chose.
+
+### Pourquoi pas une review agentique
+
+Le runner sort bien le dépôt, et `glm-5.2:cloud` accepte les outils : rien n'empêche techniquement
+de donner au modèle un `read_file` et de le laisser chercher au lieu de tout lui envoyer.
+
+L'arithmétique, si. Un aller-retour agentique ne renvoie pas la question, il renvoie tout ce qui
+précède. Sans cache de prompt, `n` tours coûtent `n` fois le socle : avec un socle de 50 000 tokens
+et huit tours de lecture, l'addition passe 400 000 tokens là où l'envoi glouton en coûte 65 000.
+Plus le relecteur travaille bien, plus il coûte.
+
+Or Ollama Cloud ne sert pas de cache de prompt ([#15600](https://github.com/ollama/ollama/issues/15600),
+[#16714](https://github.com/ollama/ollama/issues/16714)). C'est la même raison qui tue le raccourci
+symétrique : faire partager aux trois passes un préfixe identique ne leur ferait rien repasser. Et
+un LSP n'y changerait rien non plus, puisqu'il rétrécit les réponses des outils, pas le socle
+renvoyé à chaque tour.
+
+À rouvrir le jour où ce cache existe. La mesure tient en deux requêtes identiques dont on compare
+le `prompt_eval_duration`.
 
 ### Pourquoi la température n'est pas à zéro
 

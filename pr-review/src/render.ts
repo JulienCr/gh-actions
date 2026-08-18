@@ -115,6 +115,18 @@ export interface Footer {
   skipped: string[];
   /** Fichiers dont seul le diff a été envoyé, faute de place. */
   omitted: string[];
+  /** Fichiers fournis par extraits autour de leurs hunks, pas en entier. */
+  windowed: string[];
+  /** Le cran qui a réglé l'ampleur des coupes : full, balanced ou lean. */
+  effort: string;
+  /**
+   * Passes qui n'ont PAS reçu les fichiers importés.
+   *
+   * Déclaré parce que le cran promet de dire ce qu'il retire. Sans cette ligne,
+   * trois passes paraissent avoir jugé sur le même contexte alors que l'une
+   * d'elles n'avait pas les appelants sous les yeux.
+   */
+  importsWithheld: string[];
   /**
    * Nombre de fichiers joints parce qu'un fichier touché les importe.
    *
@@ -125,6 +137,14 @@ export interface Footer {
   imported: number;
   /** Passes qui n'ont pas abouti. Une review partielle doit se déclarer. */
   failedPasses: string[];
+  /**
+   * Passes délibérément non lancées, avec leur raison.
+   *
+   * Champ distinct de `failedPasses`, et rendu sans avertissement : une passe
+   * qui échoue est un incident, une passe qu'on ne lance pas est une décision.
+   * Les confondre ferait lire un choix comme une panne, et l'inverse.
+   */
+  skippedPasses: { label: string; reason: string }[];
 }
 
 function formatDuration(ms: number): string {
@@ -138,6 +158,7 @@ const count = (value: number) => value.toLocaleString('fr-FR');
 function renderFooter(footer: Footer): string {
   const bits = [
     `${footer.model} via Ollama Cloud`,
+    `effort ${footer.effort}`,
     formatDuration(footer.durationMs),
     `${count(footer.promptTokens)} tokens en entrée, ${count(footer.evalTokens)} en sortie`,
   ];
@@ -145,7 +166,11 @@ function renderFooter(footer: Footer): string {
     bits.push(`${count(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
   }
   if (footer.imported > 0) {
-    bits.push(`${footer.imported} fichier(s) importés joints en contexte`);
+    const withheld =
+      footer.importsWithheld.length > 0
+        ? ` (hors ${footer.importsWithheld.map((label) => `« ${label} »`).join(', ')})`
+        : '';
+    bits.push(`${footer.imported} fichier(s) importés joints en contexte${withheld}`);
   }
   if (footer.skipped.length > 0) {
     bits.push(`${footer.skipped.length} fichier(s) générés ignorés`);
@@ -153,6 +178,18 @@ function renderFooter(footer: Footer): string {
   if (footer.omitted.length > 0) {
     // Dit explicitement : une review partielle ne doit pas se lire comme une review complète.
     bits.push(`diff seul (sans contexte complet) pour ${footer.omitted.join(', ')}`);
+  }
+  if (footer.windowed.length > 0) {
+    // Au-delà de quatre noms la liste noie le pied de page, là où « omitted »
+    // reste rare et court.
+    bits.push(
+      footer.windowed.length > 4
+        ? `${footer.windowed.length} fichier(s) fournis par extraits autour des changements`
+        : `extraits autour des changements pour ${footer.windowed.join(', ')}`,
+    );
+  }
+  for (const { label, reason } of footer.skippedPasses) {
+    bits.push(`passe « ${label} » non lancée (${reason})`);
   }
   if (footer.failedPasses.length > 0) {
     const quoted = footer.failedPasses.map((pass) => `« ${pass} »`);

@@ -21,7 +21,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { assembleContext, type AssembledContext } from './context';
+import { assembleContext, contextFor, type AssembledContext, type WindowOptions } from './context';
 import { run } from './exec';
 import { currentHeadSha, fetchPrDiff, fetchPrMeta, postComment, resolveRepo, type PrMeta } from './gh';
 import { compileMatcher } from './globs';
@@ -32,11 +32,34 @@ import {
   buildMergeSystemPrompt,
   buildMergeUserPrompt,
   buildPassSystemPrompt,
-  PASSES,
   PASS_HEADING,
+  selectPasses,
+  stepDown,
   type Pass,
 } from './passes';
 import { extractReview, renderComment, renderFailureComment, renderPartialComment } from './render';
+import {
+  describeCall,
+  renderBreakdown,
+  statsLine,
+  totals,
+  type CallStat,
+  type InputBreakdown,
+} from './stats';
+
+/**
+ * Le fenêtrage, hors son seuil, qui vient du cran.
+ *
+ * `pad` assez large pour tenir la fonction touchée et sa signature : en dessous
+ * de quarante lignes on coupe au milieu d'une fonction, soit exactement le
+ * voisinage qui justifie d'envoyer le contenu et pas seulement le diff.
+ */
+const WINDOW: Omit<WindowOptions, 'minLines'> = {
+  pad: 60,
+  head: 40,
+  joinGap: 25,
+  maxCoverage: 0.7,
+};
 
 /** Emplacement 1Password de la clé, pour l'usage local. Surchargeable. */
 const DEFAULT_KEY_REF = 'op://Personal/Ollama/add more/api_key';
@@ -88,14 +111,16 @@ function readDoctrine(root: string, paths: string[]): DoctrineFile[] {
  * lignes qui ont bougé. Mesuré : la moitié des « hallucinations » d'un réglage
  * de prompt venaient de là, pas du modèle.
  */
-async function warnOnDetachedContext(headSha: string): Promise<void> {
+async function warnOnDetachedContext(headSha: string): Promise<boolean> {
   const head = await currentHeadSha();
   if (head && head !== headSha) {
     console.warn(
       `⚠ Le dépôt est sur ${head.slice(0, 8)}, la PR sur ${headSha.slice(0, 8)} : le contenu lu ne\n` +
         "  correspond pas au diff. Pour un réglage de prompt fidèle, fais d'abord « gh pr checkout ».",
     );
+    return true;
   }
+  return false;
 }
 
 /**
@@ -117,11 +142,15 @@ async function keyFrom1Password(): Promise<string> {
   }
 }
 
-/** Ce que les quatre appels laissent derrière eux : des compteurs et des échecs. */
+/**
+ * Ce que les quatre appels laissent derrière eux : un relevé et des échecs.
+ *
+ * Un relevé par appel et non quatre compteurs cumulés : baisser le contexte
+ * d'une passe et baisser son raisonnement font tous deux descendre le total, et
+ * demandent des décisions opposées. Un total ne permet pas de les distinguer.
+ */
 interface Run {
-  promptTokens: number;
-  evalTokens: number;
-  thinkingChars: number;
+  calls: CallStat[];
   /** Raisons des appels en échec, pour les expliquer si plus rien n'aboutit. */
   failures: string[];
 }
@@ -136,8 +165,9 @@ interface Run {
 async function callModel(
   config: Config,
   run: Run,
-  args: { system: string; user: string; think: string; label: string },
+  args: { id: string; system: string; user: string; think: string; label: string },
 ): Promise<ChatResult | null> {
+  const sizes = { systemChars: args.system.length, userChars: args.user.length };
   let result: ChatResult;
   try {
     result = await chat({
@@ -160,16 +190,38 @@ async function callModel(
     const reason = error instanceof OllamaError ? error.message : String(error);
     console.error(`✗ ${args.label} : ${reason}`);
     run.failures.push(reason);
+    // Consigné quand même : l'entrée d'un appel raté a été envoyée, donc payée.
+    // Ollama ne rend pas ses compteurs sur un échec, d'où des tokens à zéro et
+    // des caractères, eux, connus.
+    run.calls.push({
+      id: args.id,
+      label: args.label,
+      think: args.think,
+      ...sizes,
+      promptTokens: 0,
+      evalTokens: 0,
+      thinkingChars: 0,
+      contentChars: 0,
+      durationMs: 0,
+      ok: false,
+    });
     return null;
   }
 
-  run.promptTokens += result.promptTokens;
-  run.evalTokens += result.evalTokens;
-  run.thinkingChars += result.thinkingChars;
-  console.log(
-    `✓ ${args.label} en ${Math.round(result.durationMs / 1000)} s ` +
-      `(${result.promptTokens} tokens en entrée, ${result.evalTokens} en sortie).`,
-  );
+  const stat: CallStat = {
+    id: args.id,
+    label: args.label,
+    think: args.think,
+    ...sizes,
+    promptTokens: result.promptTokens,
+    evalTokens: result.evalTokens,
+    thinkingChars: result.thinkingChars,
+    contentChars: result.content.length,
+    durationMs: result.durationMs,
+    ok: true,
+  };
+  run.calls.push(stat);
+  console.log(`✓ ${describeCall(stat)}`);
   return result;
 }
 
@@ -187,18 +239,14 @@ interface PassOutcome {
  * est bien plus faible que celui d'un axe de recherche que le modèle expédie
  * parce que deux autres lui tiennent la tête.
  */
-async function runPasses(
-  config: Config,
-  run: Run,
-  promptOptions: PromptOptions,
-  user: string,
-): Promise<PassOutcome[]> {
+async function runPasses(config: Config, run: Run, plan: PassPrompt[]): Promise<PassOutcome[]> {
   const results = await Promise.all(
-    PASSES.map(async (pass) => {
+    plan.map(async ({ pass, system, user, think }) => {
       const result = await callModel(config, run, {
-        system: buildPassSystemPrompt(pass, promptOptions),
+        id: pass.id,
+        system,
         user,
-        think: config.thinking,
+        think,
         label: `passe ${pass.label}`,
       });
       if (result === null) return null;
@@ -206,6 +254,121 @@ async function runPasses(
     }),
   );
   return results.filter((result): result is PassOutcome => result !== null);
+}
+
+/**
+ * Ce qui partira pour une passe, calculé avant tout appel.
+ *
+ * Séparé de l'envoi pour que `--count-only` mesure exactement ce qui serait
+ * parti, plutôt qu'une reconstruction parallèle qui dériverait du vrai chemin
+ * à la première divergence.
+ */
+interface PassPrompt {
+  pass: Pass;
+  system: string;
+  user: string;
+  think: string;
+  /** Le contexte que CETTE passe reçoit, imports retirés le cas échéant. */
+  seen: AssembledContext;
+}
+
+/**
+ * Ce qui partira, passe par passe.
+ *
+ * Un prompt par passe et non un seul partagé : le contexte que chacune reçoit
+ * dépend désormais d'elle et du cran, et la construction doit rester le seul
+ * chemin vers l'envoi, pour que `--count-only` mesure ce qui partirait vraiment.
+ */
+function planPasses(
+  config: Config,
+  promptOptions: PromptOptions,
+  meta: PrMeta,
+  context: AssembledContext,
+  passes: readonly Pass[],
+): PassPrompt[] {
+  return passes.map((pass) => {
+    const wantsImports = pass.imports[config.effort];
+    const seen = contextFor(context, wantsImports);
+    return {
+      pass,
+      // La consigne sur les doutes ne s'écrit que s'il y a bien une section de
+      // fichiers de contexte à lire : sinon elle désigne du vide.
+      system: buildPassSystemPrompt(pass, promptOptions, seen.imported.length > 0),
+      user: buildUserPrompt(meta, seen),
+      think: stepDown(config.thinking, pass.thinkingSteps[config.effort]),
+      seen,
+    };
+  });
+}
+
+/**
+ * La ventilation de l'entrée d'UNE passe, en caractères.
+ *
+ * Sur la somme des appels, un bloc envoyé à une seule passe paraîtrait bien plus
+ * petit qu'il ne l'est pour celle qui le reçoit : on couperait ailleurs qu'où il
+ * faut.
+ */
+function breakdown(plan: PassPrompt[]): InputBreakdown {
+  const first = plan[0];
+  const sum = (files: { numbered: string }[]) =>
+    files.reduce((total, file) => total + file.numbered.length, 0);
+  // Le contexte de CETTE passe, pas le contexte global : depuis que le cran
+  // retire les imports à certaines passes, compter ceux du contexte global
+  // attribuerait des caractères qui ne partent pas, écraserait « meta » à zéro
+  // et rendrait la ventilation fausse précisément dans les réglages que
+  // « --count-only » sert à comparer.
+  const seen = first?.seen;
+  const system = first?.system.length ?? 0;
+  const diff = seen?.diff.length ?? 0;
+  const touched = sum(seen?.files ?? []);
+  const imported = sum(seen?.imported ?? []);
+  return {
+    system,
+    diff,
+    touched,
+    imported,
+    // Ce qui reste du prompt user : titre, description, liste des fichiers et
+    // consignes. Déduit plutôt que recompté, pour que la somme des parts fasse
+    // toujours exactement le prompt envoyé.
+    meta: Math.max(0, (first?.user.length ?? 0) - diff - touched - imported),
+  };
+}
+
+/**
+ * Imprime ce qui partirait au modèle, sans rien lui envoyer.
+ *
+ * L'entrée est déterministe : mêmes fichiers, même prompt, mêmes caractères. Une
+ * seule exécution suffit donc à comparer deux réglages, et elle ne coûte rien.
+ * C'est ce qui permet de choisir où couper sur des mesures plutôt que sur un
+ * pari, la composition d'une PR changeant d'un dépôt à l'autre.
+ */
+function countOnly(config: Config, plan: PassPrompt[], context: AssembledContext): void {
+  const calls: CallStat[] = plan.map(({ pass, system, user, think }) => ({
+    id: pass.id,
+    label: `passe ${pass.label}`,
+    think,
+    systemChars: system.length,
+    userChars: user.length,
+    promptTokens: 0,
+    evalTokens: 0,
+    thinkingChars: 0,
+    contentChars: 0,
+    durationMs: 0,
+    ok: true,
+  }));
+
+  console.log(
+    `\nPR #${config.pr} · ${context.files.length} fichier(s) touchés · ` +
+      `${context.imported.length} importé(s) · variante « ${config.variant} »\n`,
+  );
+  console.log(renderBreakdown(calls, breakdown(plan)));
+  // La fusion ne se mesure pas à vide : son entrée est faite des trouvailles des
+  // passes, qui n'existent qu'une fois les passes appelées. La taire vaut mieux
+  // que la deviner, d'autant qu'elle ne pèse presque rien.
+  console.log(
+    '\n  La fusion n\u2019est pas comptée : son entrée est faite des trouvailles des passes,\n' +
+      '  qui n\u2019existent pas sans appel. Mesurée en production, elle pèse ~2 000 tokens.',
+  );
 }
 
 async function review(config: Config): Promise<void> {
@@ -217,12 +380,23 @@ async function review(config: Config): Promise<void> {
     fetchPrMeta(config.pr),
     fetchPrDiff(config.pr),
   ]);
-  await warnOnDetachedContext(meta.headSha);
+  const detached = await warnOnDetachedContext(meta.headSha);
 
+  const isSkipped = compileMatcher(config.skip);
+  // Un diff périmé donne des plages périmées, donc des fenêtres qui montrent les
+  // mauvaises lignes : le fenêtrage ferait d'un avertissement une faute
+  // silencieuse. Le cas n'existe qu'en local, la CI sortant la tête de la PR.
+  if (detached && config.windowMinLines > 0) {
+    console.warn('  Fenêtrage désactivé pour cette exécution : les plages du diff ne seraient pas fiables.');
+  }
   const context = assembleContext({
     rawDiff,
     prFiles: meta.files,
-    isSkipped: compileMatcher(config.skip),
+    isSkipped,
+    window:
+      config.windowMinLines > 0 && !detached
+        ? { ...WINDOW, minLines: config.windowMinLines }
+        : null,
     budget: {
       totalChars: config.budgetChars,
       perFileChars: config.perFileChars,
@@ -256,15 +430,34 @@ async function review(config: Config): Promise<void> {
     projectSummary: config.projectSummary,
     doctrine: readDoctrine(root, config.doctrine),
   };
-  const user = buildUserPrompt(meta, context);
+
+  const doctrine = promptOptions.doctrine;
+  const selection = selectPasses(
+    { files: meta.files.filter((file) => !isSkipped(file.path)), hasDoctrine: doctrine.length > 0 },
+    {
+      auto: config.effort !== 'full',
+      forced: config.passes,
+      warn: (message) => console.warn(`⚠ ${message}`),
+    },
+  );
+  const plan = planPasses(config, promptOptions, meta, context, selection.run);
+
   console.log(
     `Contexte : ${context.files.length} fichier(s) touchés, ${context.imported.length} importé(s), ` +
-      `~${Math.round(user.length / 1024)} Ko par passe, ${PASSES.length} passes + fusion (${config.model}).`,
+      `${plan.length} passe(s) + fusion (${config.model}, effort ${config.effort}).`,
   );
+  for (const { label, reason } of selection.skipped) {
+    console.log(`· passe « ${label} » non lancée : ${reason}.`);
+  }
+
+  if (config.countOnly) {
+    countOnly(config, plan, context);
+    return;
+  }
 
   const started = Date.now();
-  const run: Run = { promptTokens: 0, evalTokens: 0, thinkingChars: 0, failures: [] };
-  const outcomes = await runPasses(config, run, promptOptions, user);
+  const run: Run = { calls: [], failures: [] };
+  const outcomes = await runPasses(config, run, plan);
 
   if (outcomes.length === 0) {
     const reason = run.failures[0] ?? 'raison inconnue';
@@ -274,7 +467,14 @@ async function review(config: Config): Promise<void> {
   }
 
   const merged = await callModel(config, run, {
-    system: buildMergeSystemPrompt({ repo, maxFindings: config.maxFindings }),
+    id: 'merge',
+    // Les passes qui ont abouti, pas celles qui étaient prévues : annoncer un
+    // relecteur qui n'a rien rendu ferait chercher à la fusion un axe absent.
+    system: buildMergeSystemPrompt({
+      repo,
+      maxFindings: config.maxFindings,
+      passes: outcomes.map((outcome) => outcome.pass),
+    }),
     user: buildMergeUserPrompt(meta, outcomes),
     think: config.mergeThinking,
     label: 'fusion',
@@ -290,15 +490,24 @@ async function review(config: Config): Promise<void> {
     footer: {
       model: config.model,
       durationMs: Date.now() - started,
-      promptTokens: run.promptTokens,
-      evalTokens: run.evalTokens,
-      thinkingChars: run.thinkingChars,
+      ...totals(run.calls),
       skipped: context.skipped,
       omitted: context.omitted,
+      windowed: context.windowed,
       imported: context.imported.length,
-      failedPasses: PASSES.filter((pass) => !outcomes.some((outcome) => outcome.pass === pass)).map(
-        (pass) => pass.label,
-      ),
+      effort: config.effort,
+      // Ce que le cran a retiré, nommément. Le pied de page promet de déclarer
+      // toute coupe ; taire à quelles passes les imports ont manqué laisserait
+      // le lecteur croire que les trois ont jugé sur le même contexte.
+      importsWithheld: selection.run
+        .filter((pass) => !pass.imports[config.effort])
+        .map((pass) => pass.label),
+      // Les passes lancées qui n'ont pas abouti : un incident. Distinct de
+      // celles qu'on n'a pas lancées, qui est une décision.
+      failedPasses: selection.run
+        .filter((pass) => !outcomes.some((outcome) => outcome.pass === pass))
+        .map((pass) => pass.label),
+      skippedPasses: selection.skipped,
     },
   };
 
@@ -310,6 +519,26 @@ async function review(config: Config): Promise<void> {
           passes: outcomes.map((outcome) => ({ label: outcome.pass.label, findings: outcome.findings })),
         })
       : renderComment({ ...shared, review: merged.content });
+
+  // Une ligne, greppable dans un journal de CI comme en local.
+  //
+  // Les trouvailles brutes n'y sont QU'EN LOCAL. La passe « données et accès »
+  // cherche des secrets, et une trouvaille qui en cite un le recopierait dans
+  // le journal d'un runner, que la doctrine du dépôt interdit. Comparer deux
+  // réglages sur leurs trouvailles est un geste de réglage, qui se fait depuis
+  // un poste ; en CI la ligne garde les compteurs, qui ne citent rien.
+  console.log(
+    statsLine({
+      pr: config.pr,
+      model: config.model,
+      variant: config.variant,
+      calls: run.calls,
+      blocks: breakdown(plan),
+      findings: config.dryRun
+        ? Object.fromEntries(outcomes.map((outcome) => [outcome.pass.id, outcome.findings]))
+        : {},
+    }),
+  );
 
   if (config.dryRun) {
     console.log('\n────────── review (dry-run, non postée) ──────────\n');
@@ -347,8 +576,10 @@ async function main(): Promise<void> {
   // nom de la variable qu'attend un CLI qu'il n'appelle pas lui-même.
   if (config.githubToken) process.env.GH_TOKEN = config.githubToken;
 
-  if (!config.apiKey) config.apiKey = await keyFrom1Password();
-  if (!config.apiKey) {
+  // `--count-only` n'appelle rien : exiger une clé pour compter des caractères
+  // interdirait de mesurer depuis un poste sans 1Password, ou depuis la CI.
+  if (!config.apiKey && !config.countOnly) config.apiKey = await keyFrom1Password();
+  if (!config.apiKey && !config.countOnly) {
     // Cas nominal d'une PR venue d'un fork : GitHub n'y expose pas les secrets.
     // Rien à commenter, rien à faire échouer.
     console.log('Clé Ollama absente : review ignorée.');

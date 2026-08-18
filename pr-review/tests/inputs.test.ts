@@ -179,3 +179,66 @@ describe('resolveConfig · réglages du modèle', () => {
     expect(resolve({ INPUT_SEED: '7' }).seed).toBe(7);
   });
 });
+
+
+describe('le cran d’effort', () => {
+  const config = (env: Record<string, string> = {}) =>
+    resolveConfig({ argv: ['154'], env, warn: () => {} });
+
+  it('vaut « balanced » quand personne ne le règle', () => {
+    expect(config().effort).toBe('balanced');
+  });
+
+  it('accepte les trois crans, quelle que soit la casse', () => {
+    expect(config({ INPUT_EFFORT: 'full' }).effort).toBe('full');
+    expect(config({ INPUT_EFFORT: 'LEAN' }).effort).toBe('lean');
+  });
+
+  it('prévient et garde le défaut sur un cran inconnu, plutôt que d’annuler la review', () => {
+    const warnings: string[] = [];
+    const resolved = resolveConfig({
+      argv: ['154'],
+      env: { INPUT_EFFORT: 'high' },
+      warn: (message) => warnings.push(message),
+    });
+    expect(resolved.effort).toBe('balanced');
+    expect(warnings[0]).toContain('effort');
+  });
+
+  it('resserre le budget des imports au cran lean', () => {
+    expect(config({ INPUT_EFFORT: 'lean' }).importsBudgetChars).toBe(120_000);
+    expect(config({ INPUT_EFFORT: 'balanced' }).importsBudgetChars).toBe(300_000);
+  });
+
+  /** Régler un cran ne doit pas rendre inopérant un budget écrit à la main. */
+  it('laisse un budget explicite l’emporter sur le cran', () => {
+    expect(
+      config({ INPUT_EFFORT: 'lean', 'INPUT_IMPORTS-BUDGET-CHARS': '50000' }).importsBudgetChars,
+    ).toBe(50_000);
+  });
+
+  it('lit la liste de passes imposées', () => {
+    expect(config({ INPUT_PASSES: 'regression\ndata' }).passes).toEqual(['regression', 'data']);
+    expect(config().passes).toEqual([]);
+  });
+});
+
+describe('les drapeaux de mesure', () => {
+  const parse = (argv: string[]) => resolveConfig({ argv, env: {}, warn: () => {} });
+
+  /** Compter ne doit jamais poster : une faute de frappe irait commenter une PR. */
+  it('« --count-only » implique « --dry-run »', () => {
+    const resolved = parse(['154', '--count-only']);
+    expect(resolved.countOnly).toBe(true);
+    expect(resolved.dryRun).toBe(true);
+  });
+
+  it('nomme le bras mesuré', () => {
+    expect(parse(['154', '--variant', 'lean']).variant).toBe('lean');
+    expect(parse(['154']).variant).toBe('default');
+  });
+
+  it('refuse « --variant » sans nom', () => {
+    expect(() => parse(['154', '--variant'])).toThrow(UsageError);
+  });
+});
