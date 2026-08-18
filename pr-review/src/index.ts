@@ -25,7 +25,7 @@ import { assembleContext, type AssembledContext } from './context';
 import { run } from './exec';
 import { currentHeadSha, fetchPrDiff, fetchPrMeta, postComment, resolveRepo, type PrMeta } from './gh';
 import { compileMatcher } from './globs';
-import { resolveConfig, UsageError, type Config } from './inputs';
+import { isEnabled, resolveConfig, UsageError, type Config } from './inputs';
 import { chat, OllamaError, type ChatResult } from './ollama';
 import { buildUserPrompt, type DoctrineFile, type PromptOptions } from './prompt';
 import {
@@ -329,6 +329,13 @@ function knownPaths(meta: PrMeta, context: AssembledContext): Set<string> {
 }
 
 async function main(): Promise<void> {
+  // Avant tout le reste : ni PR lue, ni clé cherchée, ni token dépensé. Le job
+  // reste vert, et le log dit pourquoi il n'y aura pas de commentaire.
+  if (!isEnabled(process.env)) {
+    console.log('Review désactivée (input « enable »).');
+    return;
+  }
+
   const config = resolveConfig({
     argv: process.argv.slice(2),
     env: process.env,

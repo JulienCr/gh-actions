@@ -4,6 +4,7 @@ import {
   ALWAYS_SKIPPED,
   DEFAULT_DOCTRINE,
   DEFAULTS,
+  isEnabled,
   readInput,
   resolveConfig,
   UsageError,
@@ -18,6 +19,28 @@ describe('readInput · convention du runner', () => {
     // deviennent des tirets bas, pas les traits d'union.
     expect(readInput({ 'INPUT_OLLAMA-API-KEY': ' k ' }, 'ollama-api-key')).toBe('k');
     expect(readInput({}, 'ollama-api-key')).toBe('');
+  });
+});
+
+describe('isEnabled · interrupteur', () => {
+  it('est allumé quand l’input est absent ou vide', () => {
+    // Le défaut compte plus que les autres : un dépôt qui branche l'action sans
+    // renseigner « enable » doit obtenir une review, pas un silence.
+    expect(isEnabled({})).toBe(true);
+    expect(isEnabled({ INPUT_ENABLE: '  ' })).toBe(true);
+    expect(isEnabled({ INPUT_ENABLE: 'true' })).toBe(true);
+  });
+
+  it('est éteint sur les quatre façons d’écrire « non »', () => {
+    for (const value of ['false', 'FALSE', '0', 'no', 'off']) {
+      expect(isEnabled({ INPUT_ENABLE: value })).toBe(false);
+    }
+  });
+
+  it('reste allumé sur une valeur qui ne veut rien dire', () => {
+    // Une faute de frappe ne doit pas éteindre en silence : le sens de la panne
+    // va vers la review qui tourne, pas vers la PR qu'on croit relue.
+    expect(isEnabled({ INPUT_ENABLE: 'faux' })).toBe(true);
   });
 });
 

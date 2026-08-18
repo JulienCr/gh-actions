@@ -431,6 +431,9 @@ function readNumber(env, name, fallback, warn, minimum = 1) {
 function readBoolean(env, name) {
   return /^(true|1|yes)$/i.test(readInput(env, name));
 }
+function isEnabled(env) {
+  return !/^(false|0|no|off)$/i.test(readInput(env, "enable"));
+}
 function readTemperature(env, warn) {
   const raw = readInput(env, "temperature");
   if (raw === "") return DEFAULTS.temperature;
@@ -1311,6 +1314,10 @@ function knownPaths(meta, context) {
   ]);
 }
 async function main() {
+  if (!isEnabled(process.env)) {
+    console.log("Review d\xE9sactiv\xE9e (input \xAB enable \xBB).");
+    return;
+  }
   const config = resolveConfig({
     argv: process.argv.slice(2),
     env: process.env,

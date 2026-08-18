@@ -193,6 +193,21 @@ function readBoolean(env: Env, name: string): boolean {
 }
 
 /**
+ * La review est-elle branchée ?
+ *
+ * Interrupteur du dépôt consommateur : `enable: false` la coupe sans rien
+ * démonter du workflow, le temps d'un quota épuisé ou d'une refonte. Absent vaut
+ * allumé, sinon un dépôt qui branche l'action sans lire la doc n'obtiendrait
+ * rien et croirait à une PR jugée irréprochable.
+ *
+ * Lu hors de `resolveConfig`, et appelé avant lui : une review éteinte ne doit
+ * pas exiger un numéro de PR, seule chose dont l'absence sort en 1.
+ */
+export function isEnabled(env: Env): boolean {
+  return !/^(false|0|no|off)$/i.test(readInput(env, 'enable'));
+}
+
+/**
  * Comme `readNumber`, mais zéro est une valeur, pas une erreur.
  *
  * `readNumber` refuse zéro parce qu'un plafond nul n'a pas de sens ; une

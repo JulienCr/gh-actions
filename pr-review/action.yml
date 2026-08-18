@@ -14,6 +14,14 @@ inputs:
     description: "Numéro de la PR à relire."
     required: true
 
+  enable:
+    description: >-
+      false : l'action sort tout de suite, sans lire la PR ni appeler le modèle.
+      Interrupteur pour couper la review — quota épuisé, refonte en cours — sans
+      démonter le workflow du dépôt. Le job reste vert.
+    required: false
+    default: 'true'
+
   ollama-api-key:
     description: >-
       Clé Ollama Cloud. Vide (PR venue d'un fork, secret non configuré) : la

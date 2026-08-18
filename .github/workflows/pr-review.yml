@@ -43,6 +43,9 @@ jobs:
       - uses: ./pr-review
         with:
           pr: ${{ github.event.pull_request.number || inputs.pr }}
+          # Éteint : le quota Ollama restant est gardé pour la prochaine version
+          # de l'action. Remettre `true` quand elle sera prête.
+          enable: false
           ollama-api-key: ${{ secrets.OLLAMA_API_KEY }}
           skip: |
             */dist/**

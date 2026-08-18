@@ -196,6 +196,7 @@ Seul `pr` est obligatoire.
 | Input | Défaut | |
 | --- | --- | --- |
 | `pr` | — | Numéro de la PR à relire. |
+| `enable` | `true` | `false` : l'action sort sans rien lire ni appeler. Coupe la review sans démonter le workflow. |
 | `ollama-api-key` | `''` | Clé Ollama Cloud. Vide : review ignorée sans bruit, job vert. |
 | `github-token` | `${{ github.token }}` | Jeton du CLI `gh`. Le jeton du job suffit, avec `pull-requests: write`. |
 | `model` | `glm-5.2:cloud` | Modèle Ollama Cloud. |
