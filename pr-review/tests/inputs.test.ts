@@ -89,9 +89,15 @@ describe('resolveConfig · précédence', () => {
   });
 
   it('prend la clé dans l’input, puis dans l’environnement', () => {
-    expect(resolve({ 'INPUT_OLLAMA-API-KEY': 'depuis-input' }).apiKey).toBe('depuis-input');
-    expect(resolve({ OLLAMA_API_KEY: 'depuis-env' }).apiKey).toBe('depuis-env');
-    expect(resolve().apiKey).toBe('');
+    expect(resolve({ 'INPUT_OLLAMA-API-KEY': 'depuis-input' }).keys.ollama).toBe('depuis-input');
+    expect(resolve({ OLLAMA_API_KEY: 'depuis-env' }).keys.ollama).toBe('depuis-env');
+    expect(resolve().keys.ollama).toBe('');
+  });
+
+  it('lit aussi les clés des autres providers, au même endroit', () => {
+    expect(resolve({ 'INPUT_DEEPSEEK-API-KEY': 'ds' }).keys.deepseek).toBe('ds');
+    expect(resolve({ DEEPSEEK_API_KEY: 'ds-env' }).keys.deepseek).toBe('ds-env');
+    expect(resolve({ 'INPUT_OPENAI-API-KEY': 'oa' }).keys.openai).toBe('oa');
   });
 });
 
@@ -150,19 +156,19 @@ describe('resolveConfig · nombres illisibles', () => {
 describe('resolveConfig · réglages du modèle', () => {
   it('demande le raisonnement maximum par défaut : une review vaut par ce qu’elle trouve', () => {
     const config = resolve();
-    expect(config.thinking).toBe('max');
+    expect(config.passConfigs.regression.thinking).toBe('max');
     expect(config.temperature).toBe(1);
     expect(config.seed).toBe(1);
   });
 
   it('laisse le dépôt choisir un autre niveau, y compris aucun', () => {
-    expect(resolve({ INPUT_THINKING: 'high' }).thinking).toBe('high');
-    expect(resolve({ INPUT_THINKING: 'off' }).thinking).toBe('off');
+    expect(resolve({ INPUT_THINKING: 'high' }).passConfigs.regression.thinking).toBe('high');
+    expect(resolve({ INPUT_THINKING: 'off' }).passConfigs.regression.thinking).toBe('off');
   });
 
   it('règle la fusion plus bas que les passes : elle trie, elle ne relit pas', () => {
-    expect(resolve().mergeThinking).toBe('high');
-    expect(resolve({ 'INPUT_MERGE-THINKING': 'max' }).mergeThinking).toBe('max');
+    expect(resolve().passConfigs.merge.thinking).toBe('high');
+    expect(resolve({ 'INPUT_MERGE-THINKING': 'max' }).passConfigs.merge.thinking).toBe('max');
   });
 
   it('prévient quand on redemande le décodage glouton, sans l’interdire', () => {
@@ -240,5 +246,114 @@ describe('les drapeaux de mesure', () => {
 
   it('refuse « --variant » sans nom', () => {
     expect(() => parse(['154', '--variant'])).toThrow(UsageError);
+  });
+});
+
+/**
+ * La règle de priorité de ce module, épinglée cas par cas :
+ *
+ *   `<passe>-*`  >  input global écrit à la main  >  mix recommandé  >  défaut
+ *
+ * Le mix passe après ce qui est écrit à la main, sinon un `model:` posé dans un
+ * workflow se ferait ignorer en silence le jour où une clé DeepSeek apparaît
+ * dans les secrets.
+ */
+describe('resolveConfig · la destination de chaque appel', () => {
+  it('laisse les quatre appels sur Ollama quand aucune clé DeepSeek n’existe', () => {
+    const config = resolve();
+    for (const target of Object.values(config.passConfigs)) {
+      expect(target.provider).toBe('ollama');
+      expect(target.model).toBe(DEFAULTS.model);
+    }
+  });
+
+  it('déplace doctrine, données et fusion dès qu’une clé DeepSeek est fournie', () => {
+    const config = resolve({ 'INPUT_DEEPSEEK-API-KEY': 'ds' });
+    expect(config.passConfigs.doctrine).toEqual({
+      provider: 'deepseek',
+      model: 'deepseek-v4-flash',
+      thinking: 'high',
+    });
+    expect(config.passConfigs.data.provider).toBe('deepseek');
+    expect(config.passConfigs.merge.thinking).toBe('low');
+  });
+
+  /** La passe dont la valeur de GLM-5.2 est observée ne bouge pas. */
+  it('laisse la régression là où elle est', () => {
+    const config = resolve({ 'INPUT_DEEPSEEK-API-KEY': 'ds' });
+    expect(config.passConfigs.regression).toEqual({
+      provider: 'ollama',
+      model: DEFAULTS.model,
+      thinking: 'max',
+    });
+  });
+
+  /**
+   * Doctrine et données doivent viser le MÊME couple, sinon elles ne peuvent
+   * pas se partager de cache et le principal levier du mix disparaît.
+   */
+  it('envoie doctrine et données à la même destination, qui est tout l’objet du mix', () => {
+    const config = resolve({ 'INPUT_DEEPSEEK-API-KEY': 'ds' });
+    expect(config.passConfigs.data.provider).toBe(config.passConfigs.doctrine.provider);
+    expect(config.passConfigs.data.model).toBe(config.passConfigs.doctrine.model);
+  });
+
+  it('n’écrase pas un modèle écrit à la main, même avec une clé DeepSeek', () => {
+    const config = resolve({ 'INPUT_DEEPSEEK-API-KEY': 'ds', INPUT_MODEL: 'qwen3-coder:cloud' });
+    for (const target of Object.values(config.passConfigs)) {
+      expect(target.provider).toBe('ollama');
+      expect(target.model).toBe('qwen3-coder:cloud');
+    }
+  });
+
+  it('laisse une passe désigner sa propre destination', () => {
+    const config = resolve({
+      'INPUT_DEEPSEEK-API-KEY': 'ds',
+      'INPUT_DATA-MODEL': 'deepseek-v4-pro',
+    });
+    expect(config.passConfigs.data.model).toBe('deepseek-v4-pro');
+    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4-flash');
+  });
+
+  /**
+   * Rediriger une passe ailleurs ne doit pas lui laisser le modèle du provider
+   * qu'elle vient de quitter : ce serait un 404, pas un compromis.
+   */
+  it('ne fait pas hériter le modèle du mix à une passe redirigée ailleurs', () => {
+    const config = resolve({
+      'INPUT_DEEPSEEK-API-KEY': 'ds',
+      'INPUT_DOCTRINE-PROVIDER': 'ollama',
+    });
+    expect(config.passConfigs.doctrine.provider).toBe('ollama');
+    expect(config.passConfigs.doctrine.model).toBe(DEFAULTS.model);
+  });
+
+  it('prévient sur un provider inconnu et garde celui d’avant', () => {
+    const warn = vi.fn();
+    const config = resolveConfig({
+      argv: ['42'],
+      env: { 'INPUT_DOCTRINE-PROVIDER': 'nawak' },
+      warn,
+    });
+    expect(config.passConfigs.doctrine.provider).toBe('ollama');
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Un `<passe>-thinking` explicite échappe au cran : deux mécanismes qui
+   * règlent la même valeur finiraient par se battre, et le perdant serait celui
+   * que quelqu'un a écrit.
+   */
+  it('laisse un niveau écrit pour une passe échapper au cran d’effort', () => {
+    const config = resolve({ INPUT_EFFORT: 'lean', 'INPUT_DOCTRINE-THINKING': 'max' });
+    expect(config.passConfigs.doctrine.thinking).toBe('max');
+  });
+
+  it('applique le cran au niveau global, comme avant', () => {
+    // « lean » retire deux crans à doctrine et un à données.
+    const config = resolve({ INPUT_EFFORT: 'lean', INPUT_THINKING: 'high' });
+    expect(config.passConfigs.doctrine.thinking).toBe('low');
+    expect(config.passConfigs.data.thinking).toBe('medium');
+    expect(config.passConfigs.regression.thinking).toBe('high');
   });
 });

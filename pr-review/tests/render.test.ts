@@ -83,11 +83,14 @@ describe('linkifyPaths', () => {
   });
 });
 
-const FOOTER = {
-  model: 'glm-5.2:cloud',
+const FOOTER: Footer = {
+  models: 'ollama/glm-5.2:cloud (régression fonctionnelle)',
   durationMs: 134_000,
-  promptTokens: 84_312,
-  evalTokens: 1204,
+  inputTokens: 84_312,
+  cachedInputTokens: 0,
+  outputTokens: 1204,
+  costUsd: 0,
+  costPartial: false,
   thinkingChars: 0,
   skipped: [],
   omitted: [],
@@ -104,7 +107,7 @@ describe('renderComment', () => {
     const comment = renderComment({ ...OPTIONS, review: '## Verdict\nok', footer: FOOTER });
     expect(comment.startsWith(MARKER)).toBe(true);
     expect(comment).toContain('## Aristarque — review automatique');
-    expect(comment).toContain('glm-5.2:cloud via Ollama Cloud');
+    expect(comment).toContain('ollama/glm-5.2:cloud (régression fonctionnelle)');
     expect(comment).toContain('2 min 14 s');
   });
 
@@ -200,7 +203,7 @@ describe('renderPartialComment', () => {
 
   it('pose quand même les liens et le pied de page', () => {
     expect(comment).toContain('/blob/abc123/src/lib/content.ts#L9');
-    expect(comment).toContain('glm-5.2:cloud via Ollama Cloud');
+    expect(comment).toContain('ollama/glm-5.2:cloud (régression fonctionnelle)');
     expect(comment).toContain('⚠ passe « doctrine du dépôt » non aboutie');
   });
 });

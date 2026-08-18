@@ -13,8 +13,10 @@
  * sens, sinon trois passes rendraient trois fois le plafond.
  */
 
+import type { AssembledContext } from './context';
 import type { PrFile, PrMeta } from './gh';
-import { buildPreamble, type PromptOptions } from './prompt';
+import type { ChatMessage } from './llm/types';
+import { buildPreamble, buildUserPrompt, type PromptOptions } from './prompt';
 
 /**
  * Le repère qui sépare le raisonnement des trouvailles.
@@ -341,16 +343,82 @@ export function selectPasses(input: SelectionInput, options: SelectOptions): Sel
   return { run, skipped };
 }
 
-export function buildPassSystemPrompt(
+/**
+ * Les messages d'une passe, dans l'ordre qui rend le cache possible.
+ *
+ * Trois messages et non deux, et l'objectif de la passe en DERNIER. Le prompt
+ * système portait auparavant le préambule **et** l'objectif : deux passes
+ * divergeaient donc dès leur premier octet, et les quatre-vingt-dix kilo-octets
+ * de contexte qui suivaient étaient repayés intégralement à chaque appel.
+ * Aucun cache de préfixe ne pouvait s'y accrocher.
+ *
+ * Ici le préambule est identique pour toutes les passes, le contexte aussi (au
+ * bloc des imports près, rendu en dernier), et seul le troisième message
+ * change. Le préfixe commun est donc aussi long que possible, ce qui est
+ * exactement ce qu'un cache de préfixe sait réutiliser.
+ *
+ * Le texte n'a pas bougé, seulement sa place. Une consigne posée APRÈS un long
+ * contexte est d'ailleurs plutôt mieux honorée qu'une consigne lue avant.
+ */
+export function buildPassMessages(
   pass: Pass,
   options: PromptOptions,
-  hasImports: boolean,
-): string {
-  return `${buildPreamble(options)}
+  meta: PrMeta,
+  seen: AssembledContext,
+): ChatMessage[] {
+  return [
+    { role: 'system', content: buildPreamble(options) },
+    { role: 'user', content: buildUserPrompt(meta, seen) },
+    // La consigne sur les doutes ne s'écrit que s'il y a bien une section de
+    // fichiers de contexte à lire : sinon elle désigne du vide.
+    { role: 'user', content: `${pass.objective}\n\n${passOutput(seen.imported.length > 0)}` },
+  ];
+}
 
-${pass.objective}
+export interface Sequenceable {
+  /** Deux appels qui partagent ce couple peuvent partager un cache. */
+  provider: string;
+  model: string;
+  /** Taille de l'entrée, en caractères. */
+  chars: number;
+  /**
+   * Enchaîner cet appel derrière un autre achète-t-il un préfixe en cache ?
+   *
+   * Faux chez Ollama, qui n'expose aucun cache : y sérialiser trois passes
+   * triplerait le mur du job en échange de rien. C'est ce drapeau qui garantit
+   * qu'un dépôt sans clé DeepSeek retrouve exactement le comportement d'avant.
+   */
+  cacheable: boolean;
+}
 
-${passOutput(hasImports)}`;
+/**
+ * Regroupe les appels par destination, et ordonne chaque groupe.
+ *
+ * Deux passes qui visent le même couple provider+modèle peuvent se partager le
+ * gros contexte, à deux conditions : que la seconde parte APRÈS la première,
+ * puisqu'un cache s'écrit à la fin de l'entrée qui l'a produit, et que son
+ * prompt commence par exactement les mêmes octets. D'où le tri par taille
+ * croissante : au cran `balanced`, « doctrine » ne reçoit pas les fichiers
+ * importés et « données » les reçoit, or ils sont rendus en dernier. Le prompt
+ * de doctrine est alors un préfixe strict de celui de données, et le passer en
+ * premier rend le second presque gratuit.
+ *
+ * Les groupes, eux, restent parallèles entre eux : ils ne partagent rien, et
+ * les sérialiser ne ferait qu'additionner leurs durées.
+ */
+export function groupForCache<T extends Sequenceable>(items: readonly T[]): T[][] {
+  const groups = new Map<string, T[]>();
+  for (const [index, item] of items.entries()) {
+    // Un appel qui n'a aucun cache à gagner reste seul dans son groupe, donc
+    // parallèle : l'index le rend unique sans lui donner de voisin.
+    const key = item.cacheable ? `${item.provider}/${item.model}` : `seul:${index}`;
+    const group = groups.get(key);
+    if (group) group.push(item);
+    else groups.set(key, [item]);
+  }
+  // Le tri est stable : deux entrées de même taille gardent l'ordre des passes,
+  // qui est lui-même déterministe. Rien ici ne doit dépendre d'une exécution.
+  return [...groups.values()].map((group) => [...group].sort((a, b) => a.chars - b.chars));
 }
 
 /**

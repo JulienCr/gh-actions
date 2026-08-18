@@ -5,7 +5,7 @@ par des tags `vX.Y.Z` plus un tag majeur mobile `vX`.
 
 | Action | Ce qu'elle fait |
 | --- | --- |
-| [`pr-review`](#pr-review) | **Aristarque** relit une pull request avec un modèle Ollama Cloud, en trois passes, et poste un commentaire de synthèse. |
+| [`pr-review`](#pr-review) | **Aristarque** relit une pull request en trois passes, chacune sur le modèle qui lui convient, puis poste un commentaire de synthèse. |
 
 ## pr-review
 
@@ -19,17 +19,19 @@ l'astérisque pour le doublon. C'est déjà « Bloquant », « À corriger » et
 ici la passe de fusion. Le mot a fini par désigner en français un critique sévère.
 
 La lecture est découpée en **trois passes indépendantes**, puis fusionnée : voir
-[Trois passes plutôt qu'une](#trois-passes-plutôt-quune).
+[Trois passes plutôt qu'une](#trois-passes-plutôt-quune). Chaque passe choisit son provider, son
+modèle et son niveau de raisonnement : voir [Le mix par passe](#le-mix-par-passe).
 
 **Elle ne fait jamais échouer le job.** Une review est un avis, pas un gate. Quota épuisé, panne
-d'Ollama, clé absente : c'est dit dans un commentaire quand c'est possible, et le job sort en 0.
+du provider, clé absente : c'est dit dans un commentaire quand c'est possible, et le job sort en 0.
 La seule chose qu'on refuse est le silence, qui laisserait une PR non relue passer pour une PR
 jugée irréprochable.
 
 ### Installation dans un dépôt
 
-Poser le secret `OLLAMA_API_KEY` (`gh secret set OLLAMA_API_KEY --repo <owner>/<repo>`), puis
-créer `.github/workflows/pr-review.yml` :
+Poser le secret `OLLAMA_API_KEY` (`gh secret set OLLAMA_API_KEY --repo <owner>/<repo>`), et
+tant qu'à faire `DEEPSEEK_API_KEY` (voir [Le mix par passe](#le-mix-par-passe)), puis créer
+`.github/workflows/pr-review.yml` :
 
 ```yaml
 name: Review IA des PR
@@ -113,6 +115,10 @@ jobs:
         with:
           pr: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
           ollama-api-key: ${{ secrets.OLLAMA_API_KEY }}
+          # Facultative, et c'est le meilleur rapport économie/effort de toute
+          # cette configuration : trois appels sur quatre quittent le quota
+          # Ollama. Voir « Le mix par passe ». Sans elle, rien ne change.
+          deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
           doctrine: |
             .github/copilot-instructions.md
             CLAUDE.md
@@ -198,12 +204,19 @@ Seul `pr` est obligatoire.
 | `pr` | — | Numéro de la PR à relire. |
 | `enable` | `true` | `false` : l'action sort sans rien lire ni appeler. Coupe la review sans démonter le workflow. |
 | `ollama-api-key` | `''` | Clé Ollama Cloud. Vide : review ignorée sans bruit, job vert. |
+| `deepseek-api-key` | `''` | Clé DeepSeek. **La fournir suffit à activer le [mix par passe](#le-mix-par-passe).** Vide : tout reste sur Ollama, comme avant. |
+| `openai-api-key` | `''` | Clé du provider `openai` générique. Inutile sans `openai-base-url`. |
+| `openai-base-url` | `''` | Base d'un endpoint OpenAI-compatible quelconque (Fireworks, Z.ai, OpenRouter…). |
 | `github-token` | `${{ github.token }}` | Jeton du CLI `gh`. Le jeton du job suffit, avec `pull-requests: write`. |
-| `model` | `glm-5.2:cloud` | Modèle Ollama Cloud. |
+| `provider` | `ollama` | Provider des passes qui n'en désignent pas d'autre : `ollama`, `deepseek`, `openai`. |
+| `model` | `glm-5.2:cloud` | Modèle du provider global. ⚠️ L'écrire **désactive le mix** : voir ci-dessous. |
+| `<passe>-provider` | `''` | Provider d'une passe : `regression`, `doctrine`, `data`, `merge`. |
+| `<passe>-model` | `''` | Modèle d'une passe. |
+| `<passe>-thinking` | `''` | Raisonnement d'une passe. Écrit ici, il **échappe au cran** d'`effort`. |
 | `effort` | `balanced` | Ampleur des coupes dans ce qui est envoyé : `full`, `balanced`, `lean`. Voir ci-dessous. |
 | `passes` | `''` | Passes à lancer (`regression`, `doctrine`, `data`), une par ligne. Vide : `effort` décide. |
 | `thinking` | `max` | Effort de raisonnement des trois passes : `low`, `medium`, `high`, `max`, `off`. Un modèle qui refuse est relancé sans. |
-| `merge-thinking` | `high` | Idem pour la fusion, qui trie sans avoir le code sous les yeux. |
+| `merge-thinking` | `high` | Idem pour la fusion, qui trie sans avoir le code sous les yeux. `low` quand le mix est actif. |
 | `temperature` | `1` | **Ne pas mettre 0** : voir ci-dessous. |
 | `seed` | `1` | Graine, pour que deux lectures du même diff se ressemblent. `off` rend sa variance au modèle. |
 | `doctrine` | voir ci-dessous | Fichiers de conventions injectés dans le prompt, un chemin par ligne. |
@@ -216,6 +229,84 @@ Seul `pr` est obligatoire.
 | `imports-budget-chars` | `300000` | Plafond des fichiers **importés**, joints en contexte. `0` : aucun. `120000` au cran `lean`. |
 | `timeout-minutes` | `15` | Délai d'**une** requête. La review en fait quatre ; voir le `timeout-minutes` du job. |
 | `dry-run` | `false` | `true` : la review part dans les logs, rien n'est posté. |
+
+### Le mix par passe
+
+Les quatre appels d'une review ne demandent pas le même modèle. « Régression fonctionnelle » trace
+des appelants et des chemins d'erreur : c'est une recherche, et la valeur de GLM-5.2 y est observée
+sur de vraies PR. « Doctrine du dépôt » applique des règles écrites qu'elle a sous les yeux. La
+fusion trie une trentaine de puces **sans avoir le code**. Payer les quatre au même tarif revient à
+payer trois fois pour une profondeur dont une seule se sert.
+
+Poser le secret `DEEPSEEK_API_KEY` et le passer en `deepseek-api-key` suffit :
+
+| Appel | Provider | Modèle | `thinking` |
+| --- | --- | --- | --- |
+| régression fonctionnelle | `ollama` | `glm-5.2:cloud` | `max` |
+| doctrine du dépôt | `deepseek` | `deepseek-v4-flash` | `high` |
+| données et accès | `deepseek` | `deepseek-v4-flash` | `high` |
+| fusion | `deepseek` | `deepseek-v4-flash` | `low` |
+
+Sans cette clé, **rien ne change** : les quatre appels restent sur le provider global, en parallèle,
+exactement comme avant.
+
+#### Le cache de préfixe, qui est le vrai levier
+
+« Doctrine » et « données » visent volontairement le **même couple provider + modèle**. DeepSeek
+cache automatiquement les préfixes d'entrée sur disque et facture la part rejouée **trente et une
+fois moins cher** (0,014 $/M contre 0,44 $/M). Deux conditions pour en profiter, et l'action les
+tient toutes les deux :
+
+1. **Le préfixe doit être identique octet pour octet.** Le prompt système ne porte plus que le
+   préambule commun ; l'objectif de la passe est passé en dernier message. Les fichiers importés
+   sont rendus en fin de contexte, si bien que le prompt de « doctrine », qui ne les reçoit pas au
+   cran `balanced`, est un préfixe **strict** de celui de « données ». Un test unitaire épingle
+   cette propriété, sans appeler personne.
+2. **Le second appel doit partir après le premier**, un cache s'écrivant à la fin de l'entrée qui
+   l'a produit. Les passes qui partagent une destination **s'enchaînent** donc, la plus courte
+   d'abord ; les destinations différentes restent parallèles. Le mur du job ne bouge pas en
+   pratique : la régression, seule sur Ollama, reste la plus lente.
+
+`--count-only` mesure le préfixe réellement partagé et prévient s'il s'effondre :
+
+```
+« doctrine du dépôt » puis « données et accès » : même destination,
+donc lancées à la suite pour que la seconde rejoue le préfixe de la première en cache.
+préfixe commun : 487 202 caractères, ~139 201 tokens réutilisables.
+```
+
+#### Ce que ça change sur la facture
+
+Sur une PR de 17 fichiers de ce dépôt, ~140 000 tokens d'entrée par passe :
+
+| | avant | avec le mix |
+| --- | --- | --- |
+| appels sur le quota Ollama | 4 | **1** |
+| tokens d'entrée sur Ollama | ~430 000 | **~147 000** |
+| ajouté chez DeepSeek | 0 | ~0,07 $ d'entrée, dont ~139 000 tokens en cache, plus la sortie |
+
+La ressource rare était le quota Ollama : il est divisé par trois. Ce qui le remplace se compte en
+centimes, et le pied de page du commentaire le rapporte à chaque review.
+
+#### Régler autrement
+
+- **Une passe seulement** : `data-model: deepseek-v4-pro` est la première escalade prévue si le
+  recall de « données et accès » baisse sur de vraies PR. ⚠️ Cela la sépare de « doctrine », qui
+  perd alors leur cache commun.
+- **Un autre endpoint** : `provider: openai` avec `openai-base-url` et `openai-api-key` vise
+  n'importe quelle API OpenAI-compatible, sans changer le reste.
+- **Tout garder sur Ollama** : ne pas fournir de clé DeepSeek, ou écrire `model:` à la main. ⚠️
+  Écrire `model:` désactive le mix pour les quatre appels : envoyer un modèle Ollama à DeepSeek
+  produirait un 404, pas un compromis. Pour n'en déplacer qu'une, `<passe>-model`.
+- **Le raisonnement** : un `<passe>-thinking` écrit à la main échappe au cran d'`effort`, pour que
+  deux mécanismes ne se disputent pas la même valeur.
+
+Une passe dont le provider n'a pas de clé retombe sur le provider global, avec un avertissement.
+Si celui-ci n'en a pas non plus, la passe n'est pas lancée et le pied de page le déclare : le job
+reste vert dans tous les cas.
+
+⚠️ **`seed` n'est pas transmis à DeepSeek**, qui ne le documente pas : ces passes varient d'une
+exécution à l'autre. L'action le dit une fois dans le journal.
 
 ### Le cran d'effort
 
@@ -274,22 +365,31 @@ pr-review 154 --count-only
 ```
 
 ```
-  appel                             système        user       total    ≈ tokens
-  passe régression fonctionnelle      8 207     139 316     147 523     ~42 149
-  passe doctrine du dépôt             7 916     139 316     147 232     ~42 066
-  passe données et accès              8 091     139 316     147 407     ~42 116
-  ──────────────────────────────────────────────────────────────────────────
-  total entrée                                              442 162    ~126 332
-  dont : diff 23 % · fichiers touchés 69 % · imports 0 % · système 6 % · reste 2 %
+  appel                           destination                 consignes    contexte       total    ≈ tokens      ≈ entrée
+  passe régression fonctionnelle  ollama/glm-5.2:cloud            8 208     505 856     514 064    ~146 875             —
+  passe doctrine du dépôt         deepseek/deepseek-v4-flash      7 828     480 278     488 106    ~139 459     ~0,0614 $
+  passe données et accès          deepseek/deepseek-v4-flash      8 092     505 856     513 948    ~146 842     ~0,0646 $
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  total entrée                                                                        1 516 118    ~433 177     ~0,1260 $
+  dont : diff 37 % · fichiers touchés 55 % · imports 5 % · système 2 % · reste 1 %
 ```
 
 La ventilation est ce qui dit où couper, et elle ne se devine pas : sur ce dépôt le diff pèse
-entre 10 et 33 % de l'entrée selon la PR, et les fichiers importés entre 0 et 11 %. Les tokens
+entre 10 et 37 % de l'entrée selon la PR, et les fichiers importés entre 0 et 11 %. Les tokens
 sont estimés à partir des caractères ; les caractères, eux, sont exacts.
+
+Deux colonnes tiennent des promesses limitées, et le disent. « consignes » regroupe le préambule
+commun **et** l'objectif de la passe, où que le message les porte. « ≈ entrée » ne chiffre que
+l'entrée, au tarif plein et sans cache : la sortie n'est pas devinable avant l'appel, et le cache
+ne se constate qu'après. Un tiret veut dire que le tarif du modèle n'est pas connu, ce qui est le
+cas d'Ollama Cloud, vendu au quota et non au token.
 
 Une review dont au moins une passe aboutit imprime aussi une ligne `::stats::{…}` en JSON,
 greppable dans un journal de CI, qui porte les compteurs. `--count-only`, qui n'appelle rien, n'en
-imprime pas.
+imprime pas. Chaque appel y porte désormais son provider, son modèle, sa part d'entrée servie par
+le cache, son coût estimé et ses tokens de raisonnement quand le provider les expose. Les
+compteurs `promptTokens` et `evalTokens` s'y appellent maintenant `inputTokens` et `outputTokens` :
+un dépouillement écrit contre l'ancien nom est à reprendre.
 
 **Les trouvailles brutes n'y figurent qu'en local**, sous `--dry-run`. La passe « données et
 accès » cherche des secrets : une trouvaille qui en cite un le recopierait dans le journal d'un
@@ -309,13 +409,17 @@ et huit tours de lecture, l'addition passe 400 000 tokens là où l'envoi glouto
 Plus le relecteur travaille bien, plus il coûte.
 
 Or Ollama Cloud ne sert pas de cache de prompt ([#15600](https://github.com/ollama/ollama/issues/15600),
-[#16714](https://github.com/ollama/ollama/issues/16714)). C'est la même raison qui tue le raccourci
-symétrique : faire partager aux trois passes un préfixe identique ne leur ferait rien repasser. Et
-un LSP n'y changerait rien non plus, puisqu'il rétrécit les réponses des outils, pas le socle
-renvoyé à chaque tour.
+[#16714](https://github.com/ollama/ollama/issues/16714)). Un LSP n'y changerait rien non plus,
+puisqu'il rétrécit les réponses des outils, pas le socle renvoyé à chaque tour.
 
-À rouvrir le jour où ce cache existe. La mesure tient en deux requêtes identiques dont on compare
-le `prompt_eval_duration`.
+Le raccourci symétrique, lui, a fini par exister : chez un provider qui cache les préfixes, faire
+partager aux passes un préfixe identique **fait** rejouer le socle à un trente-et-unième du tarif.
+C'est ce que fait [le mix par passe](#le-mix-par-passe) pour « doctrine » et « données ». Une review
+agentique reste hors de portée pour autant : elle renverrait un socle qui **grossit** à chaque tour,
+là où deux passes partagent un socle figé. Le cache amortit la répétition, pas l'accumulation.
+
+À rouvrir le jour où le mode agentique tournera chez un provider dont le cache couvre aussi les
+tours intermédiaires.
 
 ### Pourquoi la température n'est pas à zéro
 
@@ -334,8 +438,7 @@ La review tenait en un seul appel : la doctrine du dépôt, six axes de recherch
 rédaction et le gabarit de sortie, le tout pendant que le modèle lit quatre-vingt-dix kilo-octets
 de code. Les axes cités en dernier étaient ceux qu'il honorait le moins.
 
-Trois lectures indépendantes tournent donc en parallèle, sur le même contexte, avec un seul
-objectif chacune :
+Trois lectures indépendantes tournent donc sur le même contexte, avec un seul objectif chacune :
 
 1. **Régression fonctionnelle** : côté appelant, chemins d'erreur, entrées limites, état et
    ordonnancement, ce que le changement a oublié.
@@ -347,9 +450,10 @@ Une quatrième requête les fusionne : elle déduplique, arbitre les sévérité
 dit : son travail est de trier, pas de relire, et un modèle qui complète de mémoire une trouvaille
 trop courte l'invente.
 
-Ce que ça coûte : le contexte part trois fois. Ce que ça évite : un axe expédié parce que deux
-autres tenaient la tête du modèle. Les passes étant parallèles, le mur du job vaut « la plus lente
-plus la fusion », pas leur somme, d'où le `timeout-minutes: 40` de l'exemple.
+Ce que ça coûte : le contexte part trois fois, et une fois seulement là où le cache de préfixe le
+rejoue (voir [Le mix par passe](#le-mix-par-passe)). Ce que ça évite : un axe expédié parce que deux
+autres tenaient la tête du modèle. Le mur du job vaut « le groupe le plus lent plus la fusion », pas
+la somme des passes, d'où le `timeout-minutes: 40` de l'exemple.
 
 Une passe qui échoue n'annule pas les autres : deux lectures sur trois valent mieux que rien, et le
 pied de page du commentaire dit laquelle manque. Si c'est la fusion qui échoue, les trouvailles
@@ -437,9 +541,16 @@ Corollaire utile : une version passée sert de point de comparaison. `#v1.1.0` e
 relire en un seul appel et sans contexte importé ; la lancer sur la même PR, à graine égale, dit
 si un changement de prompt a rapporté des trouvailles ou seulement du bruit.
 
-La clé se prend dans `OLLAMA_API_KEY`, sinon dans 1Password à la référence `OLLAMA_API_KEY_REF`
-(défaut `op://Personal/Ollama/add more/api_key`), pour qu'elle ne traîne ni dans un `.env` ni
-dans l'historique du shell.
+Chaque clé se prend dans `<PROVIDER>_API_KEY`, sinon dans 1Password à la référence
+`<PROVIDER>_API_KEY_REF`, pour qu'elle ne traîne ni dans un `.env` ni dans l'historique du shell :
+
+| Provider | Variable | Référence 1Password par défaut |
+| --- | --- | --- |
+| `ollama` | `OLLAMA_API_KEY` | `op://Personal/Ollama/add more/api_key` |
+| `deepseek` | `DEEPSEEK_API_KEY` | `op://Personal/DeepSeek/api_key` |
+
+Seuls les providers que la review va réellement solliciter sont cherchés : faire clignoter
+1Password pour une clé dont aucune passe n'a besoin serait du bruit.
 
 Avant de régler quoi que ce soit : `gh pr checkout <n>`. Le diff vient de GitHub, le contenu
 intégral vient du disque ; sur une PR déjà mergée, le modèle reçoit le diff d'hier et les

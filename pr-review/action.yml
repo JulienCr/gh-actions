@@ -1,8 +1,8 @@
-name: 'Review IA de PR (Ollama)'
+name: 'Review IA de PR'
 description: >-
-  Relit une pull request avec un modèle Ollama Cloud en trois passes (régression,
-  doctrine du dépôt, données et accès), et poste un commentaire de synthèse. Ne
-  fait jamais échouer le job.
+  Relit une pull request en trois passes (régression, doctrine du dépôt, données
+  et accès), et poste un commentaire de synthèse. Chaque passe choisit son
+  provider et son modèle. Ne fait jamais échouer le job.
 author: 'Julien Cruau'
 
 branding:
@@ -29,15 +29,112 @@ inputs:
     required: false
     default: ''
 
+  deepseek-api-key:
+    description: >-
+      Clé DeepSeek. La fournir suffit à activer le mix recommandé : « doctrine »,
+      « données et accès » et la fusion passent sur deepseek-v4-flash, et seule
+      la régression reste sur le provider global. Ces deux premières partagent
+      alors un cache de préfixe, ce qui divise par trente le coût de leur
+      contexte commun. Vide : comportement inchangé, tout part sur Ollama.
+    required: false
+    default: ''
+
+  openai-api-key:
+    description: >-
+      Clé du provider « openai » générique, pour un endpoint OpenAI-compatible
+      quelconque (Fireworks, Z.ai, OpenRouter…). Inutile sans « openai-base-url ».
+    required: false
+    default: ''
+
+  openai-base-url:
+    description: >-
+      Base du provider « openai » générique, par exemple
+      https://api.fireworks.ai/inference/v1. Sans elle, ce provider est déclaré
+      inutilisable plutôt que de viser api.openai.com par accident.
+    required: false
+    default: ''
+
+  provider:
+    description: >-
+      Provider des passes qui n'en désignent pas d'autre : ollama, deepseek ou
+      openai. Un identifiant inconnu est signalé et ignoré.
+    required: false
+    default: 'ollama'
+
   github-token:
     description: "Jeton utilisé par le CLI gh. Le jeton du job suffit, avec pull-requests: write."
     required: false
     default: ${{ github.token }}
 
   model:
-    description: "Modèle Ollama Cloud."
+    description: >-
+      Modèle du provider global. Laissé vide : glm-5.2:cloud. ⚠️ L'écrire
+      DÉSACTIVE le mix recommandé pour les quatre appels : déplacer une passe
+      vers un autre provider en lui laissant le modèle d'un autre produirait un
+      404, pas un compromis. Pour n'en changer qu'une, utiliser
+      « <passe>-model ».
     required: false
-    default: 'glm-5.2:cloud'
+    default: ''
+
+  regression-provider:
+    description: "Provider de la passe « régression fonctionnelle ». Vide : celui du mix, sinon « provider »."
+    required: false
+    default: ''
+
+  regression-model:
+    description: "Modèle de la passe « régression fonctionnelle »."
+    required: false
+    default: ''
+
+  regression-thinking:
+    description: >-
+      Raisonnement de la passe « régression fonctionnelle ». Écrit ici, il
+      échappe au cran d'« effort ».
+    required: false
+    default: ''
+
+  doctrine-provider:
+    description: "Provider de la passe « doctrine du dépôt »."
+    required: false
+    default: ''
+
+  doctrine-model:
+    description: "Modèle de la passe « doctrine du dépôt »."
+    required: false
+    default: ''
+
+  doctrine-thinking:
+    description: "Raisonnement de la passe « doctrine du dépôt ». Échappe au cran d'« effort »."
+    required: false
+    default: ''
+
+  data-provider:
+    description: "Provider de la passe « données et accès »."
+    required: false
+    default: ''
+
+  data-model:
+    description: >-
+      Modèle de la passe « données et accès ». Première escalade prévue si le
+      recall y baisse sur de vraies PR : deepseek-v4-pro. ⚠️ Le changer sépare
+      cette passe de « doctrine », qui perd alors leur cache commun.
+    required: false
+    default: ''
+
+  data-thinking:
+    description: "Raisonnement de la passe « données et accès ». Échappe au cran d'« effort »."
+    required: false
+    default: ''
+
+  merge-provider:
+    description: "Provider de la fusion."
+    required: false
+    default: ''
+
+  merge-model:
+    description: "Modèle de la fusion, qui trie sans avoir le code sous les yeux."
+    required: false
+    default: ''
 
   effort:
     description: >-
@@ -67,20 +164,21 @@ inputs:
   thinking:
     description: >-
       Effort de raisonnement des trois passes de lecture : low, medium, high,
-      max, ou off. Ce que chaque modèle accepte lui appartient : un niveau refusé
-      retombe sur le raisonnement par défaut, un modèle qui n'en fait pas est
-      relancé sans. Dans les deux cas la review continue, et le log le dit.
+      max, ou off. Laissé vide : max. Ce que chaque modèle accepte lui
+      appartient : un niveau refusé retombe sur le raisonnement par défaut, un
+      modèle qui n'en fait pas est relancé sans. Dans les deux cas la review
+      continue, et le log le dit.
     required: false
-    default: 'max'
+    default: ''
 
   merge-thinking:
     description: >-
       Effort de raisonnement de la fusion, qui trie les trouvailles des trois
-      passes sans avoir le code sous les yeux. Plus bas que « thinking » à
-      dessein : c'est la fusion qui s'ajoute au mur du job, les passes tournant
-      en parallèle.
+      passes sans avoir le code sous les yeux. Laissé vide : high, ou low quand
+      le mix est actif. Plus bas que « thinking » à dessein : c'est la fusion
+      qui s'ajoute au mur du job.
     required: false
-    default: 'high'
+    default: ''
 
   temperature:
     description: >-
@@ -163,10 +261,13 @@ inputs:
 
   timeout-minutes:
     description: >-
-      Délai maximum d'UNE requête au modèle. La review en fait quatre : trois
-      passes en parallèle puis leur fusion, donc le mur du job vaut jusqu'à deux
-      fois cette valeur. Le timeout-minutes du job doit rester au-dessus, sinon
-      le commentaire d'échec n'a pas le temps d'être posté.
+      Délai maximum d'UNE requête au modèle. La review en fait quatre. Les
+      passes qui visent des providers différents tournent en parallèle ; celles
+      qui partagent un provider ET un modèle s'enchaînent, pour que la seconde
+      rejoue le préfixe de la première en cache. Le mur du job vaut donc
+      « le groupe le plus lent, plus la fusion ». Le timeout-minutes du job doit
+      rester au-dessus, sinon le commentaire d'échec n'a pas le temps d'être
+      posté.
     required: false
     default: '15'
 

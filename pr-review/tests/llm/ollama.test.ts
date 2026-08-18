@@ -7,7 +7,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { chat, OllamaError } from '../src/ollama';
+import { ollamaClient } from '../../src/llm/ollama';
+import { LlmError } from '../../src/llm/types';
 
 /**
  * La politique de reprise se teste contre un vrai serveur HTTP local plutôt que
@@ -29,6 +30,14 @@ let host: string;
 let queue: Scripted[] = [];
 let calls = 0;
 let lastBody: Record<string, unknown> = {};
+/**
+ * L'hôte visé par `call`.
+ *
+ * Une variable plutôt qu'`OLLAMA_HOST` depuis que la base est un paramètre du
+ * client : c'est l'appelant qui la résout (cf. `endpointFor` dans `index.ts`),
+ * et le client, lui, ne lit plus l'environnement.
+ */
+let baseUrl = '';
 
 beforeAll(async () => {
   server = createServer((req, res) => {
@@ -45,11 +54,10 @@ beforeAll(async () => {
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   host = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  process.env.OLLAMA_HOST = host;
+  baseUrl = host;
 });
 
 afterAll(async () => {
-  delete process.env.OLLAMA_HOST;
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
@@ -78,13 +86,12 @@ const ok = (content: string) =>
  * accusent alors le mauvais coupable.
  */
 async function withHost(url: string, body: () => Promise<void>): Promise<void> {
-  const previous = process.env.OLLAMA_HOST;
-  process.env.OLLAMA_HOST = url;
+  const previous = baseUrl;
+  baseUrl = url;
   try {
     await body();
   } finally {
-    if (previous === undefined) delete process.env.OLLAMA_HOST;
-    else process.env.OLLAMA_HOST = previous;
+    baseUrl = previous;
   }
 }
 
@@ -102,12 +109,15 @@ async function withServer(
   }
 }
 
-const call = (over: Partial<Parameters<typeof chat>[0]> = {}) =>
-  chat({
+const call = (over: Partial<Parameters<typeof ollamaClient>[0]> = {}) =>
+  ollamaClient({
     apiKey: 'faux',
+    baseUrl,
     model: 'glm-5.2:cloud',
-    system: 'sys',
-    user: 'usr',
+    messages: [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'usr' },
+    ],
     retryDelayMs: 1,
     ...over,
   });
@@ -169,8 +179,8 @@ describe('chat · requête', () => {
 
     expect(result.content).toBe('## Verdict\nrien à signaler');
     expect(result.thinkingChars).toBe('je réfléchis'.length);
-    expect(result.promptTokens).toBe(84817);
-    expect(result.evalTokens).toBe(31158);
+    expect(result.usage.inputTokens).toBe(84817);
+    expect(result.usage.outputTokens).toBe(31158);
   });
 
   it('rend le contenu, les compteurs de tokens et la taille du raisonnement', async () => {
@@ -185,8 +195,8 @@ describe('chat · requête', () => {
     });
     const result = await call();
     expect(result.content).toBe('## Verdict\nok');
-    expect(result.promptTokens).toBe(100);
-    expect(result.evalTokens).toBe(20);
+    expect(result.usage.inputTokens).toBe(100);
+    expect(result.usage.outputTokens).toBe(20);
     expect(result.thinkingChars).toBe(5);
   });
 });
@@ -227,7 +237,7 @@ describe('chat · modèle sans raisonnement', () => {
 
   it('ne rejoue pas un 400 qui ne parle pas de raisonnement', async () => {
     queue.push({ status: 400, body: '{"error":"prompt trop long"}' });
-    await expect(call({ think: 'max' })).rejects.toThrow(OllamaError);
+    await expect(call({ think: 'max' })).rejects.toThrow(LlmError);
     expect(calls).toBe(1);
   });
 
@@ -281,7 +291,7 @@ describe('chat · reprise', () => {
 
   it('abandonne après un second échec, sans troisième tentative', async () => {
     queue.push({ status: 503, body: 'ko' }, { status: 503, body: 'toujours ko' });
-    await expect(call()).rejects.toThrow(OllamaError);
+    await expect(call()).rejects.toThrow(LlmError);
     expect(calls).toBe(2);
   });
 });
@@ -409,7 +419,7 @@ describe('chat · dépassement de délai', () => {
       },
       async () => {
         await expect(
-          chat({ apiKey: 'faux', model: 'm', system: 's', user: 'u', timeoutMs: 60, retryDelayMs: 1 }),
+          call({ timeoutMs: 60 }),
         ).rejects.toThrow(/n'a pas répondu/);
       },
     );
@@ -428,7 +438,7 @@ describe('chat · dépassement de délai', () => {
       },
       async () => {
         await expect(
-          chat({ apiKey: 'faux', model: 'm', system: 's', user: 'u', timeoutMs: 60, retryDelayMs: 1 }),
+          call({ timeoutMs: 60 }),
         ).rejects.toThrow(/n'a pas répondu/);
       },
     );
@@ -446,7 +456,7 @@ describe('chat · dépassement de délai', () => {
       },
       async () => {
         await expect(
-          chat({ apiKey: 'faux', model: 'm', system: 's', user: 'u', timeoutMs: 60, retryDelayMs: 1 }),
+          call({ timeoutMs: 60 }),
         ).rejects.toThrow(/n'a pas répondu/);
       },
     );

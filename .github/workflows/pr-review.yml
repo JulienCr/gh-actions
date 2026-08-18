@@ -28,8 +28,9 @@ jobs:
   review:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    # Le mur vaut « passe la plus lente + fusion », soit jusqu'à deux fois le
-    # timeout-minutes de l'action, plus la marge du commentaire d'échec.
+    # Le mur vaut « groupe le plus lent + fusion ». Les passes qui partagent
+    # provider ET modèle s'enchaînent pour se passer un cache de préfixe ; les
+    # autres restent parallèles. Plus la marge du commentaire d'échec.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
@@ -43,9 +44,10 @@ jobs:
       - uses: ./pr-review
         with:
           pr: ${{ github.event.pull_request.number || inputs.pr }}
-          # Éteint : le quota Ollama restant est gardé pour la prochaine version
-          # de l'action. Remettre `true` quand elle sera prête.
-          enable: false
           ollama-api-key: ${{ secrets.OLLAMA_API_KEY }}
+          # Rallume ce que le quota avait éteint : trois appels sur quatre
+          # quittent Ollama, qui ne garde que la passe de régression. Le secret
+          # absent ramène simplement le comportement d'avant, et le job vert.
+          deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
           skip: |
             */dist/**

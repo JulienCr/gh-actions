@@ -25,21 +25,30 @@ import { assembleContext, contextFor, type AssembledContext, type WindowOptions 
 import { run } from './exec';
 import { currentHeadSha, fetchPrDiff, fetchPrMeta, postComment, resolveRepo, type PrMeta } from './gh';
 import { compileMatcher } from './globs';
-import { isEnabled, resolveConfig, UsageError, type Config } from './inputs';
-import { chat, OllamaError, type ChatResult } from './ollama';
-import { buildUserPrompt, type DoctrineFile, type PromptOptions } from './prompt';
+import {
+  isEnabled,
+  resolveConfig,
+  UsageError,
+  type Config,
+  type PassConfig,
+  type PassId,
+} from './inputs';
+import { estimateCost, PROVIDERS, LlmError, type ChatMessage, type ChatResult } from './llm';
+import { type DoctrineFile, type PromptOptions } from './prompt';
 import {
   buildMergeSystemPrompt,
   buildMergeUserPrompt,
-  buildPassSystemPrompt,
+  buildPassMessages,
+  groupForCache,
   PASS_HEADING,
   selectPasses,
-  stepDown,
   type Pass,
 } from './passes';
 import { extractReview, renderComment, renderFailureComment, renderPartialComment } from './render';
 import {
   describeCall,
+  describeTargets,
+  estimateTokens,
   renderBreakdown,
   statsLine,
   totals,
@@ -61,8 +70,14 @@ const WINDOW: Omit<WindowOptions, 'minLines'> = {
   maxCoverage: 0.7,
 };
 
-/** Emplacement 1Password de la clé, pour l'usage local. Surchargeable. */
-const DEFAULT_KEY_REF = 'op://Personal/Ollama/add more/api_key';
+/**
+ * Emplacements 1Password des clés, pour l'usage local. Surchargeables par
+ * `<PROVIDER>_API_KEY_REF`, par exemple `OLLAMA_API_KEY_REF`.
+ */
+const DEFAULT_KEY_REFS: Record<string, string> = {
+  ollama: 'op://Personal/Ollama/add more/api_key',
+  deepseek: 'op://Personal/DeepSeek/api_key',
+};
 
 /**
  * Racine du dépôt relu.
@@ -124,20 +139,21 @@ async function warnOnDetachedContext(headSha: string): Promise<boolean> {
 }
 
 /**
- * Récupère la clé Ollama depuis 1Password, en local seulement.
+ * Récupère la clé d'un provider depuis 1Password, en local seulement.
  *
  * Évite qu'elle traîne dans un `.env` ou dans l'historique du shell. En CI elle
  * vient de l'input, et `op` n'existe pas : on ne tente rien.
  */
-async function keyFrom1Password(): Promise<string> {
+async function keyFrom1Password(provider: string): Promise<string> {
   if (process.env.GITHUB_ACTIONS === 'true') return '';
-  const ref = process.env.OLLAMA_API_KEY_REF ?? DEFAULT_KEY_REF;
+  const ref = process.env[`${provider.toUpperCase()}_API_KEY_REF`] ?? DEFAULT_KEY_REFS[provider];
+  if (!ref) return '';
   try {
     // tr côté appelant serait inutile : c'est le wrapper WSL de op.exe qui rend
     // une fin de ligne Windows, et un trim suffit à l'absorber.
     return (await run('op', ['read', ref])).trim();
   } catch {
-    console.warn(`⚠ Clé absente et lecture de ${ref} impossible (1Password verrouillé ?).`);
+    console.warn(`⚠ Clé ${provider} absente et lecture de ${ref} impossible (1Password verrouillé ?).`);
     return '';
   }
 }
@@ -156,6 +172,44 @@ interface Run {
 }
 
 /**
+ * Où part un appel, et avec quelle clé.
+ *
+ * Le provider `openai` générique n'a pas de base par défaut : sans
+ * `openai-base-url`, il viserait api.openai.com par accident. Mieux vaut le
+ * déclarer inutilisable et le dire.
+ */
+function endpointFor(config: Config, target: PassConfig): { baseUrl: string; apiKey: string } | null {
+  const spec = PROVIDERS[target.provider];
+  if (!spec) return null;
+  const baseUrl =
+    target.provider === 'openai'
+      ? // Le provider générique n'existe que pour viser l'adresse qu'on lui
+        // donne. `openai-base-url` ne vaut QUE pour lui : appliquée à DeepSeek,
+        // elle enverrait la review chez le voisin sans que rien ne le dise.
+        config.openaiBaseUrl
+      : // `OLLAMA_HOST` est historique et documenté ; le motif vaut désormais
+        // pour tous les providers, ce qui donne un bac à sable local gratuit.
+        (process.env[`${target.provider.toUpperCase()}_HOST`] ?? spec.defaultBaseUrl).replace(
+          /\/$/,
+          '',
+        );
+  const apiKey = config.keys[target.provider] ?? '';
+  if (!baseUrl || !apiKey) return null;
+  return { baseUrl, apiKey };
+}
+
+/** Ce que pèsent les messages, consignes d'un côté et contexte de l'autre. */
+function sizes(messages: ChatMessage[]): { instructionChars: number; contextChars: number } {
+  // Le contexte est le PREMIER message user : c'est ce que produit
+  // `buildPassMessages`, et c'est le bloc que deux passes se partagent. Tout le
+  // reste (préambule système, objectif de la passe) est de la consigne.
+  const context = messages.find((message) => message.role === 'user');
+  const total = messages.reduce((sum, message) => sum + message.content.length, 0);
+  const contextChars = context?.content.length ?? 0;
+  return { instructionChars: total - contextChars, contextChars };
+}
+
+/**
  * Un appel au modèle, dont l'échec ne fait pas tomber les autres.
  *
  * Les trois passes sont indépendantes : deux passes sur trois valent mieux que
@@ -165,95 +219,80 @@ interface Run {
 async function callModel(
   config: Config,
   run: Run,
-  args: { id: string; system: string; user: string; think: string; label: string },
+  args: { id: string; target: PassConfig; messages: ChatMessage[]; label: string },
 ): Promise<ChatResult | null> {
-  const sizes = { systemChars: args.system.length, userChars: args.user.length };
+  const { target } = args;
+  const shape = {
+    id: args.id,
+    label: args.label,
+    provider: target.provider,
+    model: target.model,
+    think: target.thinking,
+    ...sizes(args.messages),
+  };
+
+  const endpoint = endpointFor(config, target);
   let result: ChatResult;
   try {
-    result = await chat({
-      apiKey: config.apiKey,
-      model: config.model,
-      system: args.system,
-      user: args.user,
-      think: args.think,
+    if (endpoint === null) {
+      // Ne devrait pas arriver : `usableTargets` a déjà écarté ces passes. Le
+      // test reste, parce qu'un chemin qui appellerait sans clé partirait en
+      // 401 après avoir envoyé quatre-vingt-dix kilo-octets.
+      throw new LlmError(`aucun endpoint utilisable pour « ${target.provider} »`);
+    }
+    result = await PROVIDERS[target.provider]!.client({
+      apiKey: endpoint.apiKey,
+      baseUrl: endpoint.baseUrl,
+      model: target.model,
+      messages: args.messages,
+      think: target.thinking,
       temperature: config.temperature,
       seed: config.seed,
       timeoutMs: config.timeoutMs,
       onRetry: (reason) => console.warn(`⚠ [${args.label}] ${reason} — nouvelle tentative dans 20 s.`),
       onDowngrade: (reason) =>
         console.warn(
-          `⚠ [${args.label}] ${config.model} n'a pas accepté « thinking: ${args.think} » (${reason}).\n` +
+          `⚠ [${args.label}] ${target.model} n'a pas accepté « thinking: ${target.thinking} » (${reason}).\n` +
             '  Relancé sans raisonnement explicite : ce sera moins fouillé.',
         ),
     });
   } catch (error) {
-    const reason = error instanceof OllamaError ? error.message : String(error);
+    const reason = error instanceof LlmError ? error.message : String(error);
     console.error(`✗ ${args.label} : ${reason}`);
     run.failures.push(reason);
     // Consigné quand même : l'entrée d'un appel raté a été envoyée, donc payée.
-    // Ollama ne rend pas ses compteurs sur un échec, d'où des tokens à zéro et
+    // Les compteurs ne sont pas rendus sur un échec, d'où des tokens à zéro et
     // des caractères, eux, connus.
     run.calls.push({
-      id: args.id,
-      label: args.label,
-      think: args.think,
-      ...sizes,
-      promptTokens: 0,
-      evalTokens: 0,
+      ...shape,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
       thinkingChars: 0,
       contentChars: 0,
       durationMs: 0,
+      costUsd: null,
       ok: false,
     });
     return null;
   }
 
   const stat: CallStat = {
-    id: args.id,
-    label: args.label,
-    think: args.think,
-    ...sizes,
-    promptTokens: result.promptTokens,
-    evalTokens: result.evalTokens,
+    ...shape,
+    inputTokens: result.usage.inputTokens,
+    cachedInputTokens: result.usage.cachedInputTokens,
+    outputTokens: result.usage.outputTokens,
+    reasoningTokens: result.usage.reasoningTokens,
     thinkingChars: result.thinkingChars,
     contentChars: result.content.length,
     durationMs: result.durationMs,
+    costUsd: estimateCost(target.provider, target.model, result.usage),
     ok: true,
   };
   run.calls.push(stat);
   console.log(`✓ ${describeCall(stat)}`);
   return result;
-}
-
-interface PassOutcome {
-  pass: Pass;
-  findings: string;
-}
-
-/**
- * Lance les trois passes en parallèle.
- *
- * En parallèle et non l'une après l'autre : elles ne dépendent pas les unes des
- * autres, et le mur du job devient la plus lente au lieu de leur somme. Le prix
- * est que le contexte part trois fois ; c'est le coût assumé du découpage, et il
- * est bien plus faible que celui d'un axe de recherche que le modèle expédie
- * parce que deux autres lui tiennent la tête.
- */
-async function runPasses(config: Config, run: Run, plan: PassPrompt[]): Promise<PassOutcome[]> {
-  const results = await Promise.all(
-    plan.map(async ({ pass, system, user, think }) => {
-      const result = await callModel(config, run, {
-        id: pass.id,
-        system,
-        user,
-        think,
-        label: `passe ${pass.label}`,
-      });
-      if (result === null) return null;
-      return { pass, findings: extractReview(result.content, PASS_HEADING) };
-    }),
-  );
-  return results.filter((result): result is PassOutcome => result !== null);
 }
 
 /**
@@ -265,11 +304,16 @@ async function runPasses(config: Config, run: Run, plan: PassPrompt[]): Promise<
  */
 interface PassPrompt {
   pass: Pass;
-  system: string;
-  user: string;
-  think: string;
+  target: PassConfig;
+  messages: ChatMessage[];
   /** Le contexte que CETTE passe reçoit, imports retirés le cas échéant. */
   seen: AssembledContext;
+  /** Pour `groupForCache` : deux appels de même destination partagent un cache. */
+  provider: string;
+  model: string;
+  /** Taille totale de l'entrée. Le plus court part en premier dans son groupe. */
+  chars: number;
+  cacheable: boolean;
 }
 
 /**
@@ -287,18 +331,68 @@ function planPasses(
   passes: readonly Pass[],
 ): PassPrompt[] {
   return passes.map((pass) => {
-    const wantsImports = pass.imports[config.effort];
-    const seen = contextFor(context, wantsImports);
+    const target = config.passConfigs[pass.id as PassId];
+    const seen = contextFor(context, pass.imports[config.effort]);
+    const messages = buildPassMessages(pass, promptOptions, meta, seen);
     return {
       pass,
-      // La consigne sur les doutes ne s'écrit que s'il y a bien une section de
-      // fichiers de contexte à lire : sinon elle désigne du vide.
-      system: buildPassSystemPrompt(pass, promptOptions, seen.imported.length > 0),
-      user: buildUserPrompt(meta, seen),
-      think: stepDown(config.thinking, pass.thinkingSteps[config.effort]),
+      target,
+      messages,
       seen,
+      provider: target.provider,
+      model: target.model,
+      chars: messages.reduce((sum, message) => sum + message.content.length, 0),
+      cacheable: PROVIDERS[target.provider]?.prefixCache ?? false,
     };
   });
+}
+
+interface PassOutcome {
+  pass: Pass;
+  findings: string;
+}
+
+/**
+ * Lance les passes, groupées par destination.
+ *
+ * Deux régimes, et c'est tout l'objet de la fonction :
+ *
+ * - **entre groupes, en parallèle.** Ils ne partagent rien, et les sérialiser
+ *   ne ferait qu'additionner leurs durées. Le mur du job reste celui du groupe
+ *   le plus lent, en pratique la régression.
+ * - **dans un groupe, en séquence.** Deux passes qui visent le même couple
+ *   provider+modèle partagent un préfixe de quatre-vingt-dix kilo-octets, mais
+ *   un cache s'écrit à la fin de l'entrée qui l'a produit : lancées ensemble,
+ *   elles le paient toutes les deux. La plus courte part en premier, et la
+ *   seconde rejoue son préfixe à un trente-et-unième du tarif.
+ *
+ * L'échec d'une passe ne fait toujours tomber qu'elle : dans un groupe
+ * séquentiel, il coûte à la suivante son cache, pas sa lecture.
+ */
+async function runPasses(config: Config, run: Run, plan: PassPrompt[]): Promise<PassOutcome[]> {
+  const groups = await Promise.all(
+    groupForCache(plan).map(async (group) => {
+      const outcomes: PassOutcome[] = [];
+      for (const { pass, target, messages } of group) {
+        const result = await callModel(config, run, {
+          id: pass.id,
+          target,
+          messages,
+          label: `passe ${pass.label}`,
+        });
+        if (result !== null) {
+          outcomes.push({ pass, findings: extractReview(result.content, PASS_HEADING) });
+        }
+      }
+      return outcomes;
+    }),
+  );
+  // Remis dans l'ordre des passes : le groupement est un détail d'exécution, et
+  // le commentaire ne doit pas changer d'ordre selon qui a été groupé avec qui.
+  const done = new Map(groups.flat().map((outcome) => [outcome.pass, outcome]));
+  return plan
+    .map(({ pass }) => done.get(pass))
+    .filter((outcome): outcome is PassOutcome => outcome !== undefined);
 }
 
 /**
@@ -318,19 +412,21 @@ function breakdown(plan: PassPrompt[]): InputBreakdown {
   // et rendrait la ventilation fausse précisément dans les réglages que
   // « --count-only » sert à comparer.
   const seen = first?.seen;
-  const system = first?.system.length ?? 0;
+  const measured = first ? sizes(first.messages) : { instructionChars: 0, contextChars: 0 };
   const diff = seen?.diff.length ?? 0;
   const touched = sum(seen?.files ?? []);
   const imported = sum(seen?.imported ?? []);
   return {
-    system,
+    // Le préambule commun ET l'objectif de la passe : les deux sont de la
+    // consigne, quel que soit le rôle du message qui les porte.
+    system: measured.instructionChars,
     diff,
     touched,
     imported,
-    // Ce qui reste du prompt user : titre, description, liste des fichiers et
-    // consignes. Déduit plutôt que recompté, pour que la somme des parts fasse
-    // toujours exactement le prompt envoyé.
-    meta: Math.max(0, (first?.user.length ?? 0) - diff - touched - imported),
+    // Ce qui reste du bloc de contexte : titre, description, liste des fichiers
+    // et bannières. Déduit plutôt que recompté, pour que la somme des parts
+    // fasse toujours exactement le prompt envoyé.
+    meta: Math.max(0, measured.contextChars - diff - touched - imported),
   };
 }
 
@@ -343,19 +439,34 @@ function breakdown(plan: PassPrompt[]): InputBreakdown {
  * pari, la composition d'une PR changeant d'un dépôt à l'autre.
  */
 function countOnly(config: Config, plan: PassPrompt[], context: AssembledContext): void {
-  const calls: CallStat[] = plan.map(({ pass, system, user, think }) => ({
-    id: pass.id,
-    label: `passe ${pass.label}`,
-    think,
-    systemChars: system.length,
-    userChars: user.length,
-    promptTokens: 0,
-    evalTokens: 0,
-    thinkingChars: 0,
-    contentChars: 0,
-    durationMs: 0,
-    ok: true,
-  }));
+  const calls: CallStat[] = plan.map(({ pass, target, messages }) => {
+    const measured = sizes(messages);
+    const inputTokens = estimateTokens(measured.instructionChars + measured.contextChars);
+    return {
+      id: pass.id,
+      label: `passe ${pass.label}`,
+      provider: target.provider,
+      model: target.model,
+      think: target.thinking,
+      ...measured,
+      inputTokens,
+      // Rien n'est encore parti : aucun cache ne peut être supposé, et le
+      // supposer flatterait précisément le chiffre qu'on veut vérifier.
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      thinkingChars: 0,
+      contentChars: 0,
+      durationMs: 0,
+      costUsd: estimateCost(target.provider, target.model, {
+        inputTokens,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+      }),
+      ok: true,
+    };
+  });
 
   console.log(
     `\nPR #${config.pr} · ${context.files.length} fichier(s) touchés · ` +
@@ -369,6 +480,96 @@ function countOnly(config: Config, plan: PassPrompt[], context: AssembledContext
     '\n  La fusion n\u2019est pas comptée : son entrée est faite des trouvailles des passes,\n' +
       '  qui n\u2019existent pas sans appel. Mesurée en production, elle pèse ~2 000 tokens.',
   );
+  for (const group of groupForCache(plan).filter((chain) => chain.length > 1)) {
+    console.log(
+      `\n  ${group.map(({ pass }) => `« ${pass.label} »`).join(' puis ')} : même destination,\n` +
+        '  donc lancées à la suite pour que la seconde rejoue le préfixe de la première en cache.',
+    );
+    console.log(`  ${describePrefix(group)}`);
+  }
+}
+
+/**
+ * Le préfixe que deux appels enchaînés se partagent réellement, en caractères.
+ *
+ * Vérifié sur les vrais prompts et pas seulement en test unitaire : le test
+ * épingle la règle, ce relevé épingle la PR du jour. Un fichier au contenu
+ * inattendu, une doctrine lue dans un ordre différent, et le préfixe tombe à
+ * quelques centaines de caractères sans que rien d'autre ne le signale.
+ * `--count-only` ne coûtant rien, autant qu'il le dise avant l'appel plutôt
+ * qu'après la facture.
+ */
+function describePrefix(group: PassPrompt[]): string {
+  const shared = group.reduce<string | null>((prefix, { messages }) => {
+    const whole = messages.map((message) => message.content).join('\n');
+    if (prefix === null) return whole;
+    let cut = 0;
+    while (cut < prefix.length && cut < whole.length && prefix[cut] === whole[cut]) cut += 1;
+    return prefix.slice(0, cut);
+  }, null);
+
+  const chars = shared?.length ?? 0;
+  const smallest = Math.min(...group.map(({ chars: total }) => total));
+  const share = Math.round((chars / smallest) * 100);
+  if (share < 90) {
+    return (
+      `⚠ préfixe commun : ${chars.toLocaleString('fr-FR')} caractères seulement, soit ${share} %\n` +
+      "    du plus court des deux prompts. Le cache ne portera que sur cette part : une consigne\n" +
+      '    accordée différemment selon la passe a dû diverger avant le contexte.'
+    );
+  }
+  return `préfixe commun : ${chars.toLocaleString('fr-FR')} caractères, ~${chars > 0 ? Math.round(chars / 3.5).toLocaleString('fr-FR') : 0} tokens réutilisables.`;
+}
+
+/**
+ * Écarte les passes dont la destination n'a pas de clé, plutôt que de les
+ * envoyer chercher un 401.
+ *
+ * Le repli est délibérément timide : on retombe sur le provider global, qui est
+ * celui que le dépôt utilisait avant, et jamais sur un autre provider configuré
+ * pour une autre passe. Sans clé nulle part, la passe n'est pas lancée et le
+ * pied de page le déclare : c'est une décision, pas une panne, et le job reste
+ * vert dans les deux cas.
+ */
+function resolveTarget(
+  config: Config,
+  id: PassId,
+  label: string,
+  warn: (message: string) => void,
+): PassConfig | null {
+  const target = config.passConfigs[id];
+  if (endpointFor(config, target) !== null) return target;
+
+  const fallback: PassConfig = { ...target, provider: config.provider, model: config.model };
+  if (endpointFor(config, fallback) === null) return null;
+  warn(
+    `« ${label} » : aucune clé pour « ${target.provider} ».\n` +
+      `  Repli sur ${fallback.provider}/${fallback.model}, qui en a une.`,
+  );
+  config.passConfigs[id] = fallback;
+  return fallback;
+}
+
+function usableTargets(
+  config: Config,
+  passes: readonly Pass[],
+  warn: (message: string) => void,
+): { run: Pass[]; skipped: { label: string; reason: string }[] } {
+  const runnable: Pass[] = [];
+  const skipped: { label: string; reason: string }[] = [];
+
+  for (const pass of passes) {
+    if (resolveTarget(config, pass.id as PassId, `passe ${pass.label}`, warn) !== null) {
+      runnable.push(pass);
+    } else {
+      skipped.push({
+        label: pass.label,
+        reason: `aucune clé pour « ${config.passConfigs[pass.id as PassId].provider} »`,
+      });
+    }
+  }
+
+  return { run: runnable, skipped };
 }
 
 async function review(config: Config): Promise<void> {
@@ -440,14 +641,38 @@ async function review(config: Config): Promise<void> {
       warn: (message) => console.warn(`⚠ ${message}`),
     },
   );
+  // Après `selectPasses` : une passe qu'aucune règle ne lance n'a pas besoin
+  // d'une clé, et exiger la clé d'abord ferait râler pour une passe qui ne
+  // partait pas. `--count-only` n'appelle rien et n'exige donc rien non plus.
+  if (!config.countOnly) {
+    const usable = usableTargets(config, selection.run, (message) => console.warn(`⚠ ${message}`));
+    selection.run = usable.run;
+    selection.skipped.push(...usable.skipped);
+  }
   const plan = planPasses(config, promptOptions, meta, context, selection.run);
 
   console.log(
     `Contexte : ${context.files.length} fichier(s) touchés, ${context.imported.length} importé(s), ` +
-      `${plan.length} passe(s) + fusion (${config.model}, effort ${config.effort}).`,
+      `${plan.length} passe(s) + fusion (effort ${config.effort}).`,
   );
+  for (const { pass, target } of plan) {
+    console.log(`· passe « ${pass.label} » → ${target.provider}/${target.model}, think=${target.thinking || 'défaut'}.`);
+  }
   for (const { label, reason } of selection.skipped) {
     console.log(`· passe « ${label} » non lancée : ${reason}.`);
+  }
+  // Une seule fois, et seulement quand ça change quelque chose : une graine
+  // posée dans le workflow laisserait croire à une review reproductible partout.
+  if (config.seed !== undefined) {
+    const ignoring = [...new Set(plan.map(({ target }) => target.provider))].filter(
+      (provider) => PROVIDERS[provider]?.supportsSeed === false,
+    );
+    if (ignoring.length > 0) {
+      console.warn(
+        `⚠ « seed » n'est pas transmis à ${ignoring.join(', ')} : ce paramètre n'y est pas\n` +
+          '  documenté. Ces passes varieront d\u2019une exécution à l\u2019autre.',
+      );
+    }
   }
 
   if (config.countOnly) {
@@ -455,30 +680,63 @@ async function review(config: Config): Promise<void> {
     return;
   }
 
-  const started = Date.now();
-  const run: Run = { calls: [], failures: [] };
-  const outcomes = await runPasses(config, run, plan);
-
-  if (outcomes.length === 0) {
-    const reason = run.failures[0] ?? 'raison inconnue';
-    console.error(`Échec de la review : aucune passe n'a abouti (${reason}).`);
+  if (plan.length === 0) {
+    // Aucune passe lançable, et ce n'est pas une panne : chacune a sa raison,
+    // et la taire laisserait une PR non relue passer pour une PR irréprochable.
+    const reason = selection.skipped.map(({ label, reason: why }) => `« ${label} » : ${why}`).join(' ; ');
+    console.error(`Échec de la review : aucune passe lançable (${reason}).`);
     if (!config.dryRun) await postComment(config.pr, renderFailureComment(reason, config.model));
     return;
   }
 
-  const merged = await callModel(config, run, {
-    id: 'merge',
-    // Les passes qui ont abouti, pas celles qui étaient prévues : annoncer un
-    // relecteur qui n'a rien rendu ferait chercher à la fusion un axe absent.
-    system: buildMergeSystemPrompt({
-      repo,
-      maxFindings: config.maxFindings,
-      passes: outcomes.map((outcome) => outcome.pass),
-    }),
-    user: buildMergeUserPrompt(meta, outcomes),
-    think: config.mergeThinking,
-    label: 'fusion',
-  });
+  const started = Date.now();
+  const run: Run = { calls: [], failures: [] };
+  const outcomes = await runPasses(config, run, plan);
+
+  const targets = [...new Set(plan.map(({ target }) => `${target.provider}/${target.model}`))];
+
+  if (outcomes.length === 0) {
+    const reason = run.failures[0] ?? 'raison inconnue';
+    console.error(`Échec de la review : aucune passe n'a abouti (${reason}).`);
+    if (!config.dryRun) {
+      await postComment(config.pr, renderFailureComment(reason, targets.join(', ') || config.model));
+    }
+    return;
+  }
+
+  const mergeTarget = resolveTarget(config, 'merge', 'fusion', (message) =>
+    console.warn(`⚠ ${message}`),
+  );
+  if (mergeTarget === null) {
+    // Les lectures sont déjà payées : elles seront rendues brutes plutôt que
+    // jetées parce que le tri n'a nulle part où tourner.
+    const reason = `aucune clé pour « ${config.passConfigs.merge.provider} »`;
+    console.error(`✗ fusion : ${reason}`);
+    run.failures.push(reason);
+  }
+
+  const merged =
+    mergeTarget === null
+      ? null
+      : await callModel(config, run, {
+          id: 'merge',
+          target: mergeTarget,
+          messages: [
+            {
+              role: 'system',
+              // Les passes qui ont abouti, pas celles qui étaient prévues :
+              // annoncer un relecteur qui n'a rien rendu ferait chercher à la
+              // fusion un axe absent.
+              content: buildMergeSystemPrompt({
+                repo,
+                maxFindings: config.maxFindings,
+                passes: outcomes.map((outcome) => outcome.pass),
+              }),
+            },
+            { role: 'user', content: buildMergeUserPrompt(meta, outcomes) },
+          ],
+          label: 'fusion',
+        });
 
   const server = (process.env.GITHUB_SERVER_URL ?? 'https://github.com').replace(/\/$/, '');
   const shared = {
@@ -488,7 +746,7 @@ async function review(config: Config): Promise<void> {
     // Le filtre garde son rôle contre les chemins que le modèle invente.
     knownPaths: knownPaths(meta, context),
     footer: {
-      model: config.model,
+      models: describeTargets(run.calls.filter((call) => call.ok)),
       durationMs: Date.now() - started,
       ...totals(run.calls),
       skipped: context.skipped,
@@ -578,12 +836,22 @@ async function main(): Promise<void> {
 
   // `--count-only` n'appelle rien : exiger une clé pour compter des caractères
   // interdirait de mesurer depuis un poste sans 1Password, ou depuis la CI.
-  if (!config.apiKey && !config.countOnly) config.apiKey = await keyFrom1Password();
-  if (!config.apiKey && !config.countOnly) {
-    // Cas nominal d'une PR venue d'un fork : GitHub n'y expose pas les secrets.
-    // Rien à commenter, rien à faire échouer.
-    console.log('Clé Ollama absente : review ignorée.');
-    return;
+  if (!config.countOnly) {
+    // Seulement les providers que cette review va réellement solliciter : aller
+    // chercher une clé DeepSeek dans 1Password alors qu'aucune passe n'y part
+    // ferait clignoter l'application pour rien.
+    const wanted = new Set(Object.values(config.passConfigs).map((target) => target.provider));
+    wanted.add(config.provider);
+    for (const provider of wanted) {
+      if (!config.keys[provider]) config.keys[provider] = await keyFrom1Password(provider);
+    }
+
+    if (Object.values(config.keys).every((key) => !key)) {
+      // Cas nominal d'une PR venue d'un fork : GitHub n'y expose pas les
+      // secrets. Rien à commenter, rien à faire échouer.
+      console.log('Aucune clé de provider : review ignorée.');
+      return;
+    }
   }
 
   await review(config);

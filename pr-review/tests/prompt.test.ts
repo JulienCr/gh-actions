@@ -124,20 +124,48 @@ describe('buildUserPrompt', () => {
 });
 
 
-describe('la phrase qui désigne les sections fournies', () => {
+/**
+ * La garde du cache de préfixe, et elle ne coûte pas un appel.
+ *
+ * Deux passes qui visent le même provider ne se partagent le gros contexte que
+ * si leurs prompts commencent par exactement les mêmes octets. Un seul mot
+ * accordé différemment selon ce que la passe reçoit suffit à faire diverger le
+ * préfixe avant les quatre-vingt-dix kilo-octets qu'on cherchait à réutiliser,
+ * et rien dans une review réussie ne le montrerait.
+ */
+describe('la stabilité du préfixe partagé', () => {
   const build = (imported: { path: string; numbered: string }[]) =>
-    buildUserPrompt(META, { diff: 'd', files: [], imported, skipped: [], omitted: [], windowed: [] });
+    buildUserPrompt(META, {
+      diff: 'd',
+      files: [{ path: 'src/a.ts', numbered: '1| a' }],
+      imported,
+      skipped: [],
+      omitted: [],
+      windowed: [],
+    });
 
-  it('annonce deux sections quand des fichiers de contexte suivent', () => {
-    expect(build([{ path: 'src/b.ts', numbered: '1| b' }])).toContain(
-      'absent from this section and from the next one',
-    );
+  it('désigne les sections fournies sans dépendre de leur nombre', () => {
+    const phrase = 'absent from the\nsections below was not given to you';
+    expect(build([])).toContain(phrase);
+    expect(build([{ path: 'src/b.ts', numbered: '1| b' }])).toContain(phrase);
   });
 
-  /** Sans section suivante, la phrase désignerait du vide. */
-  it('n’en annonce qu’une quand la passe ne reçoit pas d’imports', () => {
-    const prompt = build([]);
-    expect(prompt).toContain('absent from this section was not given to you');
-    expect(prompt).not.toContain('from the next one');
+  /**
+   * C'est ce qui rend le cran « balanced » compatible avec le cache : la passe
+   * « doctrine » n'y reçoit pas les imports, « données » les reçoit, et la
+   * première sert donc de préfixe à la seconde.
+   */
+  it('rend le prompt sans imports préfixe STRICT du prompt avec imports', () => {
+    const sans = build([]);
+    const avec = build([{ path: 'src/b.ts', numbered: '1| b' }]);
+    expect(avec.startsWith(sans)).toBe(true);
+    expect(avec.length).toBeGreaterThan(sans.length);
+  });
+
+  /** Même entrée, mêmes octets : sans quoi une relecture ne réutilise rien. */
+  it('rend deux fois le même texte pour le même contexte', () => {
+    expect(build([{ path: 'src/b.ts', numbered: '1| b' }])).toBe(
+      build([{ path: 'src/b.ts', numbered: '1| b' }]),
+    );
   });
 });
