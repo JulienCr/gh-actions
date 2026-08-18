@@ -192,7 +192,9 @@ function renderFooter(footer: Footer): string {
     // passerait sous silence sous-estimerait la review de tout son gros appel.
     bits.push(`${footer.costPartial ? 'au moins ' : '~'}${formatCost(footer.costUsd)}`);
   }
-  if (footer.thinkingChars > 0) {
+  // Au kilo-octet près, et pas en deçà : « 0 Ko de raisonnement » se lit comme
+  // une mesure alors que c'est un arrondi, et vaut moins que le silence.
+  if (footer.thinkingChars >= 1024) {
     bits.push(`${count(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
   }
   if (footer.imported > 0) {

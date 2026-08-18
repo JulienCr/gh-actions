@@ -268,3 +268,39 @@ describe('le pied de page déclare ce que le cran a retiré', () => {
     expect(comment).not.toContain('hors «');
   });
 });
+
+describe('le pied de page rapporte le cache et le coût', () => {
+  const footer = (over: Partial<Footer>) =>
+    renderComment({ ...OPTIONS, review: '## Verdict\nok', footer: { ...FOOTER, ...over } });
+
+  /** La seule mesure du levier : sans elle, un préfixe qui a divergé ne se voit pas. */
+  it('dit la part d’entrée servie par le cache', () => {
+    expect(footer({ cachedInputTokens: 141_694 })).toContain(
+      `dont ${(141_694).toLocaleString('fr-FR')} en cache`,
+    );
+  });
+
+  it('tait le cache quand il n’y en a pas eu', () => {
+    expect(footer({ cachedInputTokens: 0 })).not.toContain('en cache');
+  });
+
+  /**
+   * Un quota Ollama consommé n'est pas un appel gratuit : annoncer « ~ » sur un
+   * total dont une part n'est pas chiffrable sous-estimerait la review de tout
+   * son plus gros appel.
+   */
+  it('dit « au moins » quand une part du total n’a pas de tarif connu', () => {
+    expect(footer({ costUsd: 0.0697, costPartial: true })).toContain('au moins 0,0697 $');
+    expect(footer({ costUsd: 0.0697, costPartial: false })).toContain('~0,0697 $');
+  });
+
+  it('tait le coût quand rien n’est chiffrable', () => {
+    expect(footer({ costUsd: 0 })).not.toContain('$');
+  });
+
+  /** Un arrondi à zéro se lit comme une mesure : mieux vaut le silence. */
+  it('n’annonce pas « 0 Ko de raisonnement »', () => {
+    expect(footer({ thinkingChars: 19 })).not.toContain('Ko de raisonnement');
+    expect(footer({ thinkingChars: 40_960 })).toContain('40 Ko de raisonnement');
+  });
+});

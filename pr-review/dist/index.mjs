@@ -1679,7 +1679,7 @@ function renderFooter(footer) {
   if (footer.costUsd > 0) {
     bits.push(`${footer.costPartial ? "au moins " : "~"}${formatCost(footer.costUsd)}`);
   }
-  if (footer.thinkingChars > 0) {
+  if (footer.thinkingChars >= 1024) {
     bits.push(`${count2(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
   }
   if (footer.imported > 0) {
