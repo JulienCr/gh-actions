@@ -33,7 +33,33 @@ interface RawPrView {
   headRefOid: string;
   baseRefName: string;
   isDraft: boolean;
-  files: { path: string; additions: number; deletions: number; status?: string }[] | null;
+  files: { path: string; additions: number; deletions: number; changeType?: string }[] | null;
+}
+
+/**
+ * Traduit le `changeType` de l'API en statut de fichier.
+ *
+ * `gh pr view --json files` ne rend PAS de champ `status` : il rend
+ * `changeType`, en capitales (`ADDED`, `MODIFIED`, `DELETED`, `RENAMED`,
+ * `COPIED`, `CHANGED`). Lire `status` rendait donc `undefined` sur chaque
+ * fichier, et le repli faisait passer toute une PR pour « modified » :
+ * un fichier supprimé n'était écarté que parce que sa lecture ratait, et un
+ * fichier neuf ne se distinguait pas d'un fichier retouché.
+ *
+ * Le repli reste « modified », qui est le cas le plus prudent : on lit le
+ * contenu et on le donne au modèle. Un `gh` trop ancien dégrade, il n'échoue pas.
+ */
+export function statusOf(changeType: string | undefined): string {
+  switch (changeType?.toUpperCase()) {
+    case 'ADDED':
+      return 'added';
+    case 'DELETED':
+      return 'removed';
+    case 'RENAMED':
+      return 'renamed';
+    default:
+      return 'modified';
+  }
 }
 
 export async function fetchPrMeta(pr: number): Promise<PrMeta> {
@@ -56,7 +82,7 @@ export async function fetchPrMeta(pr: number): Promise<PrMeta> {
       path: file.path,
       additions: file.additions,
       deletions: file.deletions,
-      status: file.status ?? 'modified',
+      status: statusOf(file.changeType),
     })),
   };
 }
