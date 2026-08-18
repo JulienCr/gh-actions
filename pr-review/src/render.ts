@@ -115,6 +115,8 @@ export interface Footer {
   skipped: string[];
   /** Fichiers dont seul le diff a été envoyé, faute de place. */
   omitted: string[];
+  /** Fichiers fournis par extraits autour de leurs hunks, pas en entier. */
+  windowed: string[];
   /**
    * Nombre de fichiers joints parce qu'un fichier touché les importe.
    *
@@ -161,6 +163,15 @@ function renderFooter(footer: Footer): string {
   if (footer.omitted.length > 0) {
     // Dit explicitement : une review partielle ne doit pas se lire comme une review complète.
     bits.push(`diff seul (sans contexte complet) pour ${footer.omitted.join(', ')}`);
+  }
+  if (footer.windowed.length > 0) {
+    // Au-delà de quatre noms la liste noie le pied de page, là où « omitted »
+    // reste rare et court.
+    bits.push(
+      footer.windowed.length > 4
+        ? `${footer.windowed.length} fichier(s) fournis par extraits autour des changements`
+        : `extraits autour des changements pour ${footer.windowed.join(', ')}`,
+    );
   }
   for (const { label, reason } of footer.skippedPasses) {
     bits.push(`passe « ${label} » non lancée (${reason})`);

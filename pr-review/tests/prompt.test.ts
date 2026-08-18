@@ -23,6 +23,7 @@ const CONTEXT: AssembledContext = {
   imported: [],
   skipped: ['pnpm-lock.yaml'],
   omitted: [],
+    windowed: [],
 };
 
 const preamble = (over: Partial<PromptOptions> = {}) =>
@@ -125,7 +126,7 @@ describe('buildUserPrompt', () => {
 
 describe('la phrase qui désigne les sections fournies', () => {
   const build = (imported: { path: string; numbered: string }[]) =>
-    buildUserPrompt(META, { diff: 'd', files: [], imported, skipped: [], omitted: [] });
+    buildUserPrompt(META, { diff: 'd', files: [], imported, skipped: [], omitted: [], windowed: [] });
 
   it('annonce deux sections quand des fichiers de contexte suivent', () => {
     expect(build([{ path: 'src/b.ts', numbered: '1| b' }])).toContain(

@@ -156,11 +156,66 @@ function foldAddedFiles(diff, folded) {
     return [...lines.slice(0, firstHunk), FOLDED_NOTE].join("\n");
   }).join("\n");
 }
-function numberLines(content) {
+function splitLines(content) {
   const lines = content.split("\n");
   if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+var gutter = (line, width) => `${String(line).padStart(width, " ")}| `;
+function numberLines(content) {
+  const lines = splitLines(content);
   const width = String(lines.length).length;
-  return lines.map((line, index) => `${String(index + 1).padStart(width, " ")}| ${line}`).join("\n");
+  return lines.map((line, index) => `${gutter(index + 1, width)}${line}`).join("\n");
+}
+var HUNK = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+function changedRanges(chunkBody) {
+  const ranges = [];
+  for (const line of chunkBody.split("\n")) {
+    const match = HUNK.exec(line);
+    if (!match) continue;
+    const start = Number(match[1]);
+    const count3 = match[2] === void 0 ? 1 : Number(match[2]);
+    const anchor = Math.max(1, start);
+    ranges.push(count3 === 0 ? { start: anchor, end: anchor } : { start: anchor, end: start + count3 - 1 });
+  }
+  return ranges;
+}
+function mergeRanges(ranges, joinGap, lastLine) {
+  const clamped = ranges.map((range) => ({ start: Math.max(1, range.start), end: Math.min(lastLine, range.end) })).filter((range) => range.start <= range.end).sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const range of clamped) {
+    const last = merged[merged.length - 1];
+    if (last && range.start - last.end - 1 <= joinGap) last.end = Math.max(last.end, range.end);
+    else merged.push({ ...range });
+  }
+  return merged;
+}
+var gap = (from, to) => `==== lines ${from}-${to} of this file were NOT given to you (${to - from + 1} lines) ====`;
+function windowFile(content, ranges, options) {
+  const lines = splitLines(content);
+  if (ranges.length === 0 || lines.length < options.minLines) return null;
+  const windows = mergeRanges(
+    [
+      { start: 1, end: options.head },
+      ...ranges.map((range) => ({ start: range.start - options.pad, end: range.end + options.pad }))
+    ],
+    options.joinGap,
+    lines.length
+  );
+  const kept = windows.reduce((total, window) => total + window.end - window.start + 1, 0);
+  if (kept > lines.length * options.maxCoverage) return null;
+  const width = String(lines.length).length;
+  const out = [];
+  let cursor = 1;
+  for (const window of windows) {
+    if (window.start > cursor) out.push(gap(cursor, window.start - 1));
+    for (let line = window.start; line <= window.end; line += 1) {
+      out.push(`${gutter(line, width)}${lines[line - 1]}`);
+    }
+    cursor = window.end + 1;
+  }
+  if (cursor <= lines.length) out.push(gap(cursor, lines.length));
+  return out.join("\n");
 }
 function assembleContext({
   rawDiff,
@@ -168,9 +223,11 @@ function assembleContext({
   readFile,
   exists,
   isSkipped,
-  budget
+  budget,
+  window = null
 }) {
   const { diff, skipped } = filterDiff(rawDiff, isSkipped);
+  const ranges = new Map(splitDiffByFile(diff).map((chunk) => [chunk.path, changedRanges(chunk.body)]));
   const sources = [];
   const omitted = [];
   let used = 0;
@@ -178,25 +235,35 @@ function assembleContext({
   for (const file of candidates2) {
     const content = readFile(file.path);
     if (content === null) continue;
-    if (content.length > budget.perFileChars || used + content.length > budget.totalChars) {
+    const extract = window ? windowFile(content, ranges.get(file.path) ?? [], window) : null;
+    const rendered = extract ?? numberLines(content);
+    if (rendered.length > budget.perFileChars || used + rendered.length > budget.totalChars) {
       omitted.push(file.path);
       continue;
     }
-    used += content.length;
-    sources.push({ path: file.path, content });
+    used += rendered.length;
+    sources.push({ path: file.path, content, rendered, windowed: extract !== null });
   }
   const order = new Map(prFiles.map((file, index) => [file.path, index]));
   sources.sort((a, b) => (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0));
   const files = sources.map((source) => ({
     path: source.path,
-    numbered: numberLines(source.content)
+    numbered: source.rendered,
+    ...source.windowed ? { windowed: true } : {}
   }));
   const imported = readImported({ sources, readFile, exists, isSkipped, budget });
   const supplied = new Set(sources.map((source) => source.path));
   const added = new Set(
     prFiles.filter((file) => file.status === "added" && supplied.has(file.path)).map((file) => file.path)
   );
-  return { diff: foldAddedFiles(diff, added), files, imported, skipped, omitted };
+  return {
+    diff: foldAddedFiles(diff, added),
+    files,
+    imported,
+    skipped,
+    omitted,
+    windowed: sources.filter((source) => source.windowed).map((source) => source.path)
+  };
 }
 function contextFor(context, imports) {
   return imports ? context : { ...context, imported: [] };
@@ -396,7 +463,7 @@ Your job is coverage, not curation. A finding you swallowed because you were not
 is a bug that ships. Report what you find and let its label carry your confidence: a doubt is
 reported as a doubt, never dropped.
 
-- **Read every file you were given in full**, not only the changed lines. The diff says what
+- **Read every excerpt you were given in full**, not only the changed lines. The diff says what
   moved; the code around it says what that broke. A reviewer who only reads \xAB + \xBB lines finds
   only typos.
 - **Do not soften a finding into silence.** When something looks wrong but you cannot prove it
@@ -463,14 +530,32 @@ ${context.diff}
 ## Full content of the changed files, after the change
 
 Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from ${context.imported.length > 0 ? "this section and from the next one" : "this section"} was not given to you: do not describe its contents.
-
+${renderGaps(context.windowed.length > 0)}
 ${contents}${renderImported(context.imported)}`;
 }
-var renderFile = (file) => `### ${file.path}
+var renderFile = (file) => {
+  const note = file.windowed ? " (excerpt: the lines around the changes only)" : "";
+  return `### ${file.path}${note}
 
 \`\`\`
 ${file.numbered}
 \`\`\``;
+};
+function renderGaps(hasWindows) {
+  if (!hasWindows) return "";
+  return `
+Large files are given as excerpts around the changed lines, not in full. A line reading
+
+    ==== lines 43-317 of this file were NOT given to you (275 lines) ====
+
+means those 275 lines exist in the file and were withheld from you. It does not mean the file
+stops there, and it does not mean the code you expected there is missing.
+
+**Never conclude from a gap.** \xAB I do not see the tenant filter \xBB is not a finding when the filter
+could be sitting in a gap: it is a \xAB doute \xBB, and you name the gap that would settle it. What you
+may conclude from a gap is nothing at all.
+`;
+}
 function renderImported(files) {
   if (files.length === 0) return "";
   return `
@@ -847,7 +932,15 @@ var DEFAULTS = {
    */
   effort: "balanced",
   /** Plafond des imports au cran « lean », où le contexte se resserre. */
-  leanImportsBudgetChars: 12e4
+  leanImportsBudgetChars: 12e4,
+  /**
+   * Taille à partir de laquelle un fichier part par extraits, selon le cran.
+   *
+   * `0` au cran `full` : aucun fenêtrage. Le seuil reste haut ailleurs, parce
+   * que fenêtrer un petit fichier économise quelques lignes et coûte une lecture
+   * morcelée, plus le risque qu'une conclusion soit tirée d'un trou.
+   */
+  windowMinLines: { full: 0, balanced: 250, lean: 120 }
 };
 var UsageError = class extends Error {
 };
@@ -960,6 +1053,13 @@ function resolveConfig({ argv, env, warn = () => {
     perFileChars: readNumber(env, "per-file-chars", DEFAULTS.perFileChars, warn),
     effort,
     passes: parseList(readInput(env, "passes")),
+    windowMinLines: readNumber(
+      env,
+      "window-min-lines",
+      DEFAULTS.windowMinLines[effort],
+      warn,
+      0
+    ),
     // Le cran pose le défaut, l'input explicite l'écrase : régler « effort » ne
     // doit pas rendre un budget écrit à la main silencieusement inopérant.
     importsBudgetChars: readNumber(
@@ -1226,6 +1326,11 @@ function renderFooter(footer) {
   if (footer.omitted.length > 0) {
     bits.push(`diff seul (sans contexte complet) pour ${footer.omitted.join(", ")}`);
   }
+  if (footer.windowed.length > 0) {
+    bits.push(
+      footer.windowed.length > 4 ? `${footer.windowed.length} fichier(s) fournis par extraits autour des changements` : `extraits autour des changements pour ${footer.windowed.join(", ")}`
+    );
+  }
   for (const { label, reason } of footer.skippedPasses) {
     bits.push(`passe \xAB ${label} \xBB non lanc\xE9e (${reason})`);
   }
@@ -1338,6 +1443,12 @@ function describeBlocks(blocks) {
 var statsLine = (payload) => `::stats::${JSON.stringify(payload)}`;
 
 // pr-review/src/index.ts
+var WINDOW = {
+  pad: 60,
+  head: 40,
+  joinGap: 25,
+  maxCoverage: 0.7
+};
 var DEFAULT_KEY_REF = "op://Personal/Ollama/add more/api_key";
 function repoRoot() {
   return process.env.GITHUB_WORKSPACE ?? process.cwd();
@@ -1366,7 +1477,9 @@ async function warnOnDetachedContext(headSha) {
       `\u26A0 Le d\xE9p\xF4t est sur ${head.slice(0, 8)}, la PR sur ${headSha.slice(0, 8)} : le contenu lu ne
   correspond pas au diff. Pour un r\xE9glage de prompt fid\xE8le, fais d'abord \xAB gh pr checkout \xBB.`
     );
+    return true;
   }
+  return false;
 }
 async function keyFrom1Password() {
   if (process.env.GITHUB_ACTIONS === "true") return "";
@@ -1511,12 +1624,16 @@ async function review(config) {
     fetchPrMeta(config.pr),
     fetchPrDiff(config.pr)
   ]);
-  await warnOnDetachedContext(meta.headSha);
+  const detached = await warnOnDetachedContext(meta.headSha);
   const isSkipped = compileMatcher(config.skip);
+  if (detached && config.windowMinLines > 0) {
+    console.warn("  Fen\xEAtrage d\xE9sactiv\xE9 pour cette ex\xE9cution : les plages du diff ne seraient pas fiables.");
+  }
   const context = assembleContext({
     rawDiff,
     prFiles: meta.files,
     isSkipped,
+    window: config.windowMinLines > 0 && !detached ? { ...WINDOW, minLines: config.windowMinLines } : null,
     budget: {
       totalChars: config.budgetChars,
       perFileChars: config.perFileChars,
@@ -1603,6 +1720,7 @@ async function review(config) {
       ...totals(run2.calls),
       skipped: context.skipped,
       omitted: context.omitted,
+      windowed: context.windowed,
       imported: context.imported.length,
       // Les passes lancées qui n'ont pas abouti : un incident. Distinct de
       // celles qu'on n'a pas lancées, qui est une décision.

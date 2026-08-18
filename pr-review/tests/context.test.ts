@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 
 import {
   assembleContext,
+  changedRanges,
   contextFor,
+  mergeRanges,
+  windowFile,
   filterDiff,
   foldAddedFiles,
   hasContent,
@@ -333,6 +336,7 @@ describe('le contexte tel qu’une passe le voit', () => {
     imported: [{ path: 'src/b.ts', numbered: '1| b' }],
     skipped: [],
     omitted: [],
+    windowed: [],
   };
 
   it('laisse tout passer à une passe qui se sert des imports', () => {
@@ -344,5 +348,172 @@ describe('le contexte tel qu’une passe le voit', () => {
     expect(seen.imported).toEqual([]);
     expect(seen.files).toBe(base.files);
     expect(seen.diff).toBe(base.diff);
+  });
+});
+
+
+const WINDOW = { pad: 2, head: 3, minLines: 10, joinGap: 2, maxCoverage: 0.9 };
+/** Un fichier dont chaque ligne dit son propre numéro : un décalage se voit. */
+const numbered = (count: number) =>
+  Array.from({ length: count }, (_, index) => `ligne ${index + 1}`).join('\n');
+
+describe('les plages touchées, lues sur les en-têtes @@', () => {
+  it('lit le côté droit, seul numéro que le modèle puisse citer', () => {
+    expect(changedRanges('@@ -10,7 +20,3 @@ ctx')).toEqual([{ start: 20, end: 22 }]);
+  });
+
+  it('sous-entend un compte de 1 quand le format l’omet', () => {
+    expect(changedRanges('@@ -10 +12 @@')).toEqual([{ start: 12, end: 12 }]);
+  });
+
+  /** Une suppression pure n'ajoute rien, mais il faut montrer OÙ ça a été retiré. */
+  it('ancre une fenêtre au point de suppression', () => {
+    expect(changedRanges('@@ -10,5 +12,0 @@')).toEqual([{ start: 12, end: 12 }]);
+  });
+
+  /**
+   * Dans un diff unifié, toute ligne de contenu porte un préfixe : un « @@ »
+   * écrit dans le code relu ne peut donc pas passer pour un en-tête.
+   */
+  it('ignore un « @@ » écrit dans le code', () => {
+    expect(changedRanges('@@ -1,2 +1,2 @@\n+const motif = "@@ -1 +1 @@";')).toEqual([
+      { start: 1, end: 2 },
+    ]);
+  });
+
+  it('rend une liste vide pour un bloc sans hunk', () => {
+    expect(changedRanges('diff --git a/x b/y\nsimilarity index 100%')).toEqual([]);
+  });
+
+  it('lit tous les hunks d’un même fichier', () => {
+    expect(changedRanges('@@ -1,2 +1,2 @@\n a\n@@ -50,1 +50,4 @@\n b')).toEqual([
+      { start: 1, end: 2 },
+      { start: 50, end: 53 },
+    ]);
+  });
+});
+
+describe('la fusion des plages', () => {
+  it('joint deux fenêtres qu’un trou trop court sépare', () => {
+    expect(mergeRanges([{ start: 1, end: 5 }, { start: 8, end: 10 }], 2, 100)).toEqual([
+      { start: 1, end: 10 },
+    ]);
+  });
+
+  it('laisse un vrai trou ouvert', () => {
+    expect(mergeRanges([{ start: 1, end: 5 }, { start: 40, end: 42 }], 2, 100)).toEqual([
+      { start: 1, end: 5 },
+      { start: 40, end: 42 },
+    ]);
+  });
+
+  it('ne sort jamais du fichier', () => {
+    expect(mergeRanges([{ start: -10, end: 3 }, { start: 95, end: 400 }], 1, 100)).toEqual([
+      { start: 1, end: 3 },
+      { start: 95, end: 100 },
+    ]);
+  });
+});
+
+describe('le fenêtrage d’un fichier', () => {
+  /**
+   * LE test du lot. Un numéro faux rend toutes les citations fausses, et une
+   * review qui cite faux perd sa crédibilité entière, trouvailles comprises.
+   */
+  it('garde des numéros de ligne EXACTS, ceux du fichier d’origine', () => {
+    const extract = windowFile(numbered(60), [{ start: 30, end: 31 }], WINDOW)!;
+    for (const line of extract.split('\n')) {
+      const match = /^\s*(\d+)\| ligne (\d+)$/.exec(line);
+      if (match) expect(match[1]).toBe(match[2]);
+    }
+    expect(extract).toContain('30| ligne 30');
+  });
+
+  it('aligne la gouttière sur le fichier entier, pas sur les lignes retenues', () => {
+    const extract = windowFile(numbered(1200), [{ start: 900, end: 901 }], WINDOW)!;
+    // 1200 lignes : quatre colonnes, y compris pour la ligne 1.
+    expect(extract).toContain('   1| ligne 1');
+  });
+
+  it('joint toujours la tête, même quand le premier hunk est très bas', () => {
+    const extract = windowFile(numbered(400), [{ start: 300, end: 300 }], WINDOW)!;
+    expect(extract).toContain('| ligne 1');
+    expect(extract).toContain('| ligne 300');
+  });
+
+  it('annonce chaque trou, avec ses bornes et son compte', () => {
+    const extract = windowFile(numbered(60), [{ start: 30, end: 30 }], WINDOW)!;
+    expect(extract).toContain('==== lines 4-27 of this file were NOT given to you (24 lines) ====');
+    expect(extract).toContain('==== lines 33-60 of this file were NOT given to you (28 lines) ====');
+  });
+
+  it('n’ouvre pas de trou quand la dernière fenêtre finit sur la fin du fichier', () => {
+    const extract = windowFile(numbered(60), [{ start: 58, end: 60 }], WINDOW)!;
+    expect(extract.trimEnd().endsWith('ligne 60')).toBe(true);
+  });
+
+  it('rend null sous le seuil : fenêtrer un petit fichier coûte plus que ça ne rapporte', () => {
+    expect(windowFile(numbered(9), [{ start: 5, end: 5 }], WINDOW)).toBeNull();
+  });
+
+  it('rend null quand les fenêtres couvrent déjà l’essentiel', () => {
+    // 20 lignes, fenêtre 1-19 : 19 gardées sur 20 dépassent la couverture de
+    // 0,9, et deux bannières coûteraient plus que la ligne qu'elles cachent.
+    expect(windowFile(numbered(20), [{ start: 5, end: 17 }], WINDOW)).toBeNull();
+  });
+
+  it('rend null sans plage connue, plutôt que de ne montrer que la tête', () => {
+    expect(windowFile(numbered(400), [], WINDOW)).toBeNull();
+  });
+});
+
+describe('le fenêtrage à l’assemblage', () => {
+  const gros = numbered(600);
+  const rawDiff = [
+    'diff --git a/src/gros.ts b/src/gros.ts',
+    '--- a/src/gros.ts',
+    '+++ b/src/gros.ts',
+    '@@ -300,1 +300,1 @@',
+    '-ligne 300',
+    '+ligne 300',
+  ].join('\n');
+
+  const withWindow = (window: typeof WINDOW | null) =>
+    assemble({
+      rawDiff,
+      prFiles: [file('src/gros.ts')],
+      readFile: () => gros,
+      window,
+    });
+
+  it('déclare le fichier en « windowed », et surtout pas en « omitted »', () => {
+    const context = withWindow(WINDOW);
+    expect(context.windowed).toEqual(['src/gros.ts']);
+    expect(context.omitted).toEqual([]);
+    expect(context.files[0]?.windowed).toBe(true);
+  });
+
+  it('envoie moins que le fichier entier, en gardant la ligne touchée', () => {
+    const extrait = withWindow(WINDOW).files[0]!.numbered;
+    expect(extrait).toContain('| ligne 300');
+    expect(extrait.length).toBeLessThan(numberLines(gros).length);
+  });
+
+  it('n’en fenêtre aucun quand le fenêtrage est éteint', () => {
+    const context = withWindow(null);
+    expect(context.windowed).toEqual([]);
+    expect(context.files[0]?.windowed).toBeUndefined();
+  });
+
+  /**
+   * Le budget porte sur ce qui part : un fichier qui ne tenait pas entier tient
+   * en extrait, et devient citable au lieu d'être réduit à son diff.
+   */
+  it('fait tenir sous le budget un fichier qui n’y tenait pas entier', () => {
+    const serré = { totalChars: 4_000, perFileChars: 4_000, importedChars: 0 };
+    expect(assemble({ rawDiff, prFiles: [file('src/gros.ts')], readFile: () => gros, budget: serré }).omitted)
+      .toEqual(['src/gros.ts']);
+    expect(assemble({ rawDiff, prFiles: [file('src/gros.ts')], readFile: () => gros, budget: serré, window: WINDOW }).files)
+      .toHaveLength(1);
   });
 });

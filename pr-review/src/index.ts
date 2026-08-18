@@ -21,7 +21,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { assembleContext, contextFor, type AssembledContext } from './context';
+import { assembleContext, contextFor, type AssembledContext, type WindowOptions } from './context';
 import { run } from './exec';
 import { currentHeadSha, fetchPrDiff, fetchPrMeta, postComment, resolveRepo, type PrMeta } from './gh';
 import { compileMatcher } from './globs';
@@ -46,6 +46,20 @@ import {
   type CallStat,
   type InputBreakdown,
 } from './stats';
+
+/**
+ * Le fenêtrage, hors son seuil, qui vient du cran.
+ *
+ * `pad` assez large pour tenir la fonction touchée et sa signature : en dessous
+ * de quarante lignes on coupe au milieu d'une fonction, soit exactement le
+ * voisinage qui justifie d'envoyer le contenu et pas seulement le diff.
+ */
+const WINDOW: Omit<WindowOptions, 'minLines'> = {
+  pad: 60,
+  head: 40,
+  joinGap: 25,
+  maxCoverage: 0.7,
+};
 
 /** Emplacement 1Password de la clé, pour l'usage local. Surchargeable. */
 const DEFAULT_KEY_REF = 'op://Personal/Ollama/add more/api_key';
@@ -97,14 +111,16 @@ function readDoctrine(root: string, paths: string[]): DoctrineFile[] {
  * lignes qui ont bougé. Mesuré : la moitié des « hallucinations » d'un réglage
  * de prompt venaient de là, pas du modèle.
  */
-async function warnOnDetachedContext(headSha: string): Promise<void> {
+async function warnOnDetachedContext(headSha: string): Promise<boolean> {
   const head = await currentHeadSha();
   if (head && head !== headSha) {
     console.warn(
       `⚠ Le dépôt est sur ${head.slice(0, 8)}, la PR sur ${headSha.slice(0, 8)} : le contenu lu ne\n` +
         "  correspond pas au diff. Pour un réglage de prompt fidèle, fais d'abord « gh pr checkout ».",
     );
+    return true;
   }
+  return false;
 }
 
 /**
@@ -355,13 +371,23 @@ async function review(config: Config): Promise<void> {
     fetchPrMeta(config.pr),
     fetchPrDiff(config.pr),
   ]);
-  await warnOnDetachedContext(meta.headSha);
+  const detached = await warnOnDetachedContext(meta.headSha);
 
   const isSkipped = compileMatcher(config.skip);
+  // Un diff périmé donne des plages périmées, donc des fenêtres qui montrent les
+  // mauvaises lignes : le fenêtrage ferait d'un avertissement une faute
+  // silencieuse. Le cas n'existe qu'en local, la CI sortant la tête de la PR.
+  if (detached && config.windowMinLines > 0) {
+    console.warn('  Fenêtrage désactivé pour cette exécution : les plages du diff ne seraient pas fiables.');
+  }
   const context = assembleContext({
     rawDiff,
     prFiles: meta.files,
     isSkipped,
+    window:
+      config.windowMinLines > 0 && !detached
+        ? { ...WINDOW, minLines: config.windowMinLines }
+        : null,
     budget: {
       totalChars: config.budgetChars,
       perFileChars: config.perFileChars,
@@ -458,6 +484,7 @@ async function review(config: Config): Promise<void> {
       ...totals(run.calls),
       skipped: context.skipped,
       omitted: context.omitted,
+      windowed: context.windowed,
       imported: context.imported.length,
       // Les passes lancées qui n'ont pas abouti : un incident. Distinct de
       // celles qu'on n'a pas lancées, qui est une décision.

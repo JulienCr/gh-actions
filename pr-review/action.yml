@@ -139,6 +139,16 @@ inputs:
     required: false
     default: '80000'
 
+  window-min-lines:
+    description: >-
+      Taille en lignes à partir de laquelle un fichier touché part par extraits
+      autour de ses changements, au lieu d'être envoyé en entier. Les numéros de
+      ligne restent ceux du fichier, donc un chemin:ligne cité reste juste, et
+      chaque trou est déclaré au modèle comme au lecteur. 0 désactive. Laissé
+      vide, il vaut 0 au cran « full », 250 en « balanced » et 120 en « lean ».
+    required: false
+    default: ''
+
   imports-budget-chars:
     description: >-
       Plafond des fichiers que les fichiers touchés importent, joints en

@@ -94,6 +94,7 @@ const FOOTER = {
   imported: 0,
   failedPasses: [],
   skippedPasses: [],
+  windowed: [],
 };
 
 describe('renderComment', () => {

@@ -145,19 +145,154 @@ export function foldAddedFiles(diff: string, folded: Set<string>): string {
     .join('\n');
 }
 
+/**
+ * Découpe en lignes réelles.
+ *
+ * Un fichier qui finit par un saut de ligne produit un dernier élément vide qui
+ * n'est pas une ligne : le garder décalerait le compte d'une unité, et avec lui
+ * tous les `chemin:ligne` cités.
+ */
+function splitLines(content: string): string[] {
+  const lines = content.split('\n');
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
+const gutter = (line: number, width: number) => `${String(line).padStart(width, ' ')}| `;
+
 /** Numérote les lignes, pour que le modèle puisse citer un `chemin:ligne` juste. */
 export function numberLines(content: string): string {
-  const lines = content.split('\n');
-  // Un fichier qui finit par un saut de ligne produit un dernier élément vide
-  // qui n'est pas une ligne : l'afficher décalerait le compte d'une unité.
-  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  const lines = splitLines(content);
   const width = String(lines.length).length;
-  return lines.map((line, index) => `${String(index + 1).padStart(width, ' ')}| ${line}`).join('\n');
+  return lines.map((line, index) => `${gutter(index + 1, width)}${line}`).join('\n');
+}
+
+/** Un intervalle de lignes du fichier APRÈS changement, bornes incluses. */
+export interface LineRange {
+  start: number;
+  end: number;
+}
+
+/**
+ * Les lignes touchées, lues sur les en-têtes `@@` d'un bloc de diff.
+ *
+ * Seul le côté droit compte : c'est le seul numéro que le modèle puisse citer,
+ * et c'est celui que porte le fichier lu sur le disque.
+ *
+ * L'ancrage en début de ligne n'est pas décoratif. Dans un diff unifié, toute
+ * ligne de contenu porte un préfixe (` `, `+` ou `-`) : un `@@` écrit dans le
+ * code relu ne peut donc pas être pris pour un en-tête.
+ */
+const HUNK = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+
+export function changedRanges(chunkBody: string): LineRange[] {
+  const ranges: LineRange[] = [];
+  for (const line of chunkBody.split('\n')) {
+    const match = HUNK.exec(line);
+    if (!match) continue;
+    const start = Number(match[1]);
+    // Compte omis : le format unifié le sous-entend à 1.
+    const count = match[2] === undefined ? 1 : Number(match[2]);
+    // Compte nul : suppression pure. Rien de neuf à montrer, mais il faut
+    // quand même montrer OÙ ça a été retiré, sinon la fenêtre rate le trou.
+    const anchor = Math.max(1, start);
+    ranges.push(count === 0 ? { start: anchor, end: anchor } : { start: anchor, end: start + count - 1 });
+  }
+  return ranges;
+}
+
+/** Fusionne, borne et ordonne des intervalles. */
+export function mergeRanges(ranges: LineRange[], joinGap: number, lastLine: number): LineRange[] {
+  const clamped = ranges
+    .map((range) => ({ start: Math.max(1, range.start), end: Math.min(lastLine, range.end) }))
+    .filter((range) => range.start <= range.end)
+    .sort((a, b) => a.start - b.start);
+
+  const merged: LineRange[] = [];
+  for (const range of clamped) {
+    const last = merged[merged.length - 1];
+    // Un trou plus court que sa propre bannière ne vaut pas d'être ouvert.
+    if (last && range.start - last.end - 1 <= joinGap) last.end = Math.max(last.end, range.end);
+    else merged.push({ ...range });
+  }
+  return merged;
+}
+
+export interface WindowOptions {
+  /** Lignes gardées de part et d'autre de chaque hunk. */
+  pad: number;
+  /** Lignes de tête toujours fournies : imports, types, en-tête de fichier. */
+  head: number;
+  /** En dessous de cette taille, le fichier part entier. */
+  minLines: number;
+  /** Deux fenêtres séparées par moins que ça n'en font qu'une. */
+  joinGap: number;
+  /** Au-delà de cette couverture, autant tout envoyer. */
+  maxCoverage: number;
+}
+
+/**
+ * La bannière qui déclare un trou.
+ *
+ * En anglais comme le reste des consignes, et volontairement illisible comme du
+ * code : le modèle doit pouvoir la distinguer d'un commentaire au premier coup
+ * d'œil. Elle dit ce qui manque ET combien, parce qu'« il n'y a rien ici » et
+ * « on ne vous a pas montré 275 lignes » ne mènent pas aux mêmes conclusions.
+ */
+const gap = (from: number, to: number) =>
+  `==== lines ${from}-${to} of this file were NOT given to you (${to - from + 1} lines) ====`;
+
+/**
+ * Le contenu numéroté d'un fichier, réduit aux fenêtres autour de ses hunks.
+ *
+ * Rend `null` quand fenêtrer n'achète rien, et l'appelant retombe alors sur
+ * `numberLines` : fichier trop court, aucune plage connue, ou fenêtres couvrant
+ * déjà l'essentiel. Un fenêtrage qui économise quelques lignes coûte une lecture
+ * morcelée et un risque de conclusion tirée d'un trou, pour rien.
+ *
+ * La largeur de la gouttière se calcule sur le fichier ENTIER, pas sur les
+ * lignes retenues : sinon un extrait s'alignerait autrement qu'un fichier
+ * complet, et le modèle verrait deux conventions dans le même prompt.
+ */
+export function windowFile(
+  content: string,
+  ranges: LineRange[],
+  options: WindowOptions,
+): string | null {
+  const lines = splitLines(content);
+  if (ranges.length === 0 || lines.length < options.minLines) return null;
+
+  const windows = mergeRanges(
+    [
+      { start: 1, end: options.head },
+      ...ranges.map((range) => ({ start: range.start - options.pad, end: range.end + options.pad })),
+    ],
+    options.joinGap,
+    lines.length,
+  );
+
+  const kept = windows.reduce((total, window) => total + window.end - window.start + 1, 0);
+  if (kept > lines.length * options.maxCoverage) return null;
+
+  const width = String(lines.length).length;
+  const out: string[] = [];
+  let cursor = 1;
+  for (const window of windows) {
+    if (window.start > cursor) out.push(gap(cursor, window.start - 1));
+    for (let line = window.start; line <= window.end; line += 1) {
+      out.push(`${gutter(line, width)}${lines[line - 1]}`);
+    }
+    cursor = window.end + 1;
+  }
+  if (cursor <= lines.length) out.push(gap(cursor, lines.length));
+  return out.join('\n');
 }
 
 export interface FileContent {
   path: string;
   numbered: string;
+  /** Fourni par extraits autour de ses hunks, pas en entier. */
+  windowed?: boolean;
 }
 
 export interface ContextBudget {
@@ -189,6 +324,8 @@ export interface AssembledContext {
   skipped: string[];
   /** Fichiers relus dans le diff mais dont le contenu intégral n'a pas tenu. */
   omitted: string[];
+  /** Fichiers fournis par extraits. Déclaré au même titre qu'une troncature. */
+  windowed: string[];
 }
 
 export interface AssembleOptions {
@@ -203,6 +340,8 @@ export interface AssembleOptions {
   exists: ExistsPredicate;
   isSkipped: SkipPredicate;
   budget: ContextBudget;
+  /** `null` : aucun fenêtrage, tout fichier retenu part entier. */
+  window?: WindowOptions | null;
 }
 
 /**
@@ -219,10 +358,14 @@ export function assembleContext({
   exists,
   isSkipped,
   budget,
+  window = null,
 }: AssembleOptions): AssembledContext {
   const { diff, skipped } = filterDiff(rawDiff, isSkipped);
 
-  const sources: { path: string; content: string }[] = [];
+  // Les plages touchées, lues une fois sur le diff déjà filtré.
+  const ranges = new Map(splitDiffByFile(diff).map((chunk) => [chunk.path, changedRanges(chunk.body)]));
+
+  const sources: { path: string; content: string; rendered: string; windowed: boolean }[] = [];
   const omitted: string[] = [];
   let used = 0;
 
@@ -235,12 +378,19 @@ export function assembleContext({
   for (const file of candidates) {
     const content = readFile(file.path);
     if (content === null) continue;
-    if (content.length > budget.perFileChars || used + content.length > budget.totalChars) {
+
+    const extract = window ? windowFile(content, ranges.get(file.path) ?? [], window) : null;
+    const rendered = extract ?? numberLines(content);
+
+    // Le budget porte sur ce qui PART, pas sur la matière brute. Conséquence
+    // désirable : un gros fichier qui tombait en « omitted », donc réduit au
+    // diff sans numéro citable, tient désormais sous forme d'extrait numéroté.
+    if (rendered.length > budget.perFileChars || used + rendered.length > budget.totalChars) {
       omitted.push(file.path);
       continue;
     }
-    used += content.length;
-    sources.push({ path: file.path, content });
+    used += rendered.length;
+    sources.push({ path: file.path, content, rendered, windowed: extract !== null });
   }
 
   // Rendre les fichiers dans l'ordre de la PR, pas dans l'ordre de sélection :
@@ -248,9 +398,10 @@ export function assembleContext({
   const order = new Map(prFiles.map((file, index) => [file.path, index]));
   sources.sort((a, b) => (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0));
 
-  const files = sources.map((source) => ({
+  const files: FileContent[] = sources.map((source) => ({
     path: source.path,
-    numbered: numberLines(source.content),
+    numbered: source.rendered,
+    ...(source.windowed ? { windowed: true } : {}),
   }));
 
   const imported = readImported({ sources, readFile, exists, isSkipped, budget });
@@ -262,7 +413,14 @@ export function assembleContext({
     prFiles.filter((file) => file.status === 'added' && supplied.has(file.path)).map((file) => file.path),
   );
 
-  return { diff: foldAddedFiles(diff, added), files, imported, skipped, omitted };
+  return {
+    diff: foldAddedFiles(diff, added),
+    files,
+    imported,
+    skipped,
+    omitted,
+    windowed: sources.filter((source) => source.windowed).map((source) => source.path),
+  };
 }
 
 /**
@@ -283,6 +441,8 @@ interface ImportedOptions {
   exists: ExistsPredicate;
   isSkipped: SkipPredicate;
   budget: ContextBudget;
+  /** `null` : aucun fenêtrage, tout fichier retenu part entier. */
+  window?: WindowOptions | null;
 }
 
 /**

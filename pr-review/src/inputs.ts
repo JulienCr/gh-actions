@@ -124,6 +124,14 @@ export const DEFAULTS = {
   effort: 'balanced' as Effort,
   /** Plafond des imports au cran « lean », où le contexte se resserre. */
   leanImportsBudgetChars: 120_000,
+  /**
+   * Taille à partir de laquelle un fichier part par extraits, selon le cran.
+   *
+   * `0` au cran `full` : aucun fenêtrage. Le seuil reste haut ailleurs, parce
+   * que fenêtrer un petit fichier économise quelques lignes et coûte une lecture
+   * morcelée, plus le risque qu'une conclusion soit tirée d'un trou.
+   */
+  windowMinLines: { full: 0, balanced: 250, lean: 120 } as Record<Effort, number>,
 } as const;
 
 export interface Config {
@@ -146,6 +154,8 @@ export interface Config {
   effort: Effort;
   /** Passes imposées par l'input `passes`. Vide : la règle décide. */
   passes: string[];
+  /** Taille au-delà de laquelle un fichier part par extraits. `0` : jamais. */
+  windowMinLines: number;
   timeoutMs: number;
   /** Chemins de doctrine, dans l'ordre où ils seront injectés dans le prompt. */
   doctrine: string[];
@@ -353,6 +363,13 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     perFileChars: readNumber(env, 'per-file-chars', DEFAULTS.perFileChars, warn),
     effort,
     passes: parseList(readInput(env, 'passes')),
+    windowMinLines: readNumber(
+      env,
+      'window-min-lines',
+      DEFAULTS.windowMinLines[effort],
+      warn,
+      0,
+    ),
     // Le cran pose le défaut, l'input explicite l'écrase : régler « effort » ne
     // doit pas rendre un budget écrit à la main silencieusement inopérant.
     importsBudgetChars: readNumber(
