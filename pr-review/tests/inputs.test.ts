@@ -378,3 +378,42 @@ describe('resolveConfig · la destination de chaque appel', () => {
     expect(config.passConfigs.regression.thinking).toBe('high');
   });
 });
+
+/**
+ * Les trouvailles de la review d'Aristarque sur sa propre PR, épinglées.
+ *
+ * Chacune passait sans le correctif, ce qui est la seule chose qui rende un
+ * test utile.
+ */
+describe('resolveConfig · ce que la review a trouvé', () => {
+  /**
+   * `mixRoute` testait la clé AVANT le provider : un dépôt qui avait choisi son
+   * provider voyait quand même trois passes filer chez DeepSeek, pendant que la
+   * régression restait seule sur un endpoint étranger avec un nom de modèle
+   * Ollama. Le test d'à côté ne couvrait que le cas sans clé, donc passait pour
+   * la mauvaise raison.
+   */
+  it('n’applique pas le mix à un dépôt qui a choisi son provider, clé DeepSeek ou non', () => {
+    const config = resolve({ INPUT_PROVIDER: 'openai', 'INPUT_DEEPSEEK-API-KEY': 'ds' });
+    for (const target of Object.values(config.passConfigs)) {
+      expect(target.provider).toBe('openai');
+      expect(target.model).toBe(DEFAULTS.model);
+    }
+  });
+
+  it('prévient qu’un provider non-Ollama sans « model » hérite d’un nom Ollama', () => {
+    const warn = vi.fn();
+    resolveConfig({ argv: ['42'], env: { INPUT_PROVIDER: 'deepseek' }, warn });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('nom Ollama'));
+  });
+
+  it('ne prévient pas quand le modèle est nommé', () => {
+    const warn = vi.fn();
+    resolveConfig({
+      argv: ['42'],
+      env: { INPUT_PROVIDER: 'deepseek', INPUT_MODEL: 'deepseek-v4-pro' },
+      warn,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+});

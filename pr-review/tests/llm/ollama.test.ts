@@ -462,3 +462,45 @@ describe('chat · dépassement de délai', () => {
     );
   });
 });
+
+describe('« couper le raisonnement » a une seule définition', () => {
+  /**
+   * Cette liste ignorait « no » et « 0 », que le client OpenAI-compatible
+   * accepte pourtant : un dépôt qui écrivait « thinking: no » envoyait la
+   * chaîne à Ollama, qui la refusait, et le repli le remontait à « true ».
+   * L'extinction demandée était donc ignorée chez un provider et appliquée
+   * chez l'autre.
+   */
+  it.each(['false', 'off', 'none', 'no', '0', 'NO'])('traduit « %s » en refus explicite', async (value) => {
+    queue.push({ status: 200, body: ok('ok') });
+    await call({ think: value });
+    expect(lastBody.think).toBe(false);
+  });
+
+  it('laisse passer un niveau, qui n’est pas une extinction', async () => {
+    queue.push({ status: 200, body: ok('ok') });
+    await call({ think: 'low' });
+    expect(lastBody.think).toBe('low');
+  });
+});
+
+describe('les secrets ne sortent pas dans un message d’erreur', () => {
+  it('masque la clé qu’Ollama renverrait dans le corps d’un refus', async () => {
+    queue.push({ status: 400, body: 'rejected header Bearer cle-tres-secrete' });
+    const error = await call({ apiKey: 'cle-tres-secrete' }).then(
+      () => new Error('aurait dû échouer'),
+      (caught: Error) => caught,
+    );
+    expect(error.message).not.toContain('cle-tres-secrete');
+    expect(error.message).toContain('***');
+  });
+
+  it('masque la clé dans une erreur applicative arrivée en 200', async () => {
+    queue.push({ status: 200, body: JSON.stringify({ error: 'clé cle-tres-secrete refusée' }) });
+    const error = await call({ apiKey: 'cle-tres-secrete' }).then(
+      () => new Error('aurait dû échouer'),
+      (caught: Error) => caught,
+    );
+    expect(error.message).not.toContain('cle-tres-secrete');
+  });
+});

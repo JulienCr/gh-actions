@@ -20,8 +20,10 @@ import {
   DEFAULT_TIMEOUT_MS,
   describeStatus,
   detail,
+  scrub,
   streamLines,
   transportError,
+  wantsNoThinking,
   withRetries,
   worthRetrying,
 } from './http';
@@ -53,7 +55,11 @@ interface StreamChunk extends ChatPayload {
 function parseThink(value: string): string | boolean {
   const normalised = value.trim().toLowerCase();
   if (normalised === 'true') return true;
-  if (/^(false|off|none)$/.test(normalised)) return false;
+  // La même définition que le client OpenAI-compatible, et pas une seconde
+  // écrite à côté : celle-ci ignorait « no » et « 0 », si bien qu'un
+  // « thinking: no » coupait le raisonnement chez un provider et le laissait
+  // à son défaut chez l'autre.
+  if (wantsNoThinking(normalised)) return false;
   return normalised;
 }
 
@@ -126,7 +132,7 @@ async function send(request: ChatRequest): Promise<ChatPayload> {
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
-    throw transportError(error, timeoutMs, 'Ollama');
+    throw transportError(error, timeoutMs, 'Ollama', request.apiKey);
   }
 
   // Toute lecture du corps est soumise au même traitement que l'appel : en
@@ -138,20 +144,20 @@ async function send(request: ChatRequest): Promise<ChatPayload> {
     if (!response.ok) {
       const text = await response.text();
       throw new LlmError(
-        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
+        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text, request.apiKey)}`,
         worthRetrying(response.status),
         rejectsThinking(response.status, text),
       );
     }
-    return await collect(response);
+    return await collect(response, request.apiKey);
   } catch (error) {
     if (error instanceof LlmError) throw error;
-    throw transportError(error, timeoutMs, 'Ollama');
+    throw transportError(error, timeoutMs, 'Ollama', request.apiKey);
   }
 }
 
 /** Recompose la réponse complète à partir des fragments du flux. */
-async function collect(response: Response): Promise<ChatPayload> {
+async function collect(response: Response, apiKey: string): Promise<ChatPayload> {
   let content = '';
   let thinking = '';
   let promptTokens = 0;
@@ -170,14 +176,14 @@ async function collect(response: Response): Promise<ChatPayload> {
       // même traitement, plutôt qu'un « illisible » non reprisable qui perdrait
       // la review sur ce seul détail.
       if (fragments > 0) break;
-      throw new LlmError(`réponse illisible d'Ollama (${line.slice(0, 200)})`);
+      throw new LlmError(`réponse illisible d'Ollama (${scrub(line.slice(0, 200), apiKey)})`);
     }
     fragments += 1;
     if (chunk.error) {
       // Certaines erreurs arrivent en 200 avec un corps d'erreur : le refus du
       // raisonnement en fait partie, d'où le même test que sur la voie 400.
       throw new LlmError(
-        `Ollama a répondu une erreur : ${chunk.error}`,
+        `Ollama a répondu une erreur : ${scrub(chunk.error, apiKey)}`,
         false,
         /think/i.test(chunk.error),
       );

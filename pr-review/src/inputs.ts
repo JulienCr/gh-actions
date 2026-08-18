@@ -200,14 +200,20 @@ export function mixFor(provider: string): Partial<Record<PassId, PassConfig>> {
 /**
  * Par quelle route le mix passe, ou `null` quand il ne s'applique pas.
  *
- * DeepSeek en direct dès qu'une clé existe, parce que son cache de préfixe est
- * le levier le plus fort. Sinon Ollama, qui sert le même modèle et suffit à
- * descendre d'un niveau d'usage. Un dépôt qui a désigné un autre provider
- * global a pris la main : on ne le renvoie pas ailleurs dans son dos.
+ * Un dépôt qui a désigné son provider global a pris la main : on ne renvoie pas
+ * ses passes ailleurs dans son dos, clé DeepSeek ou non. Ce test passait
+ * autrefois APRÈS celui de la clé, et un `provider: openai` se faisait quand
+ * même déplacer : trois passes partaient chez DeepSeek pendant que la
+ * régression restait seule sur un endpoint étranger, avec un nom de modèle
+ * Ollama qu'il ne sert pas.
+ *
+ * Le provider resté au défaut, DeepSeek en direct l'emporte dès qu'une clé
+ * existe, parce que son cache de préfixe est le levier le plus fort. Sinon
+ * Ollama, qui sert le même modèle et suffit à descendre d'un niveau d'usage.
  */
 export function mixRoute(provider: string, hasDeepSeekKey: boolean): string | null {
-  if (hasDeepSeekKey) return 'deepseek';
-  return provider === 'ollama' ? 'ollama' : null;
+  if (provider !== DEFAULTS.provider) return null;
+  return hasDeepSeekKey ? 'deepseek' : 'ollama';
 }
 
 export interface Config {
@@ -565,6 +571,15 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   };
 
   const provider = readProvider(env, 'provider', DEFAULTS.provider, warn);
+  // Le modèle par défaut est un nom Ollama. Le laisser filer vers un autre
+  // provider produit un 404 sur les quatre appels, et un journal qui accuse le
+  // modèle plutôt que la configuration.
+  if (provider !== DEFAULTS.provider && model === '') {
+    warn(
+      `provider « ${provider} » sans « model » : le défaut ${DEFAULTS.model} est un nom Ollama,\n` +
+        `  que cet endpoint ne sert probablement pas. Nomme un modèle.`,
+    );
+  }
   // Un modèle écrit à la main contredit le mix : déplacer une passe ailleurs en
   // lui laissant le modèle d'un autre provider produirait un 404, pas un
   // compromis. L'écrire garde donc le comportement d'avant, pour les quatre.

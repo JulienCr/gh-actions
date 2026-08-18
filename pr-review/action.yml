@@ -267,9 +267,9 @@ inputs:
       passes tournent en parallèle, sauf celles qui partagent un provider ET un
       modèle CHEZ UN PROVIDER QUI CACHE LES PRÉFIXES : celles-là s'enchaînent,
       pour que la seconde rejoue le préfixe de la première. Le mur du job vaut
-      donc « le groupe le plus lent, plus la fusion ». Le timeout-minutes du job
-      doit rester au-dessus, sinon le commentaire d'échec n'a pas le temps
-      d'être posté.
+      donc DEUX fois cette valeur sans séquencement, TROIS fois avec. Le
+      timeout-minutes du job doit rester au-dessus, sinon le commentaire d'échec
+      n'a pas le temps d'être posté.
     required: false
     default: '15'
 

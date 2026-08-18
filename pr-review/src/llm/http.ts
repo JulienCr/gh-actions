@@ -69,9 +69,30 @@ export function describeStatus(status: number): string {
   return '';
 }
 
-export function detail(body: string): string {
+export function detail(body: string, apiKey: string): string {
   const trimmed = body.trim();
-  return trimmed ? ` : ${redact(trimmed.slice(0, 300))}` : '';
+  return trimmed ? ` : ${redact(scrub(trimmed.slice(0, 300), apiKey))}` : '';
+}
+
+/**
+ * Retire la clé du texte, telle quelle et sous ses formes usuelles.
+ *
+ * Le corps d'une erreur n'est pas écrit par nous : un proxy mal réglé renvoie
+ * volontiers la requête qu'il a reçue, en-têtes compris. Ce corps part dans le
+ * journal d'un runner, et jusque dans le commentaire posté quand aucune passe
+ * n'aboutit. La doctrine du dépôt interdit qu'un jeton y figure.
+ *
+ * On masque la clé exacte plutôt que de deviner des motifs : c'est le seul
+ * filtre qui n'a ni faux positif ni faux négatif sur le secret qui compte. Le
+ * `Bearer` générique attrape en plus le jeton d'un tiers que l'endpoint
+ * citerait, dont nous ne connaissons pas la valeur.
+ */
+export function scrub(text: string, apiKey: string): string {
+  const withoutBearer = text.replace(/\bBearer\s+\S+/gi, 'Bearer ***');
+  if (!apiKey) return withoutBearer;
+  // Échappement : une clé peut contenir des caractères qui font sens en regex.
+  const pattern = apiKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return withoutBearer.replace(new RegExp(pattern, 'g'), '***');
 }
 
 /**
@@ -82,13 +103,18 @@ export function detail(body: string): string {
  * l'URL visée, d'où le masquage de `redact`. Les clés voyagent dans un en-tête
  * et n'apparaissent dans aucun de ces messages.
  */
-export function transportError(error: unknown, timeoutMs: number, provider: string): LlmError {
+export function transportError(
+  error: unknown,
+  timeoutMs: number,
+  provider: string,
+  apiKey = '',
+): LlmError {
   // Un dépassement de délai ne se reprend pas : le même prompt reprendrait le
   // même temps, et deux tentatives dépasseraient le budget du job.
   if (error instanceof Error && error.name === 'TimeoutError') {
     return new LlmError(`${provider} n'a pas répondu en ${Math.round(timeoutMs / 60_000)} min`);
   }
-  return new LlmError(`appel à ${provider} impossible (${describeCause(error)})`, true);
+  return new LlmError(`appel à ${provider} impossible (${scrub(describeCause(error), apiKey)})`, true);
 }
 
 /**

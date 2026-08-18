@@ -477,15 +477,21 @@ function describeStatus(status) {
   if (status >= 500) return "(panne c\xF4t\xE9 provider)";
   return "";
 }
-function detail(body) {
+function detail(body, apiKey) {
   const trimmed = body.trim();
-  return trimmed ? ` : ${redact(trimmed.slice(0, 300))}` : "";
+  return trimmed ? ` : ${redact(scrub(trimmed.slice(0, 300), apiKey))}` : "";
 }
-function transportError(error, timeoutMs, provider) {
+function scrub(text, apiKey) {
+  const withoutBearer = text.replace(/\bBearer\s+\S+/gi, "Bearer ***");
+  if (!apiKey) return withoutBearer;
+  const pattern = apiKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return withoutBearer.replace(new RegExp(pattern, "g"), "***");
+}
+function transportError(error, timeoutMs, provider, apiKey = "") {
   if (error instanceof Error && error.name === "TimeoutError") {
     return new LlmError(`${provider} n'a pas r\xE9pondu en ${Math.round(timeoutMs / 6e4)} min`);
   }
-  return new LlmError(`appel \xE0 ${provider} impossible (${describeCause(error)})`, true);
+  return new LlmError(`appel \xE0 ${provider} impossible (${scrub(describeCause(error), apiKey)})`, true);
 }
 function describeCause(error) {
   const chain = [];
@@ -522,7 +528,7 @@ async function withRetries(attempt2, request) {
 function parseThink(value) {
   const normalised = value.trim().toLowerCase();
   if (normalised === "true") return true;
-  if (/^(false|off|none)$/.test(normalised)) return false;
+  if (wantsNoThinking(normalised)) return false;
   return normalised;
 }
 var rejectsThinking = (status, body) => status === 400 && /think/i.test(body);
@@ -572,24 +578,24 @@ async function send(request) {
       signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (error) {
-    throw transportError(error, timeoutMs, "Ollama");
+    throw transportError(error, timeoutMs, "Ollama", request.apiKey);
   }
   try {
     if (!response.ok) {
       const text = await response.text();
       throw new LlmError(
-        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
+        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text, request.apiKey)}`,
         worthRetrying(response.status),
         rejectsThinking(response.status, text)
       );
     }
-    return await collect(response);
+    return await collect(response, request.apiKey);
   } catch (error) {
     if (error instanceof LlmError) throw error;
-    throw transportError(error, timeoutMs, "Ollama");
+    throw transportError(error, timeoutMs, "Ollama", request.apiKey);
   }
 }
-async function collect(response) {
+async function collect(response, apiKey) {
   let content = "";
   let thinking = "";
   let promptTokens = 0;
@@ -602,12 +608,12 @@ async function collect(response) {
       chunk = JSON.parse(line);
     } catch {
       if (fragments > 0) break;
-      throw new LlmError(`r\xE9ponse illisible d'Ollama (${line.slice(0, 200)})`);
+      throw new LlmError(`r\xE9ponse illisible d'Ollama (${scrub(line.slice(0, 200), apiKey)})`);
     }
     fragments += 1;
     if (chunk.error) {
       throw new LlmError(
-        `Ollama a r\xE9pondu une erreur : ${chunk.error}`,
+        `Ollama a r\xE9pondu une erreur : ${scrub(chunk.error, apiKey)}`,
         false,
         /think/i.test(chunk.error)
       );
@@ -681,24 +687,24 @@ async function send2(request, dialect) {
       signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (error) {
-    throw transportError(error, timeoutMs, dialect.name);
+    throw transportError(error, timeoutMs, dialect.name, request.apiKey);
   }
   try {
     if (!response.ok) {
       const text = await response.text();
       throw new LlmError(
-        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
+        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text, request.apiKey)}`,
         worthRetrying(response.status),
         rejectsThinking2(response.status, text)
       );
     }
-    return await collect2(response, dialect);
+    return await collect2(response, dialect, request.apiKey);
   } catch (error) {
     if (error instanceof LlmError) throw error;
-    throw transportError(error, timeoutMs, dialect.name);
+    throw transportError(error, timeoutMs, dialect.name, request.apiKey);
   }
 }
-async function collect2(response, dialect) {
+async function collect2(response, dialect, apiKey) {
   let content = "";
   let thinking = "";
   let usage = null;
@@ -717,13 +723,15 @@ async function collect2(response, dialect) {
       chunk = JSON.parse(payload);
     } catch {
       if (fragments > 0) break;
-      throw new LlmError(`r\xE9ponse illisible de ${dialect.name} (${payload.slice(0, 200)})`);
+      throw new LlmError(
+        `r\xE9ponse illisible de ${dialect.name} (${scrub(payload.slice(0, 200), apiKey)})`
+      );
     }
     fragments += 1;
     if (chunk.error) {
       const message = typeof chunk.error === "string" ? chunk.error : chunk.error.message ?? "";
       throw new LlmError(
-        `${dialect.name} a r\xE9pondu une erreur : ${message}`,
+        `${dialect.name} a r\xE9pondu une erreur : ${scrub(message, apiKey)}`,
         false,
         /reasoning|thinking/i.test(message)
       );
@@ -1346,8 +1354,8 @@ function mixFor(provider) {
   };
 }
 function mixRoute(provider, hasDeepSeekKey) {
-  if (hasDeepSeekKey) return "deepseek";
-  return provider === "ollama" ? "ollama" : null;
+  if (provider !== DEFAULTS.provider) return null;
+  return hasDeepSeekKey ? "deepseek" : "ollama";
 }
 var UsageError = class extends Error {
 };
@@ -1491,6 +1499,12 @@ function resolveConfig({ argv, env, warn = () => {
     openai: readInput(env, "openai-api-key") || env.OPENAI_API_KEY?.trim() || ""
   };
   const provider = readProvider(env, "provider", DEFAULTS.provider, warn);
+  if (provider !== DEFAULTS.provider && model === "") {
+    warn(
+      `provider \xAB ${provider} \xBB sans \xAB model \xBB : le d\xE9faut ${DEFAULTS.model} est un nom Ollama,
+  que cet endpoint ne sert probablement pas. Nomme un mod\xE8le.`
+    );
+  }
   const route = model === "" ? mixRoute(provider, keys.deepseek !== "") : null;
   return {
     pr,
@@ -1821,8 +1835,10 @@ function endpointFor(config, target) {
     // elle enverrait la review chez le voisin sans que rien ne le dise.
     config.openaiBaseUrl
   ) : (
-    // `OLLAMA_HOST` est historique et documenté ; le motif vaut désormais
-    // pour tous les providers, ce qui donne un bac à sable local gratuit.
+    // `OLLAMA_HOST` est historique et documenté ; le motif vaut pour tout
+    // provider qui a une base par défaut, ce qui donne un bac à sable local
+    // gratuit. Le provider générique n'en est pas : son adresse ne vient que
+    // de `openai-base-url`, faute de défaut à surcharger.
     (process.env[`${target.provider.toUpperCase()}_HOST`] ?? spec.defaultBaseUrl).replace(
       /\/$/,
       ""
@@ -1831,6 +1847,22 @@ function endpointFor(config, target) {
   const apiKey = config.keys[target.provider] ?? "";
   if (!baseUrl || !apiKey) return null;
   return { baseUrl, apiKey };
+}
+function warnOnClearTextKey(config, targets) {
+  const risky = /* @__PURE__ */ new Set();
+  for (const target of targets) {
+    const endpoint = endpointFor(config, target);
+    if (!endpoint) continue;
+    if (/^https:/i.test(endpoint.baseUrl)) continue;
+    if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(endpoint.baseUrl)) continue;
+    risky.add(endpoint.baseUrl);
+  }
+  for (const baseUrl of risky) {
+    console.warn(
+      `\u26A0 ${baseUrl} n'est pas en HTTPS : la cl\xE9 part en clair dans un en-t\xEAte.
+  Acceptable sur un h\xF4te local, jamais vers un endpoint distant.`
+    );
+  }
 }
 function sizes(messages) {
   const context = messages.find((message) => message.role === "user");
@@ -2127,6 +2159,7 @@ async function review(config) {
   for (const { label, reason } of selection.skipped) {
     console.log(`\xB7 passe \xAB ${label} \xBB non lanc\xE9e : ${reason}.`);
   }
+  warnOnClearTextKey(config, plan.map(({ target }) => target));
   if (config.seed !== void 0) {
     const ignoring = [...new Set(plan.map(({ target }) => target.provider))].filter(
       (provider) => PROVIDERS[provider]?.supportsSeed === false

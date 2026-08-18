@@ -296,3 +296,55 @@ describe('le dialecte générique', () => {
     expect(lastBody.reasoning_effort).toBeUndefined();
   });
 });
+
+/**
+ * Le corps d'une erreur n'est pas écrit par nous : un proxy mal réglé renvoie
+ * volontiers la requête reçue, en-têtes compris. Ce corps part dans le journal
+ * d'un runner, et jusque dans le commentaire posté quand aucune passe n'aboutit.
+ */
+describe('les secrets ne sortent pas dans un message d’erreur', () => {
+  const withKey = (over = {}) =>
+    deepseek({
+      apiKey: 'sk-secret-a-ne-pas-recopier',
+      baseUrl,
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'u' }],
+      retryDelayMs: 1,
+      ...over,
+    });
+
+  it('masque la clé qu’un endpoint renverrait dans le corps d’un refus', async () => {
+    queue.push({
+      status: 400,
+      body: '{"error":{"message":"bad request, headers: Authorization: Bearer sk-secret-a-ne-pas-recopier"}}',
+    });
+    await expect(withKey()).rejects.toThrow(/\*\*\*/);
+    queue.push({
+      status: 400,
+      body: '{"error":{"message":"Authorization: Bearer sk-secret-a-ne-pas-recopier"}}',
+    });
+    await expect(withKey()).rejects.not.toThrow(/sk-secret-a-ne-pas-recopier/);
+  });
+
+  it('masque aussi un jeton tiers, dont on ne connaît pas la valeur', async () => {
+    queue.push({ status: 400, body: '{"error":{"message":"upstream sent Bearer tok_du_voisin_123"}}' });
+    const error = await withKey().then(
+      () => new Error('aurait dû échouer'),
+      (caught: Error) => caught,
+    );
+    expect(error.message).toContain('Bearer ***');
+    expect(error.message).not.toContain('tok_du_voisin_123');
+  });
+
+  it('masque la clé dans une erreur applicative arrivée en 200', async () => {
+    queue.push({
+      status: 200,
+      body: `data: ${JSON.stringify({ error: { message: 'key sk-secret-a-ne-pas-recopier refused' } })}\n\n`,
+    });
+    const error = await withKey().then(
+      () => new Error('aurait dû échouer'),
+      (caught: Error) => caught,
+    );
+    expect(error.message).not.toContain('sk-secret-a-ne-pas-recopier');
+  });
+});

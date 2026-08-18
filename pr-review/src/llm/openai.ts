@@ -21,6 +21,7 @@ import {
   DEFAULT_TIMEOUT_MS,
   describeStatus,
   detail,
+  scrub,
   streamLines,
   wantsNoThinking,
   transportError,
@@ -147,27 +148,31 @@ async function send(request: ChatRequest, dialect: OpenAiDialect): Promise<Colle
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
-    throw transportError(error, timeoutMs, dialect.name);
+    throw transportError(error, timeoutMs, dialect.name, request.apiKey);
   }
 
   try {
     if (!response.ok) {
       const text = await response.text();
       throw new LlmError(
-        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
+        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text, request.apiKey)}`,
         worthRetrying(response.status),
         rejectsThinking(response.status, text),
       );
     }
-    return await collect(response, dialect);
+    return await collect(response, dialect, request.apiKey);
   } catch (error) {
     if (error instanceof LlmError) throw error;
-    throw transportError(error, timeoutMs, dialect.name);
+    throw transportError(error, timeoutMs, dialect.name, request.apiKey);
   }
 }
 
 /** Recompose la réponse à partir des événements `data:` du flux. */
-async function collect(response: Response, dialect: OpenAiDialect): Promise<Collected> {
+async function collect(
+  response: Response,
+  dialect: OpenAiDialect,
+  apiKey: string,
+): Promise<Collected> {
   let content = '';
   let thinking = '';
   let usage: Usage | null = null;
@@ -194,7 +199,9 @@ async function collect(response: Response, dialect: OpenAiDialect): Promise<Coll
       // coupé en son milieu : même panne que l'absence de `[DONE]`, donc même
       // traitement, plutôt qu'une review perdue sur un alignement d'octets.
       if (fragments > 0) break;
-      throw new LlmError(`réponse illisible de ${dialect.name} (${payload.slice(0, 200)})`);
+      throw new LlmError(
+        `réponse illisible de ${dialect.name} (${scrub(payload.slice(0, 200), apiKey)})`,
+      );
     }
     fragments += 1;
 
@@ -202,7 +209,7 @@ async function collect(response: Response, dialect: OpenAiDialect): Promise<Coll
       // Certaines erreurs arrivent en 200 avec un corps d'erreur.
       const message = typeof chunk.error === 'string' ? chunk.error : (chunk.error.message ?? '');
       throw new LlmError(
-        `${dialect.name} a répondu une erreur : ${message}`,
+        `${dialect.name} a répondu une erreur : ${scrub(message, apiKey)}`,
         false,
         /reasoning|thinking/i.test(message),
       );

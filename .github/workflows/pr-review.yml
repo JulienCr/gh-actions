@@ -28,10 +28,13 @@ jobs:
   review:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    # Le mur vaut « groupe le plus lent + fusion ». Les passes ne s'enchaînent
-    # que chez un provider qui cache les préfixes ; sur Ollama elles restent
-    # parallèles. Plus la marge du commentaire d'échec.
-    timeout-minutes: 40
+    # Le mur vaut « le plus gros groupe séquencé + fusion ». Les passes ne
+    # s'enchaînent que chez un provider qui cache les préfixes ; sur Ollama
+    # elles restent parallèles, soit deux fois le « timeout-minutes » de
+    # l'action. Avec une clé DeepSeek, trois fois. Plus la marge du commentaire
+    # d'échec. Mesuré sur la PR #8 : 8 min 08 s au total, dont 470 s pour la
+    # seule régression.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:

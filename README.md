@@ -84,9 +84,10 @@ jobs:
     concurrency:
       group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
       cancel-in-progress: true
-    # Trois passes en parallèle puis leur fusion : le mur vaut jusqu'à deux fois
-    # le « timeout-minutes » de l'action, plus la marge du commentaire d'échec.
-    timeout-minutes: 40
+    # Le mur vaut « le plus gros groupe séquencé, plus la fusion ». Sans clé
+    # DeepSeek les passes sont parallèles, donc deux fois le « timeout-minutes »
+    # de l'action ; avec, le groupe DeepSeek en enchaîne deux, donc trois fois.
+    timeout-minutes: 45
     steps:
       # Un run déclenché par commentaire n'apparaît pas comme check sur la PR :
       # sans cet accusé de réception, la mention se fait à l'aveugle.
@@ -226,7 +227,7 @@ Seul `pr` est obligatoire.
 | `per-file-chars` | `80000` | Plafond par fichier. |
 | `window-min-lines` | selon le cran | Taille à partir de laquelle un fichier part par extraits. `0` : jamais. |
 | `imports-budget-chars` | `300000` | Plafond des fichiers **importés**, joints en contexte. `0` : aucun. `120000` au cran `lean`. |
-| `timeout-minutes` | `15` | Délai d'**une** requête. La review en fait quatre ; voir le `timeout-minutes` du job. |
+| `timeout-minutes` | `15` | Délai d'**une** requête. Le mur du job vaut « le plus gros groupe séquencé, plus la fusion » ; voir ci-dessous. |
 | `dry-run` | `false` | `true` : la review part dans les logs, rien n'est posté. |
 
 ### Le mix par passe
@@ -274,6 +275,21 @@ permet de partager ce cache. Deux conditions, que l'action tient toutes les deux
    n'expose aucun compteur de cache ([#15600](https://github.com/ollama/ollama/issues/15600),
    [#16714](https://github.com/ollama/ollama/issues/16714)), les passes restent parallèles, parce
    que les sérialiser coûterait du temps contre une économie invérifiable.
+
+⚠️ **Le séquencement change l'arithmétique du `timeout-minutes` du job.** Sans clé DeepSeek, le mur
+vaut « la passe la plus lente, plus la fusion », soit deux fois `timeout-minutes`. Avec, le groupe
+DeepSeek en enchaîne deux : trois fois, dans le pire cas. Mesuré sur cette PR, on en est loin, la
+régression pesant à elle seule cinq fois les deux autres réunies :
+
+| Appel | Modèle | Durée |
+| --- | --- | --- |
+| données et accès | `deepseek-v4-flash:cloud` | 67 s |
+| doctrine du dépôt | `deepseek-v4-flash:cloud` | 89 s |
+| régression fonctionnelle | `glm-5.2:cloud` | **470 s** |
+| fusion | `deepseek-v4-flash:cloud` | 18 s |
+
+Rien dans le code ne garantit pourtant ce rapport. Un `timeout-minutes: 45` au niveau du job laisse
+la marge du pire cas et celle du commentaire d'échec.
 
 Mesuré sur la PR #7 de ce dépôt, ~140 000 tokens d'entrée par passe : la seconde passe a reçu
 **141 694 tokens en cache sur 149 831**, et son coût est tombé de 0,0628 $ à 0,0057 $.

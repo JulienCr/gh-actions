@@ -187,8 +187,10 @@ function endpointFor(config: Config, target: PassConfig): { baseUrl: string; api
         // donne. `openai-base-url` ne vaut QUE pour lui : appliquée à DeepSeek,
         // elle enverrait la review chez le voisin sans que rien ne le dise.
         config.openaiBaseUrl
-      : // `OLLAMA_HOST` est historique et documenté ; le motif vaut désormais
-        // pour tous les providers, ce qui donne un bac à sable local gratuit.
+      : // `OLLAMA_HOST` est historique et documenté ; le motif vaut pour tout
+        // provider qui a une base par défaut, ce qui donne un bac à sable local
+        // gratuit. Le provider générique n'en est pas : son adresse ne vient que
+        // de `openai-base-url`, faute de défaut à surcharger.
         (process.env[`${target.provider.toUpperCase()}_HOST`] ?? spec.defaultBaseUrl).replace(
           /\/$/,
           '',
@@ -196,6 +198,31 @@ function endpointFor(config: Config, target: PassConfig): { baseUrl: string; api
   const apiKey = config.keys[target.provider] ?? '';
   if (!baseUrl || !apiKey) return null;
   return { baseUrl, apiKey };
+}
+
+/**
+ * Prévient quand une clé partirait en clair sur le réseau.
+ *
+ * Une base en `http://` est légitime en local, où le bac à sable de ce dépôt
+ * l'utilise ; vers un hôte distant, elle expose l'en-tête `Authorization` à
+ * quiconque écoute. On avertit sans refuser : c'est une configuration
+ * délibérée, et le job ne rougit jamais.
+ */
+function warnOnClearTextKey(config: Config, targets: readonly PassConfig[]): void {
+  const risky = new Set<string>();
+  for (const target of targets) {
+    const endpoint = endpointFor(config, target);
+    if (!endpoint) continue;
+    if (/^https:/i.test(endpoint.baseUrl)) continue;
+    if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(endpoint.baseUrl)) continue;
+    risky.add(endpoint.baseUrl);
+  }
+  for (const baseUrl of risky) {
+    console.warn(
+      `⚠ ${baseUrl} n'est pas en HTTPS : la clé part en clair dans un en-tête.\n` +
+        "  Acceptable sur un hôte local, jamais vers un endpoint distant.",
+    );
+  }
 }
 
 /** Ce que pèsent les messages, consignes d'un côté et contexte de l'autre. */
@@ -531,6 +558,15 @@ function describePrefix(group: PassPrompt[]): string {
  * pied de page le déclare : c'est une décision, pas une panne, et le job reste
  * vert dans les deux cas.
  */
+/**
+ * La destination effective d'un appel, repli compris.
+ *
+ * ⚠️ **Mutation assumée** : le repli est écrit dans `config.passConfigs`, et pas
+ * seulement rendu. C'est ce qui fait qu'une passe repliée part bien sur son
+ * nouveau provider, `planPasses` relisant la table. L'ordre compte donc :
+ * appeler `planPasses` avant cette fonction laisserait le plan pointer vers un
+ * provider sans clé, et le repli ne servirait à rien.
+ */
 function resolveTarget(
   config: Config,
   id: PassId,
@@ -661,6 +697,8 @@ async function review(config: Config): Promise<void> {
   for (const { label, reason } of selection.skipped) {
     console.log(`· passe « ${label} » non lancée : ${reason}.`);
   }
+  warnOnClearTextKey(config, plan.map(({ target }) => target));
+
   // Une seule fois, et seulement quand ça change quelque chose : une graine
   // posée dans le workflow laisserait croire à une review reproductible partout.
   if (config.seed !== undefined) {
