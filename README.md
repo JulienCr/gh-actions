@@ -230,6 +230,11 @@ déclaré dans le pied de page du commentaire.
 | Passes | les trois | une passe qu'une PR ne peut pas déclencher n'est pas lancée | idem |
 | `thinking` | inchangé | inchangé | un cran plus bas sur « doctrine » et « données » |
 
+`full` reproduit le comportement d'avant ce réglage, à deux exceptions près qui valent à tous les
+crans : les doublons purs ne partent plus (contenu d'un fichier seulement renommé, corps du diff
+d'un fichier neuf dont le contenu numéroté suit), et la passe « doctrine » ne tourne pas sans
+doctrine. Aucune de ces deux coupes ne retire au modèle quoi que ce soit qu'il n'ait déjà.
+
 Deux garde-fous que le cran ne lève jamais. **La passe « données et accès » tourne toujours** : un
 README fuit une clé aussi bien qu'un `.ts`, et une doc d'API publie un endpoint interne. Une
 fuite coûte incomparablement plus cher qu'une passe. Et **aucun cran ne supprime un axe** :
