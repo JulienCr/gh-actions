@@ -65,6 +65,14 @@ export interface Pass {
   id: string;
   /** Nom français, affiché quand la passe n'aboutit pas. */
   label: string;
+  /**
+   * Nom anglais de l'axe, pour le prompt de fusion.
+   *
+   * Distinct de `label`, qui est français parce qu'il s'affiche : les consignes,
+   * elles, sont en anglais de bout en bout. Traduire au vol dans le prompt
+   * mélangerait les deux registres au milieu du contexte.
+   */
+  axis: string;
   objective: string;
 }
 
@@ -72,6 +80,7 @@ export const PASSES: readonly Pass[] = [
   {
     id: 'regression',
     label: 'régression fonctionnelle',
+    axis: "functional regressions",
     objective: `# Your one job in this pass: functional regressions
 
 You are not looking at conventions, style, or data access. Another pass covers those. You are
@@ -95,6 +104,7 @@ production.
   {
     id: 'doctrine',
     label: 'doctrine du dépôt',
+    axis: "the repository's own conventions",
     objective: `# Your one job in this pass: the repository's own rules
 
 Judge this PR against the doctrine quoted above, and against nothing else. Other passes cover
@@ -116,6 +126,7 @@ substitute your own conventions for the ones it did not write.`,
   {
     id: 'data',
     label: 'données et accès',
+    axis: "data access",
     objective: `# Your one job in this pass: data, secrets, and access boundaries
 
 Not runtime bugs, not conventions. Who can read what, and what escapes to where.
@@ -176,6 +187,38 @@ Une seule phrase : ce que tu retiens de cette PR.
 export interface MergeOptions {
   repo: string;
   maxFindings: number;
+  /**
+   * Les passes qui ont RÉELLEMENT lu, pas celles qui étaient prévues.
+   *
+   * Le prompt annonçait trois relecteurs en toutes lettres. Quand une passe
+   * échouait, la fusion cherchait un axe qu'on ne lui avait pas donné, ou
+   * hédgeait sur son absence : `index.ts` savait laquelle manquait, elle non.
+   */
+  passes: readonly Pass[];
+}
+
+/** Une énumération anglaise : virgules, puis « and » devant le dernier terme. */
+function enumerate(items: string[]): string {
+  if (items.length < 2) return items.join('');
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
+const WORDS = ['no', 'a single', 'two', 'three', 'four', 'five'];
+
+/**
+ * L'ouverture du prompt de fusion, accordée au nombre de relecteurs.
+ *
+ * Un « Three reviewers » écrit en dur devient un mensonge dès qu'une passe
+ * échoue ou n'est pas lancée, et un modèle à qui on ment sur son entrée comble
+ * le manque plutôt que de le signaler.
+ */
+function opening(repo: string, passes: readonly Pass[]): string {
+  const axes = enumerate(passes.map((pass) => pass.axis));
+  if (passes.length === 1) {
+    return `One reviewer has just read a pull request on \`${repo}\`, on a single axis: ${axes}.`;
+  }
+  const word = WORDS[passes.length] ?? String(passes.length);
+  return `${word[0]!.toUpperCase()}${word.slice(1)} reviewers have just read the same pull request on \`${repo}\`, each on one axis: ${axes}.`;
 }
 
 /**
@@ -187,8 +230,7 @@ export interface MergeOptions {
  * mémoire une trouvaille qu'elle trouve trop courte, et inventerait.
  */
 export function buildMergeSystemPrompt(options: MergeOptions): string {
-  return `Three reviewers have just read the same pull request on \`${options.repo}\`, each on one axis:
-functional regressions, the repository's own conventions, and data access. You are assembling
+  return `${opening(options.repo, options.passes)} You are assembling
 their findings into the single comment that gets posted on the PR.
 
 **You do not have the code.** You only have what they wrote. So:

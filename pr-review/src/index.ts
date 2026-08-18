@@ -399,7 +399,13 @@ async function review(config: Config): Promise<void> {
 
   const merged = await callModel(config, run, {
     id: 'merge',
-    system: buildMergeSystemPrompt({ repo, maxFindings: config.maxFindings }),
+    // Les passes qui ont abouti, pas celles qui étaient prévues : annoncer un
+    // relecteur qui n'a rien rendu ferait chercher à la fusion un axe absent.
+    system: buildMergeSystemPrompt({
+      repo,
+      maxFindings: config.maxFindings,
+      passes: outcomes.map((outcome) => outcome.pass),
+    }),
     user: buildMergeUserPrompt(meta, outcomes),
     think: config.mergeThinking,
     label: 'fusion',

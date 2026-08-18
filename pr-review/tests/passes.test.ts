@@ -7,6 +7,7 @@ import {
   buildPassSystemPrompt,
   PASSES,
   PASS_HEADING,
+  type Pass,
 } from '../src/passes';
 import type { PromptOptions } from '../src/prompt';
 
@@ -83,7 +84,8 @@ describe('les trois passes', () => {
 });
 
 describe('buildMergeSystemPrompt', () => {
-  const merge = (maxFindings = 20) => buildMergeSystemPrompt({ repo: 'JulienCr/exemple', maxFindings });
+  const merge = (maxFindings = 20, passes: readonly Pass[] = PASSES) =>
+    buildMergeSystemPrompt({ repo: 'JulienCr/exemple', maxFindings, passes });
 
   it('impose les cinq rubriques, dont l’exutoire des doutes', () => {
     const prompt = merge();
@@ -140,5 +142,33 @@ describe('buildMergeUserPrompt', () => {
 
   it('n’attend pas les trois passes pour rendre un prompt utilisable', () => {
     expect(prompt).not.toContain('## Reviewer: doctrine du dépôt');
+  });
+});
+
+
+describe('l’ouverture de la fusion, accordée à ce qui a réellement été lu', () => {
+  const merge = (passes: readonly Pass[]) =>
+    buildMergeSystemPrompt({ repo: 'JulienCr/exemple', maxFindings: 20, passes });
+
+  it('annonce trois relecteurs et leurs trois axes quand les trois ont abouti', () => {
+    const prompt = merge(PASSES);
+    expect(prompt).toContain('Three reviewers have just read');
+    expect(prompt).toContain("functional regressions, the repository's own conventions and data access");
+  });
+
+  /**
+   * Le cas qui mentait déjà avant toute optimisation : une passe qui échoue
+   * laissait la fusion chercher un axe qu'on ne lui avait pas donné.
+   */
+  it('n’annonce que deux relecteurs quand une passe n’a pas abouti', () => {
+    const prompt = merge(PASSES.filter((pass) => pass.id !== 'data'));
+    expect(prompt).toContain('Two reviewers have just read');
+    expect(prompt).not.toContain('data access');
+  });
+
+  it('accorde le singulier quand une seule passe a lu', () => {
+    const prompt = merge(PASSES.filter((pass) => pass.id === 'doctrine'));
+    expect(prompt).toContain('One reviewer has just read');
+    expect(prompt).not.toContain('reviewers have');
   });
 });
