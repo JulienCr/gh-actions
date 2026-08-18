@@ -167,7 +167,9 @@ describe('resolveConfig · réglages du modèle', () => {
   });
 
   it('règle la fusion plus bas que les passes : elle trie, elle ne relit pas', () => {
-    expect(resolve().passConfigs.merge.thinking).toBe('high');
+    // Le mix la pose à « low » ; sans mix, elle garde le défaut historique.
+    expect(resolve().passConfigs.merge.thinking).toBe('low');
+    expect(resolve({ INPUT_MODEL: 'glm-5.2:cloud' }).passConfigs.merge.thinking).toBe('high');
     expect(resolve({ 'INPUT_MERGE-THINKING': 'max' }).passConfigs.merge.thinking).toBe('max');
   });
 
@@ -259,10 +261,27 @@ describe('les drapeaux de mesure', () => {
  * dans les secrets.
  */
 describe('resolveConfig · la destination de chaque appel', () => {
-  it('laisse les quatre appels sur Ollama quand aucune clé DeepSeek n’existe', () => {
+  /**
+   * Sans clé DeepSeek, le mix passe quand même : Ollama sert le même modèle, à
+   * un niveau d'usage moyen là où glm-5.2 est à un niveau élevé. La clé
+   * n'achète pas le modèle bon marché, elle achète son cache de préfixe.
+   */
+  it('passe par Ollama pour le modèle bon marché quand aucune clé DeepSeek n’existe', () => {
     const config = resolve();
     for (const target of Object.values(config.passConfigs)) {
       expect(target.provider).toBe('ollama');
+    }
+    expect(config.passConfigs.regression.model).toBe(DEFAULTS.model);
+    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4-flash:cloud');
+    expect(config.passConfigs.data.model).toBe('deepseek-v4-flash:cloud');
+    expect(config.passConfigs.merge.model).toBe('deepseek-v4-flash:cloud');
+  });
+
+  /** Un dépôt qui a désigné son provider a pris la main : pas de renvoi ailleurs. */
+  it('ne renvoie pas vers Ollama un dépôt qui a choisi un autre provider global', () => {
+    const config = resolve({ INPUT_PROVIDER: 'openai' });
+    for (const target of Object.values(config.passConfigs)) {
+      expect(target.provider).toBe('openai');
       expect(target.model).toBe(DEFAULTS.model);
     }
   });
@@ -298,11 +317,13 @@ describe('resolveConfig · la destination de chaque appel', () => {
     expect(config.passConfigs.data.model).toBe(config.passConfigs.doctrine.model);
   });
 
-  it('n’écrase pas un modèle écrit à la main, même avec une clé DeepSeek', () => {
-    const config = resolve({ 'INPUT_DEEPSEEK-API-KEY': 'ds', INPUT_MODEL: 'qwen3-coder:cloud' });
-    for (const target of Object.values(config.passConfigs)) {
-      expect(target.provider).toBe('ollama');
-      expect(target.model).toBe('qwen3-coder:cloud');
+  it('n’écrase pas un modèle écrit à la main, avec ou sans clé DeepSeek', () => {
+    for (const env of [{}, { 'INPUT_DEEPSEEK-API-KEY': 'ds' }]) {
+      const config = resolve({ ...env, INPUT_MODEL: 'qwen3-coder:cloud' });
+      for (const target of Object.values(config.passConfigs)) {
+        expect(target.provider).toBe('ollama');
+        expect(target.model).toBe('qwen3-coder:cloud');
+      }
     }
   });
 
@@ -322,9 +343,9 @@ describe('resolveConfig · la destination de chaque appel', () => {
   it('ne fait pas hériter le modèle du mix à une passe redirigée ailleurs', () => {
     const config = resolve({
       'INPUT_DEEPSEEK-API-KEY': 'ds',
-      'INPUT_DOCTRINE-PROVIDER': 'ollama',
+      'INPUT_DOCTRINE-PROVIDER': 'openai',
     });
-    expect(config.passConfigs.doctrine.provider).toBe('ollama');
+    expect(config.passConfigs.doctrine.provider).toBe('openai');
     expect(config.passConfigs.doctrine.model).toBe(DEFAULTS.model);
   });
 

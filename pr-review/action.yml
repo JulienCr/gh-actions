@@ -31,11 +31,11 @@ inputs:
 
   deepseek-api-key:
     description: >-
-      Clé DeepSeek. La fournir suffit à activer le mix recommandé : « doctrine »,
-      « données et accès » et la fusion passent sur deepseek-v4-flash, et seule
-      la régression reste sur le provider global. Ces deux premières partagent
-      alors un cache de préfixe, ce qui divise par trente le coût de leur
-      contexte commun. Vide : comportement inchangé, tout part sur Ollama.
+      Clé DeepSeek. Fait passer les trois appels bon marché du mix par l'API
+      directe au lieu d'Ollama, ce qui ajoute un cache de préfixe automatique :
+      « doctrine » et « données » partagent le même gros contexte, et la seconde
+      le rejoue trente et une fois moins cher. Vide : le même modèle, servi par
+      Ollama, sans cache.
     required: false
     default: ''
 
@@ -57,7 +57,9 @@ inputs:
   provider:
     description: >-
       Provider des passes qui n'en désignent pas d'autre : ollama, deepseek ou
-      openai. Un identifiant inconnu est signalé et ignoré.
+      openai. Un identifiant inconnu est signalé et ignoré. ⚠️ En désigner un
+      autre qu'ollama écarte le mix : le dépôt a pris la main, on ne renvoie pas
+      ses passes ailleurs dans son dos.
     required: false
     default: 'ollama'
 
@@ -68,11 +70,11 @@ inputs:
 
   model:
     description: >-
-      Modèle du provider global. Laissé vide : glm-5.2:cloud. ⚠️ L'écrire
-      DÉSACTIVE le mix recommandé pour les quatre appels : déplacer une passe
-      vers un autre provider en lui laissant le modèle d'un autre produirait un
-      404, pas un compromis. Pour n'en changer qu'une, utiliser
-      « <passe>-model ».
+      Modèle du provider global, et donc de la seule passe « régression » quand
+      le mix s'applique. Laissé vide : glm-5.2:cloud. ⚠️ L'écrire remet les
+      QUATRE appels dessus : envoyer un modèle à un provider qui ne le sert pas
+      produirait un 404, pas un compromis, donc un modèle nommé à la main écarte
+      le mix entier. Pour n'en changer qu'une passe, « <passe>-model ».
     required: false
     default: ''
 
@@ -174,9 +176,9 @@ inputs:
   merge-thinking:
     description: >-
       Effort de raisonnement de la fusion, qui trie les trouvailles des trois
-      passes sans avoir le code sous les yeux. Laissé vide : high, ou low quand
-      le mix est actif. Plus bas que « thinking » à dessein : c'est la fusion
-      qui s'ajoute au mur du job.
+      passes sans avoir le code sous les yeux. Laissé vide : low quand le mix
+      s'applique, high sinon. Plus bas que « thinking » à dessein : c'est la
+      fusion qui s'ajoute au mur du job.
     required: false
     default: ''
 
@@ -262,12 +264,12 @@ inputs:
   timeout-minutes:
     description: >-
       Délai maximum d'UNE requête au modèle. La review en fait quatre. Les
-      passes qui visent des providers différents tournent en parallèle ; celles
-      qui partagent un provider ET un modèle s'enchaînent, pour que la seconde
-      rejoue le préfixe de la première en cache. Le mur du job vaut donc
-      « le groupe le plus lent, plus la fusion ». Le timeout-minutes du job doit
-      rester au-dessus, sinon le commentaire d'échec n'a pas le temps d'être
-      posté.
+      passes tournent en parallèle, sauf celles qui partagent un provider ET un
+      modèle CHEZ UN PROVIDER QUI CACHE LES PRÉFIXES : celles-là s'enchaînent,
+      pour que la seconde rejoue le préfixe de la première. Le mur du job vaut
+      donc « le groupe le plus lent, plus la fusion ». Le timeout-minutes du job
+      doit rester au-dessus, sinon le commentaire d'échec n'a pas le temps
+      d'être posté.
     required: false
     default: '15'
 

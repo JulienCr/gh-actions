@@ -153,14 +153,27 @@ export interface PassConfig {
 }
 
 /**
- * Le mix recommandé, actif dès qu'une clé DeepSeek est fournie.
+ * Le modèle bon marché, sous le nom que chaque provider lui donne.
  *
- * Trois passes sur quatre quittent Ollama. Pourquoi celles-là et pas la
- * quatrième :
+ * Le même poids (284 milliards de paramètres dont 13 actifs), servi par deux
+ * routes. Ollama le facture en temps GPU, à un **niveau d'usage moyen** là où
+ * `glm-5.2:cloud` est à un niveau élevé : le déplacement paie déjà avec la
+ * seule clé Ollama. DeepSeek le facture au token, et y ajoute un cache de
+ * préfixe qui rend le contexte commun des deux passes presque gratuit.
+ */
+const CHEAP_MODEL: Record<string, string> = {
+  ollama: 'deepseek-v4-flash:cloud',
+  deepseek: 'deepseek-v4-flash',
+};
+
+/**
+ * Le mix recommandé : trois appels sur quatre quittent le modèle flagship.
+ *
+ * Pourquoi ces trois-là, et pas le quatrième :
  *
  * - **régression** n'y est pas. C'est la passe la plus complexe, la valeur de
  *   GLM-5.2 y est observée empiriquement, et rien ne prouve qu'un autre modèle
- *   la tienne. Elle garde donc le provider global, quel qu'il soit.
+ *   la tienne. Elle garde le provider et le modèle globaux.
  * - **doctrine** est une tâche `règle -> conformité -> preuve`, très guidée par
  *   un document qu'elle a sous les yeux. Un modèle bien moins cher y suffit.
  * - **données et accès** est plus subtile, mais V4-Flash est un point de départ
@@ -169,16 +182,33 @@ export interface PassConfig {
  * - **fusion** ne reçoit pas le code : elle trie une trentaine de puces. Un
  *   flagship n'y achèterait que de la latence, d'où `low`.
  *
- * Doctrine et données partagent volontairement le même couple provider+modèle :
- * c'est ce qui leur permet de partager un cache de préfixe, et donc de ne payer
+ * Doctrine et données partagent volontairement le même couple provider+modèle.
+ * Chez un provider qui cache les préfixes, c'est ce qui leur permet de ne payer
  * qu'une fois les quatre-vingt-dix kilo-octets de contexte commun. Les séparer
- * annulerait le principal levier d'économie de ce mix.
+ * annulerait ce levier.
  */
-export const DEFAULT_MIX: Partial<Record<PassId, PassConfig>> = {
-  doctrine: { provider: 'deepseek', model: 'deepseek-v4-flash', thinking: 'high' },
-  data: { provider: 'deepseek', model: 'deepseek-v4-flash', thinking: 'high' },
-  merge: { provider: 'deepseek', model: 'deepseek-v4-flash', thinking: 'low' },
-};
+export function mixFor(provider: string): Partial<Record<PassId, PassConfig>> {
+  const model = CHEAP_MODEL[provider];
+  if (!model) return {};
+  return {
+    doctrine: { provider, model, thinking: 'high' },
+    data: { provider, model, thinking: 'high' },
+    merge: { provider, model, thinking: 'low' },
+  };
+}
+
+/**
+ * Par quelle route le mix passe, ou `null` quand il ne s'applique pas.
+ *
+ * DeepSeek en direct dès qu'une clé existe, parce que son cache de préfixe est
+ * le levier le plus fort. Sinon Ollama, qui sert le même modèle et suffit à
+ * descendre d'un niveau d'usage. Un dépôt qui a désigné un autre provider
+ * global a pris la main : on ne le renvoie pas ailleurs dans son dos.
+ */
+export function mixRoute(provider: string, hasDeepSeekKey: boolean): string | null {
+  if (hasDeepSeekKey) return 'deepseek';
+  return provider === 'ollama' ? 'ollama' : null;
+}
 
 export interface Config {
   pr: number;
@@ -430,8 +460,8 @@ export interface MixOptions {
   /** `merge-thinking` tel qu'écrit par le dépôt, ou vide. */
   mergeThinking: string;
   effort: Effort;
-  /** Le mix recommandé s'applique-t-il ? */
-  useMix: boolean;
+  /** Le mix qui s'applique. Vide : chaque passe suit les inputs globaux. */
+  mix: Partial<Record<PassId, PassConfig>>;
 }
 
 /**
@@ -455,7 +485,7 @@ export function resolvePassConfigs(
     configs[id] = resolvePass(
       env,
       id,
-      options.useMix ? DEFAULT_MIX[id] : undefined,
+      options.mix[id],
       {
         provider: options.provider,
         model: options.model,
@@ -535,10 +565,10 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   };
 
   const provider = readProvider(env, 'provider', DEFAULTS.provider, warn);
-  // Le mix déplace trois appels sur quatre vers DeepSeek : sans clé il n'a rien
-  // à quoi s'adresser, et avec un modèle écrit à la main il contredirait une
-  // intention explicite. Dans les deux cas on garde le comportement d'avant.
-  const useMix = keys.deepseek !== '' && model === '';
+  // Un modèle écrit à la main contredit le mix : déplacer une passe ailleurs en
+  // lui laissant le modèle d'un autre provider produirait un 404, pas un
+  // compromis. L'écrire garde donc le comportement d'avant, pour les quatre.
+  const route = model === '' ? mixRoute(provider, keys.deepseek !== '') : null;
 
   return {
     pr,
@@ -555,7 +585,7 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
         thinking: readInput(env, 'thinking'),
         mergeThinking: readInput(env, 'merge-thinking'),
         effort,
-        useMix,
+        mix: route === null ? {} : mixFor(route),
       },
       warn,
     ),

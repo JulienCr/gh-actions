@@ -1332,11 +1332,23 @@ var DEFAULTS = {
   windowMinLines: { full: 0, balanced: 250, lean: 120 }
 };
 var PASS_IDS = ["regression", "doctrine", "data", "merge"];
-var DEFAULT_MIX = {
-  doctrine: { provider: "deepseek", model: "deepseek-v4-flash", thinking: "high" },
-  data: { provider: "deepseek", model: "deepseek-v4-flash", thinking: "high" },
-  merge: { provider: "deepseek", model: "deepseek-v4-flash", thinking: "low" }
+var CHEAP_MODEL = {
+  ollama: "deepseek-v4-flash:cloud",
+  deepseek: "deepseek-v4-flash"
 };
+function mixFor(provider) {
+  const model = CHEAP_MODEL[provider];
+  if (!model) return {};
+  return {
+    doctrine: { provider, model, thinking: "high" },
+    data: { provider, model, thinking: "high" },
+    merge: { provider, model, thinking: "low" }
+  };
+}
+function mixRoute(provider, hasDeepSeekKey) {
+  if (hasDeepSeekKey) return "deepseek";
+  return provider === "ollama" ? "ollama" : null;
+}
 var UsageError = class extends Error {
 };
 function readInput(env, name) {
@@ -1422,7 +1434,7 @@ function resolvePassConfigs(env, options, warn = () => {
     configs[id] = resolvePass(
       env,
       id,
-      options.useMix ? DEFAULT_MIX[id] : void 0,
+      options.mix[id],
       {
         provider: options.provider,
         model: options.model,
@@ -1479,7 +1491,7 @@ function resolveConfig({ argv, env, warn = () => {
     openai: readInput(env, "openai-api-key") || env.OPENAI_API_KEY?.trim() || ""
   };
   const provider = readProvider(env, "provider", DEFAULTS.provider, warn);
-  const useMix = keys.deepseek !== "" && model === "";
+  const route = model === "" ? mixRoute(provider, keys.deepseek !== "") : null;
   return {
     pr,
     dryRun,
@@ -1495,7 +1507,7 @@ function resolveConfig({ argv, env, warn = () => {
         thinking: readInput(env, "thinking"),
         mergeThinking: readInput(env, "merge-thinking"),
         effort,
-        useMix
+        mix: route === null ? {} : mixFor(route)
       },
       warn
     ),

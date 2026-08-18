@@ -28,9 +28,9 @@ jobs:
   review:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    # Le mur vaut « groupe le plus lent + fusion ». Les passes qui partagent
-    # provider ET modèle s'enchaînent pour se passer un cache de préfixe ; les
-    # autres restent parallèles. Plus la marge du commentaire d'échec.
+    # Le mur vaut « groupe le plus lent + fusion ». Les passes ne s'enchaînent
+    # que chez un provider qui cache les préfixes ; sur Ollama elles restent
+    # parallèles. Plus la marge du commentaire d'échec.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
@@ -45,9 +45,9 @@ jobs:
         with:
           pr: ${{ github.event.pull_request.number || inputs.pr }}
           ollama-api-key: ${{ secrets.OLLAMA_API_KEY }}
-          # Rallume ce que le quota avait éteint : trois appels sur quatre
-          # quittent Ollama, qui ne garde que la passe de régression. Le secret
-          # absent ramène simplement le comportement d'avant, et le job vert.
+          # Facultative, et absente aujourd'hui : sans elle, les trois appels
+          # bon marché partent quand même, sur le deepseek-v4-flash d'Ollama.
+          # La poser ajouterait le cache de préfixe de l'API directe.
           deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
           skip: |
             */dist/**
