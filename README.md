@@ -37,6 +37,11 @@ name: Review IA des PR
 on:
   pull_request:
     types: [opened, ready_for_review]
+  # Une mention rattrape ce que les deux autres ne couvrent pas : ni « opened »
+  # ni « ready_for_review » ne se rejouent sur une PR déjà relue, et un rebase
+  # ne redéclenche rien.
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       pr:
@@ -47,30 +52,58 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  # Pour réagir 👀 au commentaire déclencheur. Un commentaire de conversation de
+  # PR est un commentaire d'issue au sens de l'API : « pull-requests » ne suffit pas.
+  issues: write
 
 concurrency:
-  group: pr-review-${{ github.event.pull_request.number || inputs.pr }}
+  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
   cancel-in-progress: true
 
 jobs:
   review:
     # Un brouillon ne consomme pas de quota : il sera relu au passage en « prêt ».
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    # La mention passe outre le brouillon : demander explicitement une review
+    # sur un brouillon est une demande, pas un accident.
+    #
+    # ⚠️ La garde sur l'auteur n'est pas du confort. `issue_comment` s'exécute avec
+    # les secrets du dépôt et un jeton en écriture, sur commentaire de n'importe
+    # qui. Sur un dépôt public, sans allowlist, un inconnu vide la clé Ollama en
+    # boucle. Mettre son propre login. `issue.pull_request` écarte au passage les
+    # commentaires d'issue, que le même événement porte aussi.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request
+          && github.event.comment.user.login == 'JulienCr'
+          && contains(github.event.comment.body, '@aristarque review'))
     runs-on: ubuntu-latest
     # Trois passes en parallèle puis leur fusion : le mur vaut jusqu'à deux fois
     # le « timeout-minutes » de l'action, plus la marge du commentaire d'échec.
     timeout-minutes: 40
     steps:
+      # Un run déclenché par commentaire n'apparaît pas comme check sur la PR :
+      # sans cet accusé de réception, la mention se fait à l'aveugle.
+      - name: Accuser réception de la mention
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST \
+            "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes
+
       # La tête de la PR, pas le commit de merge : le contenu lu doit
       # correspondre au diff, sinon le modèle raisonne sur des numéros de ligne
       # qui ont bougé.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', inputs.pr) }}
+          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', github.event.issue.number || inputs.pr) }}
 
       - uses: JulienCr/gh-actions/pr-review@v2
         with:
-          pr: ${{ github.event.pull_request.number || inputs.pr }}
+          pr: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
           ollama-api-key: ${{ secrets.OLLAMA_API_KEY }}
           doctrine: |
             .github/copilot-instructions.md
@@ -88,9 +121,31 @@ est cassé, c'est-à-dire précisément quand une review sert.
 son commit de merge, donc il n'émet pas l'événement. Copilot, lui, passe par un autre mécanisme et
 tourne quand même, ce qui rend l'asymétrie déroutante. Si la review ne part pas sur une PR neuve,
 vérifier `gh pr view <n> --json mergeable` avant de suspecter le YAML : rebaser suffit. Corollaire,
-`synchronize` n'étant pas dans les types écoutés, relancer la review après un rebase se fait par
-`workflow_dispatch`, ou en repassant la PR en brouillon puis en « prêt »
-(`gh pr ready --undo <n> && gh pr ready <n>`).
+`synchronize` n'étant pas dans les types écoutés, relancer la review après un rebase demande une
+mention : voir [Déclencher une review à la demande](#déclencher-une-review-à-la-demande).
+
+### Déclencher une review à la demande
+
+Commenter `@aristarque review` sur une pull request relance la lecture. C'est le chemin qui manquait
+pour une deuxième passe : `synchronize` n'est pas écouté, donc pousser des corrections ne rejoue
+rien, et l'aller-retour brouillon (`gh pr ready --undo <n> && gh pr ready <n>`) marche mais laisse
+deux événements parasites dans l'historique de la PR.
+
+La mention passe outre le brouillon, contrairement aux deux autres déclencheurs. La règle du
+brouillon existe pour ne pas dépenser de quota sans qu'on l'ait demandé, pas pour empêcher de le
+demander.
+
+**La garde sur l'auteur n'est pas optionnelle.** `issue_comment` s'exécute avec les secrets du dépôt
+et un jeton en écriture, sur commentaire de n'importe qui. Sur un dépôt public, sans allowlist, un
+inconnu déclenche la review en boucle et vide la clé Ollama. L'exemple ci-dessus filtre sur un login
+unique ; `github.event.comment.author_association` comparé à `OWNER`, `MEMBER` ou `COLLABORATOR`
+convient mieux à un dépôt qui a plusieurs mainteneurs.
+
+Deux choses surprennent la première fois. GitHub n'exécute que la version du workflow présente sur
+la branche par défaut, donc le déclencheur ne marche qu'une fois mergé, jamais depuis la PR qui
+l'introduit. Et un run lancé par commentaire n'apparaît pas comme check sur la PR, seulement dans
+l'onglet Actions : d'où la réaction `eyes` posée sur le commentaire déclencheur, qui coûte la permission
+`issues: write`, un commentaire de conversation de PR étant un commentaire d'issue au sens de l'API.
 
 ### Inputs
 
