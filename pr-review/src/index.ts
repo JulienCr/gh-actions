@@ -27,13 +27,22 @@ import { currentHeadSha, fetchPrDiff, fetchPrMeta, postComment, resolveRepo, typ
 import { compileMatcher } from './globs';
 import {
   isEnabled,
+  readInput,
   resolveConfig,
   UsageError,
   type Config,
+  type Env,
   type PassConfig,
   type PassId,
 } from './inputs';
-import { estimateCost, PROVIDERS, LlmError, type ChatMessage, type ChatResult } from './llm';
+import {
+  estimateCost,
+  isPeakHour,
+  LlmError,
+  PROVIDERS,
+  type ChatMessage,
+  type ChatResult,
+} from './llm';
 import { type DoctrineFile, type PromptOptions } from './prompt';
 import {
   buildMergeSystemPrompt,
@@ -225,6 +234,18 @@ function warnOnClearTextKey(config: Config, targets: readonly PassConfig[]): voi
   }
 }
 
+/**
+ * Enchaîner deux appels chez ce provider achète-t-il un préfixe en cache ?
+ *
+ * L'endpoint générique n'a pas de réponse par défaut : personne ne sait ce
+ * qu'un endpoint qu'on ne connaît pas garantit, et le supposer coûterait du
+ * temps de job contre une économie imaginaire. C'est au dépôt de le dire.
+ */
+function cachesPrefixes(config: Config, provider: string): boolean {
+  if (provider === 'openai') return config.openaiPrefixCache;
+  return PROVIDERS[provider]?.prefixCache ?? false;
+}
+
 /** Ce que pèsent les messages, consignes d'un côté et contexte de l'autre. */
 function sizes(messages: ChatMessage[]): { instructionChars: number; contextChars: number } {
   // Le contexte est le PREMIER message user : c'est ce que produit
@@ -314,7 +335,10 @@ async function callModel(
     thinkingChars: result.thinkingChars,
     contentChars: result.content.length,
     durationMs: result.durationMs,
-    costUsd: estimateCost(target.provider, target.model, result.usage),
+    // Le régime horaire au moment de l'appel : DeepSeek facture moitié prix
+    // hors des heures pleines, et supposer le pire gonflerait de deux le seul
+    // chiffre qui sert à juger cette refonte.
+    costUsd: estimateCost(target.provider, target.model, result.usage, isPeakHour(new Date())),
     ok: true,
   };
   run.calls.push(stat);
@@ -369,7 +393,7 @@ function planPasses(
       provider: target.provider,
       model: target.model,
       chars: messages.reduce((sum, message) => sum + message.content.length, 0),
-      cacheable: PROVIDERS[target.provider]?.prefixCache ?? false,
+      cacheable: cachesPrefixes(config, target.provider),
     };
   });
 }
@@ -485,12 +509,12 @@ function countOnly(config: Config, plan: PassPrompt[], context: AssembledContext
       thinkingChars: 0,
       contentChars: 0,
       durationMs: 0,
-      costUsd: estimateCost(target.provider, target.model, {
-        inputTokens,
-        cachedInputTokens: 0,
-        outputTokens: 0,
-        reasoningTokens: 0,
-      }),
+      costUsd: estimateCost(
+        target.provider,
+        target.model,
+        { inputTokens, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0 },
+        isPeakHour(new Date()),
+      ),
       ok: true,
     };
   });
@@ -853,6 +877,35 @@ function knownPaths(meta: PrMeta, context: AssembledContext): Set<string> {
   ]);
 }
 
+/**
+ * Complète l'environnement avec les clés que 1Password garde, en local.
+ *
+ * **Avant** `resolveConfig`, et c'est tout l'objet de cette fonction : le mix
+ * choisit sa route sur les clés disponibles, et une clé DeepSeek qui n'arrivait
+ * qu'après ne pesait sur rien. Le support local de DeepSeek était donc
+ * inopérant pour qui range sa clé dans 1Password plutôt que dans son shell,
+ * c'est-à-dire pour l'usage que ce dépôt recommande.
+ *
+ * Les candidats sont les providers qui ont une référence connue, et rien de
+ * plus : on ne peut pas savoir lesquels serviront tant que le mix n'a pas
+ * choisi, et le mix ne peut pas choisir sans les clés. Deux lectures, pas
+ * douze.
+ */
+async function loadLocalKeys(env: NodeJS.ProcessEnv): Promise<Env> {
+  const enriched: Env = { ...env };
+  if (process.env.GITHUB_ACTIONS === 'true') return enriched;
+
+  for (const provider of Object.keys(DEFAULT_KEY_REFS)) {
+    const variable = `${provider.toUpperCase()}_API_KEY`;
+    // Ni l'input ni l'environnement n'ont la clé : c'est le seul cas où aller
+    // la chercher se justifie.
+    if (readInput(enriched, `${provider}-api-key`) || enriched[variable]?.trim()) continue;
+    const key = await keyFrom1Password(provider);
+    if (key) enriched[variable] = key;
+  }
+  return enriched;
+}
+
 async function main(): Promise<void> {
   // Avant tout le reste : ni PR lue, ni clé cherchée, ni token dépensé. Le job
   // reste vert, et le log dit pourquoi il n'y aura pas de commentaire.
@@ -861,9 +914,14 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Lu sur argv brut, avant toute résolution : ce drapeau décide s'il faut une
+  // clé, et la résolution a besoin des clés. Le poids d'un `includes` contre
+  // une lecture 1Password inutile.
+  const countOnly = process.argv.slice(2).includes('--count-only');
+
   const config = resolveConfig({
     argv: process.argv.slice(2),
-    env: process.env,
+    env: countOnly ? process.env : await loadLocalKeys(process.env),
     warn: (message) => console.warn(`⚠ ${message}`),
   });
 
@@ -875,16 +933,15 @@ async function main(): Promise<void> {
   // `--count-only` n'appelle rien : exiger une clé pour compter des caractères
   // interdirait de mesurer depuis un poste sans 1Password, ou depuis la CI.
   if (!config.countOnly) {
-    // Seulement les providers que cette review va réellement solliciter : aller
-    // chercher une clé DeepSeek dans 1Password alors qu'aucune passe n'y part
-    // ferait clignoter l'application pour rien.
+    // SEULEMENT les providers que cette review va solliciter. Une clé qui
+    // traîne dans l'environnement pour un tout autre usage — un
+    // `OPENAI_API_KEY` posé pour un autre outil — ne doit pas empêcher le
+    // silence promis à une PR venue d'un fork, qui poserait alors un
+    // commentaire d'échec là où rien n'était attendu.
     const wanted = new Set(Object.values(config.passConfigs).map((target) => target.provider));
     wanted.add(config.provider);
-    for (const provider of wanted) {
-      if (!config.keys[provider]) config.keys[provider] = await keyFrom1Password(provider);
-    }
 
-    if (Object.values(config.keys).every((key) => !key)) {
+    if ([...wanted].every((provider) => !config.keys[provider])) {
       // Cas nominal d'une PR venue d'un fork : GitHub n'y expose pas les
       // secrets. Rien à commenter, rien à faire échouer.
       console.log('Aucune clé de provider : review ignorée.');

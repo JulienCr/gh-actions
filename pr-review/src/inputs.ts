@@ -12,7 +12,7 @@
  * là pour l'ajuster, pas pour la faire démarrer.
  */
 
-import { isProvider, PROVIDER_IDS } from './llm';
+import { isProvider, PROVIDER_IDS, PROVIDERS } from './llm';
 import { parseList } from './globs';
 import { EFFORTS, isEffort, PASSES, stepDown, type Effort } from './passes';
 
@@ -235,6 +235,14 @@ export interface Config {
   keys: Record<string, string>;
   /** Base du provider `openai` générique. Vide : ce provider est inutilisable. */
   openaiBaseUrl: string;
+  /**
+   * L'endpoint générique cache-t-il les préfixes ?
+   *
+   * Faux par défaut, parce que « OpenAI-compatible » décrit un protocole et pas
+   * une garantie de cache : sérialiser deux passes chez un endpoint qui ne
+   * cache rien coûte du temps contre rien.
+   */
+  openaiPrefixCache: boolean;
   temperature: number;
   /** `undefined` : pas de graine, le modèle varie d'une exécution à l'autre. */
   seed: number | undefined;
@@ -447,9 +455,15 @@ function resolvePass(
   // Le mix ne vaut que pour SON provider : un dépôt qui redirige une passe
   // ailleurs ne doit pas hériter du modèle d'un provider qu'il vient d'écarter.
   const applicable = mix && provider === mix.provider ? mix : undefined;
+  // Une passe renvoyée vers un autre provider ne doit pas garder le modèle de
+  // celui qu'elle quitte : `doctrine-provider: deepseek` sans `doctrine-model`
+  // partait avec un nom Ollama, donc en 404.
+  const providerDefault =
+    provider === fallback.provider ? '' : (PROVIDERS[provider]?.defaultModel ?? '');
   return {
     provider,
-    model: readInput(env, `${id}-model`) || applicable?.model || fallback.model,
+    model:
+      readInput(env, `${id}-model`) || applicable?.model || providerDefault || fallback.model,
     thinking:
       readInput(env, `${id}-thinking`) ||
       fallback.thinkingWritten ||
@@ -571,13 +585,15 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   };
 
   const provider = readProvider(env, 'provider', DEFAULTS.provider, warn);
-  // Le modèle par défaut est un nom Ollama. Le laisser filer vers un autre
-  // provider produit un 404 sur les quatre appels, et un journal qui accuse le
-  // modèle plutôt que la configuration.
-  if (provider !== DEFAULTS.provider && model === '') {
+  // Le modèle par défaut suit le provider, et n'est plus un nom Ollama envoyé à
+  // qui n'en sert pas : c'était un 404 sur les quatre appels, avec un journal
+  // qui accusait le modèle plutôt que la configuration. Le provider générique
+  // n'a pas de catalogue connu, donc pas de défaut : on prévient.
+  const providerDefault = PROVIDERS[provider]?.defaultModel || '';
+  if (model === '' && providerDefault === '') {
     warn(
-      `provider « ${provider} » sans « model » : le défaut ${DEFAULTS.model} est un nom Ollama,\n` +
-        `  que cet endpoint ne sert probablement pas. Nomme un modèle.`,
+      `provider « ${provider} » sans « model » : cet endpoint n'a pas de catalogue connu,\n` +
+        `  donc aucun modèle par défaut. Nomme-en un, sinon les appels partiront à vide.`,
     );
   }
   // Un modèle écrit à la main contredit le mix : déplacer une passe ailleurs en
@@ -588,7 +604,7 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   return {
     pr,
     dryRun,
-    model: model || DEFAULTS.model,
+    model: model || providerDefault || DEFAULTS.model,
     provider,
     // Pas de validation contre une liste de niveaux : ils varient d'un modèle à
     // l'autre, et un niveau refusé est rattrapé à l'appel.
@@ -596,7 +612,7 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
       env,
       {
         provider,
-        model: model || DEFAULTS.model,
+        model: model || providerDefault || DEFAULTS.model,
         thinking: readInput(env, 'thinking'),
         mergeThinking: readInput(env, 'merge-thinking'),
         effort,
@@ -606,6 +622,7 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     ),
     keys,
     openaiBaseUrl: readInput(env, 'openai-base-url').replace(/\/$/, ''),
+    openaiPrefixCache: readBoolean(env, 'openai-prefix-cache'),
     temperature: readTemperature(env, warn),
     seed: readSeed(env, warn),
     maxFindings: readNumber(env, 'max-findings', DEFAULTS.maxFindings, warn),

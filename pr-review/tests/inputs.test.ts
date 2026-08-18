@@ -401,19 +401,44 @@ describe('resolveConfig · ce que la review a trouvé', () => {
     }
   });
 
-  it('prévient qu’un provider non-Ollama sans « model » hérite d’un nom Ollama', () => {
+  /** Un nom Ollama envoyé à DeepSeek, c'était un 404 sur les quatre appels. */
+  it('donne à chaque provider connu son propre modèle par défaut', () => {
+    expect(resolve({ INPUT_PROVIDER: 'deepseek' }).passConfigs.regression.model).toBe(
+      'deepseek-v4-flash',
+    );
+    expect(resolve().passConfigs.regression.model).toBe(DEFAULTS.model);
+  });
+
+  it('donne son modèle au provider d’une passe redirigée seule', () => {
+    const config = resolve({ 'INPUT_DOCTRINE-PROVIDER': 'deepseek' });
+    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4-flash');
+    expect(config.passConfigs.regression.model).toBe(DEFAULTS.model);
+  });
+
+  /** L'endpoint générique n'a pas de catalogue : deviner serait pire que dire. */
+  it('prévient quand le provider n’a aucun modèle par défaut à proposer', () => {
     const warn = vi.fn();
-    resolveConfig({ argv: ['42'], env: { INPUT_PROVIDER: 'deepseek' }, warn });
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('nom Ollama'));
+    resolveConfig({ argv: ['42'], env: { INPUT_PROVIDER: 'openai' }, warn });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('catalogue'));
   });
 
   it('ne prévient pas quand le modèle est nommé', () => {
     const warn = vi.fn();
     resolveConfig({
       argv: ['42'],
-      env: { INPUT_PROVIDER: 'deepseek', INPUT_MODEL: 'deepseek-v4-pro' },
+      env: { INPUT_PROVIDER: 'openai', INPUT_MODEL: 'un-modele' },
       warn,
     });
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  /**
+   * « OpenAI-compatible » décrit un protocole, pas une garantie de cache :
+   * sérialiser deux passes chez un endpoint qui ne cache rien coûte du temps
+   * contre rien.
+   */
+  it('ne présume aucun cache de préfixe sur un endpoint générique', () => {
+    expect(resolve().openaiPrefixCache).toBe(false);
+    expect(resolve({ 'INPUT_OPENAI-PREFIX-CACHE': 'true' }).openaiPrefixCache).toBe(true);
   });
 });

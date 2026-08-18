@@ -50,9 +50,20 @@ inputs:
     description: >-
       Base du provider « openai » générique, par exemple
       https://api.fireworks.ai/inference/v1. Sans elle, ce provider est déclaré
-      inutilisable plutôt que de viser api.openai.com par accident.
+      inutilisable plutôt que de viser api.openai.com par accident. Nomme aussi
+      un « model » : cet endpoint n'a pas de catalogue connu, donc pas de défaut.
     required: false
     default: ''
+
+  openai-prefix-cache:
+    description: >-
+      true : l'endpoint « openai » générique cache les préfixes, et deux passes
+      de même destination peuvent s'enchaîner pour se le partager. Faux par
+      défaut, parce qu'« OpenAI-compatible » décrit un protocole et pas une
+      garantie de cache : séquencer chez un endpoint qui ne cache rien coûte du
+      temps de job contre une économie imaginaire.
+    required: false
+    default: 'false'
 
   provider:
     description: >-
@@ -267,9 +278,11 @@ inputs:
       passes tournent en parallèle, sauf celles qui partagent un provider ET un
       modèle CHEZ UN PROVIDER QUI CACHE LES PRÉFIXES : celles-là s'enchaînent,
       pour que la seconde rejoue le préfixe de la première. Le mur du job vaut
-      donc DEUX fois cette valeur sans séquencement, TROIS fois avec. Le
-      timeout-minutes du job doit rester au-dessus, sinon le commentaire d'échec
-      n'a pas le temps d'être posté.
+      donc « (taille du plus gros groupe séquencé + 1) × cette valeur ». Soit
+      deux fois sans séquencement, trois fois quand deux passes s'enchaînent, et
+      QUATRE fois si un provider global qui cache met les trois passes dans le
+      même groupe. Le timeout-minutes du job doit rester au-dessus, sinon le
+      commentaire d'échec n'a pas le temps d'être posté.
     required: false
     default: '15'
 

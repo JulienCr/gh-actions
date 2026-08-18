@@ -27,6 +27,13 @@ export interface ProviderSpec {
    */
   defaultBaseUrl: string;
   /**
+   * Modèle servi quand le dépôt n'en nomme aucun.
+   *
+   * Vide pour le provider générique, qui n'a aucun catalogue connu : là, un
+   * défaut serait une devinette, et l'appelant prévient plutôt que d'inventer.
+   */
+  defaultModel: string;
+  /**
    * Enchaîner deux appels ici achète-t-il un préfixe en cache ?
    *
    * C'est la question qui décide si deux passes de même destination partent en
@@ -51,6 +58,7 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
     label: 'Ollama Cloud',
     client: ollamaClient,
     defaultBaseUrl: 'https://ollama.com',
+    defaultModel: 'glm-5.2:cloud',
     prefixCache: false,
     supportsSeed: true,
   },
@@ -62,6 +70,7 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
       thinkingOff: { thinking: { type: 'disabled' } },
     }),
     defaultBaseUrl: 'https://api.deepseek.com',
+    defaultModel: 'deepseek-v4-flash',
     prefixCache: true,
     supportsSeed: false,
   },
@@ -69,10 +78,12 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
     label: 'endpoint OpenAI-compatible',
     client: createOpenAiClient({ name: 'le provider' }),
     defaultBaseUrl: '',
-    // Le cache de préfixe automatique est la norme chez les endpoints
-    // OpenAI-compatibles. Un endpoint qui n'en ferait pas ne perdrait qu'un peu
-    // de parallélisme, là où l'inverse perdrait l'économie tout entière.
-    prefixCache: true,
+    defaultModel: '',
+    // « OpenAI-compatible » décrit un protocole, pas une garantie de cache. On
+    // ne présume donc rien : sérialiser deux passes chez un endpoint qui ne
+    // cache pas coûte du temps contre rien. L'input « openai-prefix-cache »
+    // l'active pour qui sait que son endpoint le fait.
+    prefixCache: false,
     supportsSeed: false,
   },
 };
@@ -84,14 +95,15 @@ export const isProvider = (value: string): boolean => value in PROVIDERS;
 /**
  * Tarif public, en dollars par million de tokens.
  *
- * Le tarif **plein** de DeepSeek est retenu, pas le tarif creux : une
- * estimation doit pouvoir décevoir vers le bas, jamais vers le haut. Un modèle
- * absent de cette table n'est pas chiffré du tout, ce qui est le cas d'Ollama
- * Cloud, vendu au quota et non au token.
+ * Relevé sur api-docs.deepseek.com le 2026-08-18. ⚠️ DeepSeek est passé le
+ * **16 août 2026** d'un tarif plat à un tarif horaire : toute table écrite
+ * avant cette date est périmée d'un facteur trois, et une review a bien failli
+ * m'en faire adopter une. Les heures pleines vont de 01:00 à 04:00 et de 06:00
+ * à 10:00 UTC ; le reste est à moitié prix.
  *
- * Cette table vieillira. C'est assumé : elle sert à situer un ordre de grandeur
- * dans un journal de CI, pas à tenir une comptabilité. Les tokens, eux, sont
- * rapportés bruts et ne vieillissent pas.
+ * Cette table vieillira à son tour. C'est assumé : elle sert à situer un ordre
+ * de grandeur dans un journal de CI, pas à tenir une comptabilité. Les tokens,
+ * eux, sont rapportés bruts et ne vieillissent pas.
  */
 export interface Price {
   input: number;
@@ -99,10 +111,24 @@ export interface Price {
   output: number;
 }
 
+/** Tarif d'heure pleine. L'heure creuse vaut la moitié, cf. `priceFor`. */
 export const PRICES: Record<string, Price> = {
   'deepseek/deepseek-v4-flash': { input: 0.44, cachedInput: 0.014, output: 1.32 },
   'deepseek/deepseek-v4-pro': { input: 1.32, cachedInput: 0.044, output: 3.96 },
 };
+
+/**
+ * L'instant est-il en heure pleine chez DeepSeek ?
+ *
+ * La date est injectée plutôt que lue : ce module reste pur, et un test qui
+ * dépendrait de l'heure qu'il est passerait ou non selon le moment du jour.
+ */
+export function isPeakHour(now: Date): boolean {
+  const hour = now.getUTCHours();
+  return (hour >= 1 && hour < 4) || (hour >= 6 && hour < 10);
+}
+
+const OFF_PEAK_RATIO = 0.5;
 
 /**
  * Ce qu'un appel a coûté, ou `null` quand on ne sait pas.
@@ -110,15 +136,24 @@ export const PRICES: Record<string, Price> = {
  * `null` et non zéro : un quota Ollama consommé n'est pas un appel gratuit, et
  * additionner des zéros produirait un total qui ment sur ce qu'il additionne.
  */
-export function estimateCost(provider: string, model: string, usage: Usage): number | null {
+export function estimateCost(
+  provider: string,
+  model: string,
+  usage: Usage,
+  peak = true,
+): number | null {
   const price = PRICES[`${provider}/${model}`];
   if (!price) return null;
+  const ratio = peak ? 1 : OFF_PEAK_RATIO;
   // `inputTokens` inclut la part servie par le cache : la facturer au plein
   // tarif la compterait deux fois et effacerait précisément l'économie qu'on
   // cherche à mesurer.
   const fresh = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
   return (
-    (fresh * price.input + usage.cachedInputTokens * price.cachedInput + usage.outputTokens * price.output) /
+    (ratio *
+      (fresh * price.input +
+        usage.cachedInputTokens * price.cachedInput +
+        usage.outputTokens * price.output)) /
     1_000_000
   );
 }

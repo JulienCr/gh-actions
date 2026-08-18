@@ -771,6 +771,7 @@ var PROVIDERS = {
     label: "Ollama Cloud",
     client: ollamaClient,
     defaultBaseUrl: "https://ollama.com",
+    defaultModel: "glm-5.2:cloud",
     prefixCache: false,
     supportsSeed: true
   },
@@ -782,6 +783,7 @@ var PROVIDERS = {
       thinkingOff: { thinking: { type: "disabled" } }
     }),
     defaultBaseUrl: "https://api.deepseek.com",
+    defaultModel: "deepseek-v4-flash",
     prefixCache: true,
     supportsSeed: false
   },
@@ -789,10 +791,12 @@ var PROVIDERS = {
     label: "endpoint OpenAI-compatible",
     client: createOpenAiClient({ name: "le provider" }),
     defaultBaseUrl: "",
-    // Le cache de préfixe automatique est la norme chez les endpoints
-    // OpenAI-compatibles. Un endpoint qui n'en ferait pas ne perdrait qu'un peu
-    // de parallélisme, là où l'inverse perdrait l'économie tout entière.
-    prefixCache: true,
+    defaultModel: "",
+    // « OpenAI-compatible » décrit un protocole, pas une garantie de cache. On
+    // ne présume donc rien : sérialiser deux passes chez un endpoint qui ne
+    // cache pas coûte du temps contre rien. L'input « openai-prefix-cache »
+    // l'active pour qui sait que son endpoint le fait.
+    prefixCache: false,
     supportsSeed: false
   }
 };
@@ -802,11 +806,17 @@ var PRICES = {
   "deepseek/deepseek-v4-flash": { input: 0.44, cachedInput: 0.014, output: 1.32 },
   "deepseek/deepseek-v4-pro": { input: 1.32, cachedInput: 0.044, output: 3.96 }
 };
-function estimateCost(provider, model, usage) {
+function isPeakHour(now) {
+  const hour = now.getUTCHours();
+  return hour >= 1 && hour < 4 || hour >= 6 && hour < 10;
+}
+var OFF_PEAK_RATIO = 0.5;
+function estimateCost(provider, model, usage, peak = true) {
   const price = PRICES[`${provider}/${model}`];
   if (!price) return null;
+  const ratio = peak ? 1 : OFF_PEAK_RATIO;
   const fresh = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
-  return (fresh * price.input + usage.cachedInputTokens * price.cachedInput + usage.outputTokens * price.output) / 1e6;
+  return ratio * (fresh * price.input + usage.cachedInputTokens * price.cachedInput + usage.outputTokens * price.output) / 1e6;
 }
 
 // pr-review/src/prompt.ts
@@ -1427,9 +1437,10 @@ function readProvider(env, name, fallback, warn) {
 function resolvePass(env, id, mix, fallback, warn) {
   const provider = readProvider(env, `${id}-provider`, mix?.provider ?? fallback.provider, warn);
   const applicable = mix && provider === mix.provider ? mix : void 0;
+  const providerDefault = provider === fallback.provider ? "" : PROVIDERS[provider]?.defaultModel ?? "";
   return {
     provider,
-    model: readInput(env, `${id}-model`) || applicable?.model || fallback.model,
+    model: readInput(env, `${id}-model`) || applicable?.model || providerDefault || fallback.model,
     thinking: readInput(env, `${id}-thinking`) || fallback.thinkingWritten || applicable?.thinking || fallback.thinkingDefault
   };
 }
@@ -1499,17 +1510,18 @@ function resolveConfig({ argv, env, warn = () => {
     openai: readInput(env, "openai-api-key") || env.OPENAI_API_KEY?.trim() || ""
   };
   const provider = readProvider(env, "provider", DEFAULTS.provider, warn);
-  if (provider !== DEFAULTS.provider && model === "") {
+  const providerDefault = PROVIDERS[provider]?.defaultModel || "";
+  if (model === "" && providerDefault === "") {
     warn(
-      `provider \xAB ${provider} \xBB sans \xAB model \xBB : le d\xE9faut ${DEFAULTS.model} est un nom Ollama,
-  que cet endpoint ne sert probablement pas. Nomme un mod\xE8le.`
+      `provider \xAB ${provider} \xBB sans \xAB model \xBB : cet endpoint n'a pas de catalogue connu,
+  donc aucun mod\xE8le par d\xE9faut. Nomme-en un, sinon les appels partiront \xE0 vide.`
     );
   }
   const route = model === "" ? mixRoute(provider, keys.deepseek !== "") : null;
   return {
     pr,
     dryRun,
-    model: model || DEFAULTS.model,
+    model: model || providerDefault || DEFAULTS.model,
     provider,
     // Pas de validation contre une liste de niveaux : ils varient d'un modèle à
     // l'autre, et un niveau refusé est rattrapé à l'appel.
@@ -1517,7 +1529,7 @@ function resolveConfig({ argv, env, warn = () => {
       env,
       {
         provider,
-        model: model || DEFAULTS.model,
+        model: model || providerDefault || DEFAULTS.model,
         thinking: readInput(env, "thinking"),
         mergeThinking: readInput(env, "merge-thinking"),
         effort,
@@ -1527,6 +1539,7 @@ function resolveConfig({ argv, env, warn = () => {
     ),
     keys,
     openaiBaseUrl: readInput(env, "openai-base-url").replace(/\/$/, ""),
+    openaiPrefixCache: readBoolean(env, "openai-prefix-cache"),
     temperature: readTemperature(env, warn),
     seed: readSeed(env, warn),
     maxFindings: readNumber(env, "max-findings", DEFAULTS.maxFindings, warn),
@@ -1864,6 +1877,10 @@ function warnOnClearTextKey(config, targets) {
     );
   }
 }
+function cachesPrefixes(config, provider) {
+  if (provider === "openai") return config.openaiPrefixCache;
+  return PROVIDERS[provider]?.prefixCache ?? false;
+}
 function sizes(messages) {
   const context = messages.find((message) => message.role === "user");
   const total = messages.reduce((sum, message) => sum + message.content.length, 0);
@@ -1928,7 +1945,10 @@ async function callModel(config, run2, args) {
     thinkingChars: result.thinkingChars,
     contentChars: result.content.length,
     durationMs: result.durationMs,
-    costUsd: estimateCost(target.provider, target.model, result.usage),
+    // Le régime horaire au moment de l'appel : DeepSeek facture moitié prix
+    // hors des heures pleines, et supposer le pire gonflerait de deux le seul
+    // chiffre qui sert à juger cette refonte.
+    costUsd: estimateCost(target.provider, target.model, result.usage, isPeakHour(/* @__PURE__ */ new Date())),
     ok: true
   };
   run2.calls.push(stat);
@@ -1948,7 +1968,7 @@ function planPasses(config, promptOptions, meta, context, passes) {
       provider: target.provider,
       model: target.model,
       chars: messages.reduce((sum, message) => sum + message.content.length, 0),
-      cacheable: PROVIDERS[target.provider]?.prefixCache ?? false
+      cacheable: cachesPrefixes(config, target.provider)
     };
   });
 }
@@ -2014,12 +2034,12 @@ function countOnly(config, plan, context) {
       thinkingChars: 0,
       contentChars: 0,
       durationMs: 0,
-      costUsd: estimateCost(target.provider, target.model, {
-        inputTokens,
-        cachedInputTokens: 0,
-        outputTokens: 0,
-        reasoningTokens: 0
-      }),
+      costUsd: estimateCost(
+        target.provider,
+        target.model,
+        { inputTokens, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0 },
+        isPeakHour(/* @__PURE__ */ new Date())
+      ),
       ok: true
     };
   });
@@ -2278,24 +2298,33 @@ function knownPaths(meta, context) {
     ...context.imported.map((file) => file.path)
   ]);
 }
+async function loadLocalKeys(env) {
+  const enriched = { ...env };
+  if (process.env.GITHUB_ACTIONS === "true") return enriched;
+  for (const provider of Object.keys(DEFAULT_KEY_REFS)) {
+    const variable = `${provider.toUpperCase()}_API_KEY`;
+    if (readInput(enriched, `${provider}-api-key`) || enriched[variable]?.trim()) continue;
+    const key = await keyFrom1Password(provider);
+    if (key) enriched[variable] = key;
+  }
+  return enriched;
+}
 async function main() {
   if (!isEnabled(process.env)) {
     console.log("Review d\xE9sactiv\xE9e (input \xAB enable \xBB).");
     return;
   }
+  const countOnly2 = process.argv.slice(2).includes("--count-only");
   const config = resolveConfig({
     argv: process.argv.slice(2),
-    env: process.env,
+    env: countOnly2 ? process.env : await loadLocalKeys(process.env),
     warn: (message) => console.warn(`\u26A0 ${message}`)
   });
   if (config.githubToken) process.env.GH_TOKEN = config.githubToken;
   if (!config.countOnly) {
     const wanted = new Set(Object.values(config.passConfigs).map((target) => target.provider));
     wanted.add(config.provider);
-    for (const provider of wanted) {
-      if (!config.keys[provider]) config.keys[provider] = await keyFrom1Password(provider);
-    }
-    if (Object.values(config.keys).every((key) => !key)) {
+    if ([...wanted].every((provider) => !config.keys[provider])) {
       console.log("Aucune cl\xE9 de provider : review ignor\xE9e.");
       return;
     }

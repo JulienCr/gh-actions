@@ -207,6 +207,7 @@ Seul `pr` est obligatoire.
 | `deepseek-api-key` | `''` | Clé DeepSeek. Fait passer le [mix](#le-mix-par-passe) par l'API directe, qui **ajoute un cache de préfixe**. Vide : le même modèle, servi par Ollama. |
 | `openai-api-key` | `''` | Clé du provider `openai` générique. Inutile sans `openai-base-url`. |
 | `openai-base-url` | `''` | Base d'un endpoint OpenAI-compatible quelconque (Fireworks, Z.ai, OpenRouter…). |
+| `openai-prefix-cache` | `false` | `true` si cet endpoint cache les préfixes. Sinon ses passes ne sont jamais séquencées. |
 | `github-token` | `${{ github.token }}` | Jeton du CLI `gh`. Le jeton du job suffit, avec `pull-requests: write`. |
 | `provider` | `ollama` | Provider des passes qui n'en désignent pas d'autre : `ollama`, `deepseek`, `openai`. |
 | `model` | `glm-5.2:cloud` | Modèle du provider global, et de la seule passe « régression ». ⚠️ L'écrire **remet les quatre appels dessus** : voir ci-dessous. |
@@ -255,11 +256,34 @@ Deux façons de ne pas prendre ce mix : écrire `model:` à la main, ce qui reme
 sur le modèle nommé, ou désigner un `provider:` autre qu'`ollama`, auquel cas le dépôt a pris la
 main et on ne le renvoie pas ailleurs dans son dos.
 
+#### Ce que le mix ne fait pas : envoyer moins de tokens
+
+Le réagencement des prompts a déplacé du texte, il n'en a retiré aucun. Mesuré sur la même PR, à
+contenu de disque identique :
+
+| | avant | après |
+| --- | --- | --- |
+| entrée totale des trois passes | 1 580 701 car. | 1 580 669 car. |
+
+Trente-deux caractères d'écart, soit 0,002 %. **Le mix ne réduit pas ce qui part, il change qui le
+lit.** Sur la review de la PR #8, cela déplace 66 % des tokens d'entrée et 58 % des tokens de sortie
+du modèle flagship vers un modèle d'un niveau d'usage en dessous.
+
+Pour réduire ce qui part, le levier reste [le cran d'effort](#le-cran-deffort), mesuré à -13,5 % sur
+une PR comparable. Et le premier poste de dépense n'est plus l'entrée : la passe de régression a
+rendu 41 681 tokens de sortie, dont 98 % de raisonnement.
+
 #### Une clé DeepSeek achète le cache de préfixe
 
 Le même modèle, servi en direct par `api.deepseek.com`, ajoute ce qu'Ollama n'a pas : un cache de
 préfixe automatique, facturé **trente et une fois moins cher** que l'entrée fraîche (0,014 $/M
-contre 0,44 $/M). Poser `deepseek-api-key` suffit à basculer les trois appels sur cette route.
+contre 0,44 $/M en heure pleine). Poser `deepseek-api-key` suffit à basculer les trois appels sur
+cette route.
+
+⚠️ DeepSeek est passé le **16 août 2026** d'un tarif plat à un tarif horaire : heures pleines de
+01:00 à 04:00 et de 06:00 à 10:00 UTC, moitié prix le reste du temps. `estimateCost` applique le
+régime de l'heure de l'appel. Toute table de prix antérieure à cette date est fausse d'un facteur
+trois.
 
 « Doctrine » et « données » visent volontairement le **même couple provider + modèle**, ce qui leur
 permet de partager ce cache. Deux conditions, que l'action tient toutes les deux :
@@ -276,10 +300,21 @@ permet de partager ce cache. Deux conditions, que l'action tient toutes les deux
    [#16714](https://github.com/ollama/ollama/issues/16714)), les passes restent parallèles, parce
    que les sérialiser coûterait du temps contre une économie invérifiable.
 
-⚠️ **Le séquencement change l'arithmétique du `timeout-minutes` du job.** Sans clé DeepSeek, le mur
-vaut « la passe la plus lente, plus la fusion », soit deux fois `timeout-minutes`. Avec, le groupe
-DeepSeek en enchaîne deux : trois fois, dans le pire cas. Mesuré sur cette PR, on en est loin, la
-régression pesant à elle seule cinq fois les deux autres réunies :
+⚠️ **Le séquencement change l'arithmétique du `timeout-minutes` du job.** Le mur vaut
+`(taille du plus gros groupe séquencé + 1) × timeout-minutes`, la fusion étant le `+ 1` :
+
+| Configuration | Plus gros groupe | Mur théorique |
+| --- | --- | --- |
+| défaut, sans clé DeepSeek | 1 (rien n'est séquencé) | 2 × 15 = **30 min** |
+| défaut, avec clé DeepSeek | 2 (doctrine puis données) | 3 × 15 = **45 min** |
+| `provider: deepseek` global | 3 (les trois passes) | 4 × 15 = **60 min** |
+
+La dernière ligne est le piège : un provider global qui cache met les trois passes dans le même
+groupe. Un `timeout-minutes: 45` y couperait la review pendant la fusion, sans laisser le temps de
+poster le commentaire d'échec. Baisse `timeout-minutes` ou monte le budget du job.
+
+Mesuré sur cette PR, on est loin du pire cas, la régression pesant à elle seule cinq fois les deux
+autres réunies :
 
 | Appel | Modèle | Durée |
 | --- | --- | --- |
@@ -288,8 +323,7 @@ régression pesant à elle seule cinq fois les deux autres réunies :
 | régression fonctionnelle | `glm-5.2:cloud` | **470 s** |
 | fusion | `deepseek-v4-flash:cloud` | 18 s |
 
-Rien dans le code ne garantit pourtant ce rapport. Un `timeout-minutes: 45` au niveau du job laisse
-la marge du pire cas et celle du commentaire d'échec.
+Rien dans le code ne garantit pourtant ce rapport.
 
 Mesuré sur la PR #7 de ce dépôt, ~140 000 tokens d'entrée par passe : la seconde passe a reçu
 **141 694 tokens en cache sur 149 831**, et son coût est tombé de 0,0628 $ à 0,0057 $.
@@ -307,7 +341,10 @@ préfixe commun : 487 202 caractères, ~139 201 tokens réutilisables.
   recall de « données et accès » baisse sur de vraies PR. ⚠️ Cela la sépare de « doctrine », qui
   perd alors leur cache commun.
 - **Un autre endpoint** : `provider: openai` avec `openai-base-url` et `openai-api-key` vise
-  n'importe quelle API OpenAI-compatible, sans changer le reste.
+  n'importe quelle API OpenAI-compatible. Nomme aussi un `model` : cet endpoint n'a pas de
+  catalogue connu, donc aucun défaut. Et `openai-prefix-cache: true` si tu sais qu'il cache les
+  préfixes, ce qu'« OpenAI-compatible » ne garantit pas : par défaut on ne séquence rien chez lui,
+  pour ne pas payer du temps contre une économie imaginaire.
 - **Le raisonnement** : un `<passe>-thinking` écrit à la main échappe au cran d'`effort`, pour que
   deux mécanismes ne se disputent pas la même valeur.
 
