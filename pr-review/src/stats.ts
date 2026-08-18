@@ -21,16 +21,40 @@ export interface CallStat {
   id: string;
   /** Nom français, celui du journal et du pied de page. */
   label: string;
+  /**
+   * Où l'appel est parti, et sur quel modèle.
+   *
+   * Rapportés par appel et non une fois pour la review : depuis le mix, deux
+   * passes n'ont plus le même coût par token, et un total qui ne dirait pas
+   * d'où viennent ses tokens ne permettrait plus de décider quoi couper.
+   */
+  provider: string;
+  model: string;
   /** Niveau de raisonnement effectivement demandé. Vide : celui du modèle. */
   think: string;
-  systemChars: number;
-  userChars: number;
-  promptTokens: number;
-  evalTokens: number;
+  /**
+   * Le préambule commun ET l'objectif de la passe.
+   *
+   * Nommé d'après ce que c'est et non d'après le rôle du message qui le porte :
+   * depuis que l'objectif est rendu en dernier message user, pour que le
+   * préfixe reste partageable, un champ « systemChars » aurait désigné la
+   * moitié de la consigne.
+   */
+  instructionChars: number;
+  /** Le bloc partagé : PR, diff, fichiers, imports. */
+  contextChars: number;
+  inputTokens: number;
+  /** Part de l'entrée servie depuis le cache. `0` : aucun, ou non exposé. */
+  cachedInputTokens: number;
+  outputTokens: number;
+  /** Part de la sortie passée en raisonnement. `0` : non exposé. */
+  reasoningTokens: number;
   thinkingChars: number;
   /** Taille de la réponse hors raisonnement. Sert à situer `thinkingChars`. */
   contentChars: number;
   durationMs: number;
+  /** Coût estimé en dollars, ou `null` quand le tarif n'est pas connu. */
+  costUsd: number | null;
   ok: boolean;
 }
 
@@ -39,7 +63,8 @@ export interface CallStat {
  *
  * Grossier et assumé : embarquer un tokenizer coûterait la seule promesse que
  * le bundle tient sans effort, celle de n'avoir aucune dépendance d'exécution.
- * La valeur se recalibre en divisant `systemChars + userChars` par le
+ * La valeur se recalibre en divisant
+ * `instructionChars + contextChars` par le
  * `promptTokens` d'un vrai run, que le journal imprime côte à côte exprès.
  */
 export const CHARS_PER_TOKEN = 3.5;
@@ -49,20 +74,43 @@ export const estimateTokens = (chars: number): number => Math.round(chars / CHAR
 const count = (value: number) => value.toLocaleString('fr-FR');
 
 export interface Totals {
-  promptTokens: number;
-  evalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
   thinkingChars: number;
+  /** Somme des coûts connus. */
+  costUsd: number;
+  /**
+   * Un appel au moins n'a pas de tarif connu.
+   *
+   * Le dire plutôt que l'additionner à zéro : un quota Ollama consommé n'est
+   * pas un appel gratuit, et un total qui l'ignorerait mentirait sur ce qu'il
+   * additionne.
+   */
+  costPartial: boolean;
 }
 
 /** Les sommes que le pied de page rapporte. Les appels ratés ne comptent pas. */
 export function totals(calls: CallStat[]): Totals {
   return calls.reduce<Totals>(
     (sum, call) => ({
-      promptTokens: sum.promptTokens + call.promptTokens,
-      evalTokens: sum.evalTokens + call.evalTokens,
+      inputTokens: sum.inputTokens + call.inputTokens,
+      cachedInputTokens: sum.cachedInputTokens + call.cachedInputTokens,
+      outputTokens: sum.outputTokens + call.outputTokens,
       thinkingChars: sum.thinkingChars + call.thinkingChars,
+      costUsd: sum.costUsd + (call.costUsd ?? 0),
+      // Un appel raté n'a rien coûté qu'on sache chiffrer, mais il a bien été
+      // envoyé : ne pas le compter comme un trou de tarification.
+      costPartial: sum.costPartial || (call.ok && call.costUsd === null),
     }),
-    { promptTokens: 0, evalTokens: 0, thinkingChars: 0 },
+    {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      thinkingChars: 0,
+      costUsd: 0,
+      costPartial: false,
+    },
   );
 }
 
@@ -81,15 +129,54 @@ export function reasoningShare(call: CallStat): number | null {
   return call.thinkingChars / total;
 }
 
+/**
+ * Un montant en dollars, avec assez de décimales pour ne pas s'afficher à zéro.
+ *
+ * Une passe sur DeepSeek coûte quelques centièmes de dollar : arrondir au cent
+ * afficherait « 0,01 $ » partout et rendrait invisible le facteur trente que le
+ * cache fait gagner, qui est précisément ce qu'on cherche à voir.
+ */
+export const formatCost = (usd: number): string =>
+  `${usd.toLocaleString('fr-FR', { minimumFractionDigits: 4, maximumFractionDigits: 4 })} $`;
+
 /** La ligne de journal d'un appel abouti. */
 export function describeCall(call: CallStat): string {
   const share = reasoningShare(call);
-  const reasoning = share === null ? '' : ` dont ~${Math.round(share * 100)} % de raisonnement`;
+  const reasoning =
+    call.reasoningTokens > 0
+      ? ` dont ${count(call.reasoningTokens)} de raisonnement`
+      : share === null
+        ? ''
+        : ` dont ~${Math.round(share * 100)} % de raisonnement`;
   const think = call.think ? `, think=${call.think}` : '';
+  const cached = call.cachedInputTokens > 0 ? ` dont ${count(call.cachedInputTokens)} en cache` : '';
+  const cost = call.costUsd === null ? '' : `, ~${formatCost(call.costUsd)}`;
   return (
-    `${call.label} en ${Math.round(call.durationMs / 1000)} s ` +
-    `(${count(call.promptTokens)} tokens en entrée, ${count(call.evalTokens)} en sortie${reasoning}${think}).`
+    `${call.label} en ${Math.round(call.durationMs / 1000)} s · ${call.provider}/${call.model} ` +
+    `(${count(call.inputTokens)} tokens en entrée${cached}, ` +
+    `${count(call.outputTokens)} en sortie${reasoning}${think}${cost}).`
   );
+}
+
+/**
+ * Ce qui a tourné, et où : « ollama/glm-5.2:cloud (régression) · … ».
+ *
+ * Le pied de page annonçait un modèle unique. Depuis que les quatre appels
+ * peuvent viser des destinations différentes, un seul nom serait faux pour
+ * trois d'entre eux, et le lecteur d'une PR n'aurait aucun moyen de savoir quel
+ * modèle a produit la trouvaille qu'il lit.
+ */
+export function describeTargets(calls: CallStat[]): string {
+  const byTarget = new Map<string, string[]>();
+  for (const call of calls) {
+    const key = `${call.provider}/${call.model}`;
+    const labels = byTarget.get(key);
+    if (labels) labels.push(call.label);
+    else byTarget.set(key, [call.label]);
+  }
+  return [...byTarget]
+    .map(([target, labels]) => `${target} (${labels.join(', ')})`)
+    .join(' · ');
 }
 
 /**
@@ -121,32 +208,47 @@ const padStart = (text: string, width: number) => text.padStart(width);
  */
 export function renderBreakdown(calls: CallStat[], blocks: InputBreakdown): string {
   const labels = calls.map((call) => call.label);
+  const targets = calls.map((call) => `${call.provider}/${call.model}`);
   const width = Math.max(...labels.map((label) => label.length), 'appel'.length);
+  const target = Math.max(...targets.map((value) => value.length), 'destination'.length);
+  const priced = calls.some((call) => call.costUsd !== null);
 
-  const rows = calls.map((call) => {
-    const total = call.systemChars + call.userChars;
+  const rows = calls.map((call, index) => {
+    const total = call.instructionChars + call.contextChars;
+    const cost = call.costUsd === null ? '—' : `~${formatCost(call.costUsd)}`;
     return (
-      `  ${pad(call.label, width)}  ${padStart(count(call.systemChars), 9)}  ` +
-      `${padStart(count(call.userChars), 10)}  ${padStart(count(total), 10)}  ` +
-      `${padStart(`~${count(estimateTokens(total))}`, 10)}`
+      `  ${pad(call.label, width)}  ${pad(targets[index]!, target)}  ` +
+      `${padStart(count(call.instructionChars), 9)}  ` +
+      `${padStart(count(call.contextChars), 10)}  ${padStart(count(total), 10)}  ` +
+      `${padStart(`~${count(estimateTokens(total))}`, 10)}` +
+      (priced ? `  ${padStart(cost, 12)}` : '')
     );
   });
 
-  const grand = calls.reduce((sum, call) => sum + call.systemChars + call.userChars, 0);
+  const grand = calls.reduce((sum, call) => sum + call.instructionChars + call.contextChars, 0);
+  const grandCost = calls.reduce((sum, call) => sum + (call.costUsd ?? 0), 0);
   const header =
-    `  ${pad('appel', width)}  ${padStart('système', 9)}  ${padStart('user', 10)}  ` +
-    `${padStart('total', 10)}  ${padStart('≈ tokens', 10)}`;
-  const rule = `  ${'─'.repeat(width + 46)}`;
+    `  ${pad('appel', width)}  ${pad('destination', target)}  ${padStart('consignes', 9)}  ` +
+    `${padStart('contexte', 10)}  ${padStart('total', 10)}  ${padStart('≈ tokens', 10)}` +
+    (priced ? `  ${padStart('≈ entrée', 12)}` : '');
+  const rule = `  ${'─'.repeat(width + target + 48 + (priced ? 14 : 0))}`;
 
   return [
     header,
     ...rows,
     rule,
-    `  ${pad('total entrée', width)}  ${padStart('', 9)}  ${padStart('', 10)}  ` +
-      `${padStart(count(grand), 10)}  ${padStart(`~${count(estimateTokens(grand))}`, 10)}`,
+    `  ${pad('total entrée', width)}  ${pad('', target)}  ${padStart('', 9)}  ${padStart('', 10)}  ` +
+      `${padStart(count(grand), 10)}  ${padStart(`~${count(estimateTokens(grand))}`, 10)}` +
+      (priced ? `  ${padStart(`~${formatCost(grandCost)}`, 12)}` : ''),
     `  dont : ${describeBlocks(blocks)}`,
     '',
     '  Tokens estimés : caractères ÷ ' + CHARS_PER_TOKEN + '. Les caractères, eux, sont exacts.',
+    ...(priced
+      ? [
+          "  Coût : ENTRÉE seule, au tarif plein, sans cache. La sortie n'est pas devinable\n" +
+            '  avant l’appel, et le cache ne se constate qu’après.',
+        ]
+      : []),
   ].join('\n');
 }
 

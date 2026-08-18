@@ -2,6 +2,8 @@
  * Mise en forme du commentaire posté sur la PR. Module **pur**.
  */
 
+import { formatCost } from './stats';
+
 /** Permet de retrouver le commentaire de la review parmi les autres. */
 export const MARKER = '<!-- aristarque -->';
 
@@ -98,10 +100,30 @@ function mapOutsideFences(markdown: string, transform: (segment: string) => stri
 }
 
 export interface Footer {
-  model: string;
+  /**
+   * Ce qui a tourné et où, une entrée par destination.
+   *
+   * Un nom de modèle unique serait faux depuis que les quatre appels peuvent
+   * viser des providers différents : le lecteur ne saurait plus quel modèle a
+   * produit la trouvaille qu'il lit. Voir `describeTargets` dans `stats.ts`.
+   */
+  models: string;
   durationMs: number;
-  promptTokens: number;
-  evalTokens: number;
+  inputTokens: number;
+  /**
+   * Part de l'entrée servie depuis le cache de préfixe du provider.
+   *
+   * Affiché parce que c'est la mesure du levier : deux passes qui partagent
+   * quatre-vingt-dix kilo-octets de contexte ne doivent les payer qu'une fois.
+   * À zéro alors qu'on l'attendait plein, le préfixe a divergé, et la PR le
+   * montre sans qu'il faille ouvrir un journal de CI.
+   */
+  cachedInputTokens: number;
+  outputTokens: number;
+  /** Coût estimé de la review, en dollars. `0` quand rien n'est chiffrable. */
+  costUsd: number;
+  /** Une part du total n'a pas de tarif connu (Ollama, vendu au quota). */
+  costPartial: boolean;
   /**
    * Taille du raisonnement, en caractères.
    *
@@ -156,13 +178,23 @@ function formatDuration(ms: number): string {
 const count = (value: number) => value.toLocaleString('fr-FR');
 
 function renderFooter(footer: Footer): string {
+  const cached =
+    footer.cachedInputTokens > 0 ? ` (dont ${count(footer.cachedInputTokens)} en cache)` : '';
   const bits = [
-    `${footer.model} via Ollama Cloud`,
+    footer.models,
     `effort ${footer.effort}`,
     formatDuration(footer.durationMs),
-    `${count(footer.promptTokens)} tokens en entrée, ${count(footer.evalTokens)} en sortie`,
+    `${count(footer.inputTokens)} tokens en entrée${cached}, ${count(footer.outputTokens)} en sortie`,
   ];
-  if (footer.thinkingChars > 0) {
+  if (footer.costUsd > 0) {
+    // « au moins » et non « environ » quand une part n'est pas chiffrable : un
+    // quota Ollama consommé n'est pas un appel gratuit, et un total qui le
+    // passerait sous silence sous-estimerait la review de tout son gros appel.
+    bits.push(`${footer.costPartial ? 'au moins ' : '~'}${formatCost(footer.costUsd)}`);
+  }
+  // Au kilo-octet près, et pas en deçà : « 0 Ko de raisonnement » se lit comme
+  // une mesure alors que c'est un arrondi, et vaut moins que le silence.
+  if (footer.thinkingChars >= 1024) {
     bits.push(`${count(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
   }
   if (footer.imported > 0) {

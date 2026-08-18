@@ -114,6 +114,24 @@ reader doubt the whole finding, and a true finding dies with its invented suppor
    Assert a file's contents only by quoting a string you can see in one of its excerpts.`;
 }
 
+/**
+ * Le contexte envoyé à une passe : la PR, son diff, ses fichiers, ses imports.
+ *
+ * ⚠️ **Ce texte est le préfixe partagé entre les passes**, et le cache de
+ * préfixe des providers exige une égalité octet pour octet. Deux règles en
+ * découlent, et elles ne sont pas cosmétiques :
+ *
+ * 1. Aucune phrase du bloc commun ne se formule différemment selon ce que la
+ *    passe reçoit. La consigne sur les fichiers absents disait autrefois
+ *    « from this section » ou « from this section and from the next one »
+ *    selon qu'il y avait des imports : une variante à cet endroit fait
+ *    diverger le prompt bien avant les quatre-vingt-dix kilo-octets qu'on
+ *    cherchait à réutiliser.
+ * 2. Les fichiers importés se rendent en DERNIER, pour que le prompt d'une
+ *    passe qui ne les reçoit pas soit un préfixe **strict** de celui d'une
+ *    passe qui les reçoit. C'est ce qui rend le cran « balanced » compatible
+ *    avec le cache. Voir `groupForCache` dans `passes.ts`.
+ */
 export function buildUserPrompt(meta: PrMeta, context: AssembledContext): string {
   const fileList = meta.files
     .map((file) => {
@@ -154,9 +172,8 @@ ${context.diff}
 
 ## Full content of the changed files, after the change
 
-Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from ${
-    context.imported.length > 0 ? 'this section and from the next one' : 'this section'
-  } was not given to you: do not describe its contents.
+Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from the
+sections below was not given to you: do not describe its contents.
 ${renderGaps(context.windowed.length > 0)}
 ${contents}${renderImported(context.imported)}`;
 }

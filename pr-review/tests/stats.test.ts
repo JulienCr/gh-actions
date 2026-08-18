@@ -3,7 +3,9 @@ import { describe, it, expect } from 'vitest';
 import {
   CHARS_PER_TOKEN,
   describeCall,
+  describeTargets,
   estimateTokens,
+  formatCost,
   reasoningShare,
   renderBreakdown,
   statsLine,
@@ -15,14 +17,19 @@ import {
 const call = (over: Partial<CallStat> = {}): CallStat => ({
   id: 'regression',
   label: 'passe régression fonctionnelle',
+  provider: 'ollama',
+  model: 'glm-5.2:cloud',
   think: 'max',
-  systemChars: 11_204,
-  userChars: 318_442,
-  promptTokens: 92_900,
-  evalTokens: 6_402,
+  instructionChars: 11_204,
+  contextChars: 318_442,
+  inputTokens: 92_900,
+  cachedInputTokens: 0,
+  outputTokens: 6_402,
+  reasoningTokens: 0,
   thinkingChars: 24_000,
   contentChars: 6_000,
   durationMs: 96_000,
+  costUsd: null,
   ok: true,
   ...over,
 });
@@ -37,12 +44,42 @@ const BLOCKS: InputBreakdown = {
 
 describe('les totaux du pied de page', () => {
   it('additionne les appels aboutis', () => {
-    const sum = totals([call(), call({ promptTokens: 58_400, evalTokens: 2_000, thinkingChars: 8_000 })]);
-    expect(sum).toEqual({ promptTokens: 151_300, evalTokens: 8_402, thinkingChars: 32_000 });
+    const sum = totals([
+      call({ costUsd: 0.04 }),
+      call({ inputTokens: 58_400, cachedInputTokens: 52_000, outputTokens: 2_000, thinkingChars: 8_000, costUsd: 0.003 }),
+    ]);
+    expect(sum).toMatchObject({
+      inputTokens: 151_300,
+      cachedInputTokens: 52_000,
+      outputTokens: 8_402,
+      thinkingChars: 32_000,
+      costPartial: false,
+    });
+    expect(sum.costUsd).toBeCloseTo(0.043, 6);
   });
 
   it('rend des zéros sur une liste vide, plutôt que de rater', () => {
-    expect(totals([])).toEqual({ promptTokens: 0, evalTokens: 0, thinkingChars: 0 });
+    expect(totals([])).toEqual({
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      thinkingChars: 0,
+      costUsd: 0,
+      costPartial: false,
+    });
+  });
+
+  /**
+   * Un quota Ollama consommé n'est pas un appel gratuit : additionner son coût
+   * comme un zéro produirait un total qui ment sur ce qu'il additionne.
+   */
+  it('signale qu’une part du total n’a pas de tarif connu', () => {
+    expect(totals([call({ costUsd: null }), call({ costUsd: 0.04 })]).costPartial).toBe(true);
+  });
+
+  /** Un appel raté n'a rien coûté qu'on sache chiffrer : ce n'est pas un trou. */
+  it('ne compte pas un appel raté comme un tarif manquant', () => {
+    expect(totals([call({ costUsd: null, ok: false }), call({ costUsd: 0.04 })]).costPartial).toBe(false);
   });
 });
 
@@ -91,7 +128,7 @@ describe('l’estimation en tokens', () => {
 
 describe('le tableau de --count-only', () => {
   const table = renderBreakdown(
-    [call(), call({ id: 'doctrine', label: 'passe doctrine du dépôt', userChars: 196_118 })],
+    [call(), call({ id: 'doctrine', label: 'passe doctrine du dépôt', contextChars: 196_118 })],
     BLOCKS,
   );
 
@@ -146,5 +183,49 @@ describe('la ligne ::stats::', () => {
     const parsed = JSON.parse(line.slice('::stats::'.length));
     expect(parsed.findings.regression).toContain('[rien]');
     expect(parsed.variant).toBe('balanced');
+  });
+});
+
+describe('ce que le pied de page annonce comme destinations', () => {
+  it('regroupe les appels par destination, une entrée par couple', () => {
+    const line = describeTargets([
+      call(),
+      call({ id: 'doctrine', label: 'doctrine du dépôt', provider: 'deepseek', model: 'deepseek-v4-flash' }),
+      call({ id: 'data', label: 'données et accès', provider: 'deepseek', model: 'deepseek-v4-flash' }),
+    ]);
+    expect(line).toBe(
+      'ollama/glm-5.2:cloud (passe régression fonctionnelle) · ' +
+        'deepseek/deepseek-v4-flash (doctrine du dépôt, données et accès)',
+    );
+  });
+});
+
+describe('la ligne de journal, côté cache et coût', () => {
+  it('dit la part servie par le cache, seule mesure du levier', () => {
+    const line = describeCall(
+      call({ provider: 'deepseek', model: 'deepseek-v4-flash', cachedInputTokens: 92_032, costUsd: 0.0032 }),
+    );
+    expect(line).toContain('deepseek/deepseek-v4-flash');
+    expect(line).toContain(`dont ${(92_032).toLocaleString('fr-FR')} en cache`);
+    expect(line).toContain('0,0032 $');
+  });
+
+  /** Un cache à zéro n'est pas une mesure : Ollama n'expose simplement rien. */
+  it('ne parle pas de cache quand il n’y en a pas eu', () => {
+    expect(describeCall(call())).not.toContain('en cache');
+  });
+
+  it('préfère les tokens de raisonnement à la part déduite, quand ils existent', () => {
+    const line = describeCall(call({ reasoningTokens: 6_480 }));
+    expect(line).toContain(`dont ${(6_480).toLocaleString('fr-FR')} de raisonnement`);
+    expect(line).not.toContain('% de raisonnement');
+  });
+
+  /**
+   * Quelques centièmes de dollar : arrondir au cent afficherait « 0,01 $ »
+   * partout et rendrait invisible le facteur trente que le cache fait gagner.
+   */
+  it('garde assez de décimales pour ne pas afficher zéro', () => {
+    expect(formatCost(0.0032)).toBe('0,0032 $');
   });
 });

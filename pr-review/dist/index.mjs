@@ -433,6 +433,392 @@ function parseList(value) {
   return value.split("\n").map((line) => line.trim()).filter((line) => line !== "" && !line.startsWith("#"));
 }
 
+// pr-review/src/llm/types.ts
+var LlmError = class extends Error {
+  /** Une seconde tentative a-t-elle une chance d'aboutir ? */
+  retryable;
+  /** Le modèle a refusé `think` : rejouer sans est la seule issue. */
+  thinkingRejected;
+  constructor(message, retryable = false, thinkingRejected = false) {
+    super(message);
+    this.name = "LlmError";
+    this.retryable = retryable;
+    this.thinkingRejected = thinkingRejected;
+  }
+};
+
+// pr-review/src/llm/http.ts
+var DEFAULT_TIMEOUT_MS = 15 * 6e4;
+var RETRY_DELAY_MS = 2e4;
+async function* streamLines(body) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for await (const chunk of body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    let cut = buffer.indexOf("\n");
+    while (cut !== -1) {
+      const line = buffer.slice(0, cut).trim();
+      buffer = buffer.slice(cut + 1);
+      if (line) yield line;
+      cut = buffer.indexOf("\n");
+    }
+  }
+  const rest = (buffer + decoder.decode()).trim();
+  if (rest) yield rest;
+}
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var worthRetrying = (status) => status === 429 || status >= 500;
+var wantsNoThinking = (value) => /^(false|off|none|no|0)$/i.test(value.trim());
+function describeStatus(status) {
+  if (status === 401 || status === 403) return "(cl\xE9 refus\xE9e)";
+  if (status === 404) return "(mod\xE8le inconnu)";
+  if (status === 402) return "(cr\xE9dit \xE9puis\xE9)";
+  if (status === 429) return "(quota ou limite de d\xE9bit atteinte)";
+  if (status >= 500) return "(panne c\xF4t\xE9 provider)";
+  return "";
+}
+function detail(body, apiKey) {
+  const trimmed = body.trim();
+  return trimmed ? ` : ${redact(scrub(trimmed.slice(0, 300), apiKey))}` : "";
+}
+function scrub(text, apiKey) {
+  const withoutBearer = text.replace(/\bBearer\s+\S+/gi, "Bearer ***");
+  if (!apiKey) return withoutBearer;
+  const pattern = apiKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return withoutBearer.replace(new RegExp(pattern, "g"), "***");
+}
+function transportError(error, timeoutMs, provider, apiKey = "") {
+  if (error instanceof Error && error.name === "TimeoutError") {
+    return new LlmError(`${provider} n'a pas r\xE9pondu en ${Math.round(timeoutMs / 6e4)} min`);
+  }
+  return new LlmError(`appel \xE0 ${provider} impossible (${scrub(describeCause(error), apiKey)})`, true);
+}
+function describeCause(error) {
+  const chain = [];
+  const seen = /* @__PURE__ */ new Set();
+  let current = error;
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    const code = current.code;
+    chain.push(typeof code === "string" ? `${current.message} [${code}]` : current.message);
+    current = current.cause;
+  }
+  return redact(chain.length > 0 ? chain.join(" \u2190 ") : String(error));
+}
+var redact = (text) => text.replace(/\/\/[^/\s@]+@/g, "//***@");
+var rejectsThinkingValue = (body) => /invalid (think|reasoning_effort) value/i.test(body);
+async function withRetries(attempt2, request) {
+  try {
+    return await attempt2(request);
+  } catch (error) {
+    if (!(error instanceof LlmError)) throw error;
+    if (error.thinkingRejected && request.think) {
+      const fallback = rejectsThinkingValue(error.message) ? "true" : "";
+      request.onDowngrade?.(error.message);
+      return attempt2({ ...request, think: fallback });
+    }
+    if (!error.retryable) throw error;
+    request.onRetry?.(error.message);
+    await sleep(request.retryDelayMs ?? RETRY_DELAY_MS);
+    return attempt2(request);
+  }
+}
+
+// pr-review/src/llm/ollama.ts
+function parseThink(value) {
+  const normalised = value.trim().toLowerCase();
+  if (normalised === "true") return true;
+  if (wantsNoThinking(normalised)) return false;
+  return normalised;
+}
+var rejectsThinking = (status, body) => status === 400 && /think/i.test(body);
+async function attempt(request) {
+  const started = Date.now();
+  const payload = await send(request);
+  return {
+    content: payload.message?.content ?? "",
+    thinkingChars: payload.message?.thinking?.length ?? 0,
+    usage: {
+      inputTokens: payload.prompt_eval_count ?? 0,
+      // Ollama Cloud ne dit rien de son cache. Voir l'en-tête du module.
+      cachedInputTokens: 0,
+      outputTokens: payload.eval_count ?? 0,
+      // `eval_count` englobe le raisonnement sans le distinguer : le seul
+      // rapport disponible est celui des tailles en caractères, que
+      // `thinkingChars` porte déjà.
+      reasoningTokens: 0
+    },
+    durationMs: Date.now() - started
+  };
+}
+var ollamaClient = (request) => withRetries(attempt, request);
+async function send(request) {
+  const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  let response;
+  try {
+    response = await fetch(`${request.baseUrl}/api/chat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${request.apiKey}`
+      },
+      body: JSON.stringify({
+        model: request.model,
+        stream: true,
+        ...request.think ? { think: parseThink(request.think) } : {},
+        // Une review doit rester comparable d'un jour à l'autre : c'est la
+        // graine qui s'en charge, pas une température nulle, qui sur un modèle
+        // de raisonnement coûterait la moitié de sa profondeur d'analyse.
+        options: {
+          temperature: request.temperature ?? 1,
+          ...request.seed === void 0 ? {} : { seed: request.seed }
+        },
+        messages: request.messages
+      }),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+  } catch (error) {
+    throw transportError(error, timeoutMs, "Ollama", request.apiKey);
+  }
+  try {
+    if (!response.ok) {
+      const text = await response.text();
+      throw new LlmError(
+        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text, request.apiKey)}`,
+        worthRetrying(response.status),
+        rejectsThinking(response.status, text)
+      );
+    }
+    return await collect(response, request.apiKey);
+  } catch (error) {
+    if (error instanceof LlmError) throw error;
+    throw transportError(error, timeoutMs, "Ollama", request.apiKey);
+  }
+}
+async function collect(response, apiKey) {
+  let content = "";
+  let thinking = "";
+  let promptTokens = 0;
+  let evalTokens = 0;
+  let complete = false;
+  let fragments = 0;
+  for await (const line of streamLines(response.body)) {
+    let chunk;
+    try {
+      chunk = JSON.parse(line);
+    } catch {
+      if (fragments > 0) break;
+      throw new LlmError(`r\xE9ponse illisible d'Ollama (${scrub(line.slice(0, 200), apiKey)})`);
+    }
+    fragments += 1;
+    if (chunk.error) {
+      throw new LlmError(
+        `Ollama a r\xE9pondu une erreur : ${scrub(chunk.error, apiKey)}`,
+        false,
+        /think/i.test(chunk.error)
+      );
+    }
+    content += chunk.message?.content ?? "";
+    thinking += chunk.message?.thinking ?? "";
+    if (chunk.prompt_eval_count !== void 0) promptTokens = chunk.prompt_eval_count;
+    if (chunk.eval_count !== void 0) evalTokens = chunk.eval_count;
+    if (chunk.done) complete = true;
+  }
+  if (!complete) {
+    throw new LlmError("le flux d'Ollama s'est interrompu avant la fin de la r\xE9ponse", true);
+  }
+  if (!content.trim()) {
+    throw new LlmError("Ollama a rendu une r\xE9ponse vide");
+  }
+  return {
+    message: { content, thinking },
+    prompt_eval_count: promptTokens,
+    eval_count: evalTokens
+  };
+}
+
+// pr-review/src/llm/openai.ts
+function readUsage(raw) {
+  return {
+    inputTokens: raw?.prompt_tokens ?? 0,
+    cachedInputTokens: raw?.prompt_cache_hit_tokens ?? raw?.prompt_tokens_details?.cached_tokens ?? 0,
+    outputTokens: raw?.completion_tokens ?? 0,
+    reasoningTokens: raw?.completion_tokens_details?.reasoning_tokens ?? 0
+  };
+}
+function reasoningBody(think, dialect) {
+  const value = (think ?? "").trim();
+  if (value === "") return {};
+  if (wantsNoThinking(value)) return dialect.thinkingOff ?? {};
+  if (/^(true|yes|on)$/i.test(value)) return {};
+  return { reasoning_effort: value.toLowerCase() };
+}
+var rejectsThinking2 = (status, body) => status === 400 && /reasoning|thinking/i.test(body);
+function createOpenAiClient(dialect) {
+  async function attempt2(request) {
+    const started = Date.now();
+    const collected = await send2(request, dialect);
+    return { ...collected, durationMs: Date.now() - started };
+  }
+  return (request) => withRetries(attempt2, request);
+}
+async function send2(request, dialect) {
+  const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  let response;
+  try {
+    response = await fetch(`${request.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${request.apiKey}`
+      },
+      body: JSON.stringify({
+        model: request.model,
+        stream: true,
+        // Sans ceci, aucun compteur n'arrive en streaming. Voir l'en-tête.
+        stream_options: { include_usage: true },
+        // `seed` n'est volontairement pas envoyé : il n'est documenté chez aucun
+        // des dialectes visés, et un paramètre inconnu se paie d'un 400 sur les
+        // serveurs stricts. La stabilité y repose sur la température seule.
+        temperature: request.temperature ?? 1,
+        ...reasoningBody(request.think, dialect),
+        messages: request.messages
+      }),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+  } catch (error) {
+    throw transportError(error, timeoutMs, dialect.name, request.apiKey);
+  }
+  try {
+    if (!response.ok) {
+      const text = await response.text();
+      throw new LlmError(
+        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text, request.apiKey)}`,
+        worthRetrying(response.status),
+        rejectsThinking2(response.status, text)
+      );
+    }
+    return await collect2(response, dialect, request.apiKey);
+  } catch (error) {
+    if (error instanceof LlmError) throw error;
+    throw transportError(error, timeoutMs, dialect.name, request.apiKey);
+  }
+}
+async function collect2(response, dialect, apiKey) {
+  let content = "";
+  let thinking = "";
+  let usage = null;
+  let complete = false;
+  let truncated = false;
+  let fragments = 0;
+  for await (const line of streamLines(response.body)) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (payload === "[DONE]") {
+      complete = true;
+      continue;
+    }
+    let chunk;
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      if (fragments > 0) break;
+      throw new LlmError(
+        `r\xE9ponse illisible de ${dialect.name} (${scrub(payload.slice(0, 200), apiKey)})`
+      );
+    }
+    fragments += 1;
+    if (chunk.error) {
+      const message = typeof chunk.error === "string" ? chunk.error : chunk.error.message ?? "";
+      throw new LlmError(
+        `${dialect.name} a r\xE9pondu une erreur : ${scrub(message, apiKey)}`,
+        false,
+        /reasoning|thinking/i.test(message)
+      );
+    }
+    for (const choice of chunk.choices ?? []) {
+      content += choice.delta?.content ?? "";
+      thinking += choice.delta?.reasoning_content ?? "";
+      if (choice.finish_reason) {
+        complete = true;
+        if (choice.finish_reason === "length") truncated = true;
+      }
+    }
+    if (chunk.usage) usage = readUsage(chunk.usage);
+  }
+  if (!complete) {
+    throw new LlmError(`le flux de ${dialect.name} s'est interrompu avant la fin de la r\xE9ponse`, true);
+  }
+  if (truncated) {
+    throw new LlmError(`${dialect.name} a coup\xE9 sa r\xE9ponse au plafond de tokens de sortie`);
+  }
+  if (!content.trim()) {
+    throw new LlmError(`${dialect.name} a rendu une r\xE9ponse vide`);
+  }
+  return {
+    content,
+    thinkingChars: thinking.length,
+    // Un usage absent laisse des compteurs à zéro : le provider n'a pas honoré
+    // `include_usage`, ce que la ligne de journal montrera. Ce n'est pas une
+    // raison de perdre une review déjà payée.
+    usage: usage ?? readUsage(null)
+  };
+}
+
+// pr-review/src/llm/index.ts
+var PROVIDERS = {
+  ollama: {
+    label: "Ollama Cloud",
+    client: ollamaClient,
+    defaultBaseUrl: "https://ollama.com",
+    defaultModel: "glm-5.2:cloud",
+    prefixCache: false,
+    supportsSeed: true
+  },
+  deepseek: {
+    label: "DeepSeek",
+    client: createOpenAiClient({
+      name: "DeepSeek",
+      // Le seul dialecte qui coupe le raisonnement autrement que par un niveau.
+      thinkingOff: { thinking: { type: "disabled" } }
+    }),
+    defaultBaseUrl: "https://api.deepseek.com",
+    defaultModel: "deepseek-v4-flash",
+    prefixCache: true,
+    supportsSeed: false
+  },
+  openai: {
+    label: "endpoint OpenAI-compatible",
+    client: createOpenAiClient({ name: "le provider" }),
+    defaultBaseUrl: "",
+    defaultModel: "",
+    // « OpenAI-compatible » décrit un protocole, pas une garantie de cache. On
+    // ne présume donc rien : sérialiser deux passes chez un endpoint qui ne
+    // cache pas coûte du temps contre rien. L'input « openai-prefix-cache »
+    // l'active pour qui sait que son endpoint le fait.
+    prefixCache: false,
+    supportsSeed: false
+  }
+};
+var PROVIDER_IDS = Object.keys(PROVIDERS);
+var isProvider = (value) => value in PROVIDERS;
+var PRICES = {
+  "deepseek/deepseek-v4-flash": { input: 0.44, cachedInput: 0.014, output: 1.32 },
+  "deepseek/deepseek-v4-pro": { input: 1.32, cachedInput: 0.044, output: 3.96 }
+};
+function isPeakHour(now) {
+  const hour = now.getUTCHours();
+  return hour >= 1 && hour < 4 || hour >= 6 && hour < 10;
+}
+var OFF_PEAK_RATIO = 0.5;
+function estimateCost(provider, model, usage, peak = true) {
+  const price = PRICES[`${provider}/${model}`];
+  if (!price) return null;
+  const ratio = peak ? 1 : OFF_PEAK_RATIO;
+  const fresh = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
+  return ratio * (fresh * price.input + usage.cachedInputTokens * price.cachedInput + usage.outputTokens * price.output) / 1e6;
+}
+
 // pr-review/src/prompt.ts
 function renderDoctrine(files) {
   if (files.length === 0) {
@@ -530,7 +916,8 @@ ${context.diff}
 
 ## Full content of the changed files, after the change
 
-Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from ${context.imported.length > 0 ? "this section and from the next one" : "this section"} was not given to you: do not describe its contents.
+Lines are numbered. That number is the one you cite in \`path:line\`. Any file absent from the
+sections below was not given to you: do not describe its contents.
 ${renderGaps(context.windowed.length > 0)}
 ${contents}${renderImported(context.imported)}`;
 }
@@ -749,12 +1136,26 @@ function selectPasses(input, options) {
   if (run2.length === 0) return { run: [...PASSES], skipped: [] };
   return { run: run2, skipped };
 }
-function buildPassSystemPrompt(pass, options, hasImports) {
-  return `${buildPreamble(options)}
+function buildPassMessages(pass, options, meta, seen) {
+  return [
+    { role: "system", content: buildPreamble(options) },
+    { role: "user", content: buildUserPrompt(meta, seen) },
+    // La consigne sur les doutes ne s'écrit que s'il y a bien une section de
+    // fichiers de contexte à lire : sinon elle désigne du vide.
+    { role: "user", content: `${pass.objective}
 
-${pass.objective}
-
-${passOutput(hasImports)}`;
+${passOutput(seen.imported.length > 0)}` }
+  ];
+}
+function groupForCache(items) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const [index, item] of items.entries()) {
+    const key = item.cacheable ? `${item.provider}/${item.model}` : `seul:${index}`;
+    const group = groups.get(key);
+    if (group) group.push(item);
+    else groups.set(key, [item]);
+  }
+  return [...groups.values()].map((group) => [...group].sort((a, b) => a.chars - b.chars));
 }
 var OUTPUT_TEMPLATE = `## Verdict
 Une seule phrase : ce que tu retiens de cette PR.
@@ -886,6 +1287,8 @@ var DEFAULT_DOCTRINE = [
   "AGENTS.md"
 ];
 var DEFAULTS = {
+  /** Provider des passes qui n'en désignent pas d'autre. */
+  provider: "ollama",
   model: "glm-5.2:cloud",
   maxFindings: 20,
   budgetChars: 5e5,
@@ -946,6 +1349,24 @@ var DEFAULTS = {
    */
   windowMinLines: { full: 0, balanced: 250, lean: 120 }
 };
+var PASS_IDS = ["regression", "doctrine", "data", "merge"];
+var CHEAP_MODEL = {
+  ollama: "deepseek-v4-flash:cloud",
+  deepseek: "deepseek-v4-flash"
+};
+function mixFor(provider) {
+  const model = CHEAP_MODEL[provider];
+  if (!model) return {};
+  return {
+    doctrine: { provider, model, thinking: "high" },
+    data: { provider, model, thinking: "high" },
+    merge: { provider, model, thinking: "low" }
+  };
+}
+function mixRoute(provider, hasDeepSeekKey) {
+  if (provider !== DEFAULTS.provider) return null;
+  return hasDeepSeekKey ? "deepseek" : "ollama";
+}
 var UsageError = class extends Error {
 };
 function readInput(env, name) {
@@ -1003,11 +1424,52 @@ function readSeed(env, warn) {
   }
   return parsed;
 }
+function readProvider(env, name, fallback, warn) {
+  const raw = readInput(env, name).toLowerCase();
+  if (raw === "") return fallback;
+  if (isProvider(raw)) return raw;
+  warn(
+    `input \xAB ${name} \xBB : provider inconnu (\xAB ${raw} \xBB) : on garde ${fallback}.
+  Connus : ${PROVIDER_IDS.join(", ")}.`
+  );
+  return fallback;
+}
+function resolvePass(env, id, mix, fallback, warn) {
+  const provider = readProvider(env, `${id}-provider`, mix?.provider ?? fallback.provider, warn);
+  const applicable = mix && provider === mix.provider ? mix : void 0;
+  const providerDefault = provider === fallback.provider ? "" : PROVIDERS[provider]?.defaultModel ?? "";
+  return {
+    provider,
+    model: readInput(env, `${id}-model`) || applicable?.model || providerDefault || fallback.model,
+    thinking: readInput(env, `${id}-thinking`) || fallback.thinkingWritten || applicable?.thinking || fallback.thinkingDefault
+  };
+}
+function resolvePassConfigs(env, options, warn = () => {
+}) {
+  const configs = {};
+  for (const id of PASS_IDS) {
+    const steps = PASSES.find((pass) => pass.id === id)?.thinkingSteps[options.effort] ?? 0;
+    const written = id === "merge" ? options.mergeThinking : options.thinking;
+    configs[id] = resolvePass(
+      env,
+      id,
+      options.mix[id],
+      {
+        provider: options.provider,
+        model: options.model,
+        thinkingWritten: written ? stepDown(written, steps) : "",
+        thinkingDefault: id === "merge" ? DEFAULTS.mergeThinking : stepDown(DEFAULTS.thinking, steps)
+      },
+      warn
+    );
+  }
+  return configs;
+}
 function resolveConfig({ argv, env, warn = () => {
 } }) {
   let pr = null;
   let dryRun = readBoolean(env, "dry-run");
-  let model = readInput(env, "model") || env.OLLAMA_REVIEW_MODEL?.trim() || DEFAULTS.model;
+  let model = readInput(env, "model") || env.OLLAMA_REVIEW_MODEL?.trim() || "";
   let countOnly2 = false;
   let variant = readInput(env, "variant") || DEFAULTS.variant;
   for (let index = 0; index < argv.length; index += 1) {
@@ -1042,14 +1504,42 @@ function resolveConfig({ argv, env, warn = () => {
   }
   const doctrineInput = parseList(readInput(env, "doctrine"));
   const effort = readEffort(env, warn);
+  const keys = {
+    ollama: readInput(env, "ollama-api-key") || env.OLLAMA_API_KEY?.trim() || "",
+    deepseek: readInput(env, "deepseek-api-key") || env.DEEPSEEK_API_KEY?.trim() || "",
+    openai: readInput(env, "openai-api-key") || env.OPENAI_API_KEY?.trim() || ""
+  };
+  const provider = readProvider(env, "provider", DEFAULTS.provider, warn);
+  const providerDefault = PROVIDERS[provider]?.defaultModel || "";
+  if (model === "" && providerDefault === "") {
+    warn(
+      `provider \xAB ${provider} \xBB sans \xAB model \xBB : cet endpoint n'a pas de catalogue connu,
+  donc aucun mod\xE8le par d\xE9faut. Nomme-en un, sinon les appels partiront \xE0 vide.`
+    );
+  }
+  const route = model === "" ? mixRoute(provider, keys.deepseek !== "") : null;
   return {
     pr,
     dryRun,
-    model,
+    model: model || providerDefault || DEFAULTS.model,
+    provider,
     // Pas de validation contre une liste de niveaux : ils varient d'un modèle à
     // l'autre, et un niveau refusé est rattrapé à l'appel.
-    thinking: readInput(env, "thinking") || DEFAULTS.thinking,
-    mergeThinking: readInput(env, "merge-thinking") || DEFAULTS.mergeThinking,
+    passConfigs: resolvePassConfigs(
+      env,
+      {
+        provider,
+        model: model || providerDefault || DEFAULTS.model,
+        thinking: readInput(env, "thinking"),
+        mergeThinking: readInput(env, "merge-thinking"),
+        effort,
+        mix: route === null ? {} : mixFor(route)
+      },
+      warn
+    ),
+    keys,
+    openaiBaseUrl: readInput(env, "openai-base-url").replace(/\/$/, ""),
+    openaiPrefixCache: readBoolean(env, "openai-prefix-cache"),
     temperature: readTemperature(env, warn),
     seed: readSeed(env, warn),
     maxFindings: readNumber(env, "max-findings", DEFAULTS.maxFindings, warn),
@@ -1080,198 +1570,103 @@ function resolveConfig({ argv, env, warn = () => {
     projectSummary: readInput(env, "project-summary"),
     countOnly: countOnly2,
     variant,
-    apiKey: readInput(env, "ollama-api-key") || env.OLLAMA_API_KEY?.trim() || "",
     githubToken: readInput(env, "github-token") || env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || ""
   };
 }
 
-// pr-review/src/ollama.ts
-var DEFAULT_HOST = "https://ollama.com";
-var DEFAULT_TIMEOUT_MS = 15 * 6e4;
-var RETRY_DELAY_MS = 2e4;
-var OllamaError = class extends Error {
-  /** Une seconde tentative a-t-elle une chance d'aboutir ? */
-  retryable;
-  /** Le modèle a refusé `think` : rejouer sans est la seule issue. */
-  thinkingRejected;
-  constructor(message, retryable = false, thinkingRejected = false) {
-    super(message);
-    this.name = "OllamaError";
-    this.retryable = retryable;
-    this.thinkingRejected = thinkingRejected;
-  }
-};
-async function* streamLines(body) {
-  const decoder = new TextDecoder();
-  let buffer = "";
-  for await (const chunk of body) {
-    buffer += decoder.decode(chunk, { stream: true });
-    let cut = buffer.indexOf("\n");
-    while (cut !== -1) {
-      const line = buffer.slice(0, cut).trim();
-      buffer = buffer.slice(cut + 1);
-      if (line) yield line;
-      cut = buffer.indexOf("\n");
+// pr-review/src/stats.ts
+var CHARS_PER_TOKEN = 3.5;
+var estimateTokens = (chars) => Math.round(chars / CHARS_PER_TOKEN);
+var count = (value) => value.toLocaleString("fr-FR");
+function totals(calls) {
+  return calls.reduce(
+    (sum, call) => ({
+      inputTokens: sum.inputTokens + call.inputTokens,
+      cachedInputTokens: sum.cachedInputTokens + call.cachedInputTokens,
+      outputTokens: sum.outputTokens + call.outputTokens,
+      thinkingChars: sum.thinkingChars + call.thinkingChars,
+      costUsd: sum.costUsd + (call.costUsd ?? 0),
+      // Un appel raté n'a rien coûté qu'on sache chiffrer, mais il a bien été
+      // envoyé : ne pas le compter comme un trou de tarification.
+      costPartial: sum.costPartial || call.ok && call.costUsd === null
+    }),
+    {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      thinkingChars: 0,
+      costUsd: 0,
+      costPartial: false
     }
+  );
+}
+function reasoningShare(call) {
+  const total = call.thinkingChars + call.contentChars;
+  if (call.thinkingChars === 0 || total === 0) return null;
+  return call.thinkingChars / total;
+}
+var formatCost = (usd) => `${usd.toLocaleString("fr-FR", { minimumFractionDigits: 4, maximumFractionDigits: 4 })} $`;
+function describeCall(call) {
+  const share = reasoningShare(call);
+  const reasoning = call.reasoningTokens > 0 ? ` dont ${count(call.reasoningTokens)} de raisonnement` : share === null ? "" : ` dont ~${Math.round(share * 100)} % de raisonnement`;
+  const think = call.think ? `, think=${call.think}` : "";
+  const cached = call.cachedInputTokens > 0 ? ` dont ${count(call.cachedInputTokens)} en cache` : "";
+  const cost = call.costUsd === null ? "" : `, ~${formatCost(call.costUsd)}`;
+  return `${call.label} en ${Math.round(call.durationMs / 1e3)} s \xB7 ${call.provider}/${call.model} (${count(call.inputTokens)} tokens en entr\xE9e${cached}, ${count(call.outputTokens)} en sortie${reasoning}${think}${cost}).`;
+}
+function describeTargets(calls) {
+  const byTarget = /* @__PURE__ */ new Map();
+  for (const call of calls) {
+    const key = `${call.provider}/${call.model}`;
+    const labels = byTarget.get(key);
+    if (labels) labels.push(call.label);
+    else byTarget.set(key, [call.label]);
   }
-  const rest = (buffer + decoder.decode()).trim();
-  if (rest) yield rest;
+  return [...byTarget].map(([target, labels]) => `${target} (${labels.join(", ")})`).join(" \xB7 ");
 }
-var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-var worthRetrying = (status) => status === 429 || status >= 500;
-function parseThink(value) {
-  const normalised = value.trim().toLowerCase();
-  if (normalised === "true") return true;
-  if (/^(false|off|none)$/.test(normalised)) return false;
-  return normalised;
+var pad = (text, width) => text.padEnd(width);
+var padStart = (text, width) => text.padStart(width);
+function renderBreakdown(calls, blocks) {
+  const labels = calls.map((call) => call.label);
+  const targets = calls.map((call) => `${call.provider}/${call.model}`);
+  const width = Math.max(...labels.map((label) => label.length), "appel".length);
+  const target = Math.max(...targets.map((value) => value.length), "destination".length);
+  const priced = calls.some((call) => call.costUsd !== null);
+  const rows = calls.map((call, index) => {
+    const total = call.instructionChars + call.contextChars;
+    const cost = call.costUsd === null ? "\u2014" : `~${formatCost(call.costUsd)}`;
+    return `  ${pad(call.label, width)}  ${pad(targets[index], target)}  ${padStart(count(call.instructionChars), 9)}  ${padStart(count(call.contextChars), 10)}  ${padStart(count(total), 10)}  ${padStart(`~${count(estimateTokens(total))}`, 10)}` + (priced ? `  ${padStart(cost, 12)}` : "");
+  });
+  const grand = calls.reduce((sum, call) => sum + call.instructionChars + call.contextChars, 0);
+  const grandCost = calls.reduce((sum, call) => sum + (call.costUsd ?? 0), 0);
+  const header = `  ${pad("appel", width)}  ${pad("destination", target)}  ${padStart("consignes", 9)}  ${padStart("contexte", 10)}  ${padStart("total", 10)}  ${padStart("\u2248 tokens", 10)}` + (priced ? `  ${padStart("\u2248 entr\xE9e", 12)}` : "");
+  const rule = `  ${"\u2500".repeat(width + target + 48 + (priced ? 14 : 0))}`;
+  return [
+    header,
+    ...rows,
+    rule,
+    `  ${pad("total entr\xE9e", width)}  ${pad("", target)}  ${padStart("", 9)}  ${padStart("", 10)}  ${padStart(count(grand), 10)}  ${padStart(`~${count(estimateTokens(grand))}`, 10)}` + (priced ? `  ${padStart(`~${formatCost(grandCost)}`, 12)}` : ""),
+    `  dont : ${describeBlocks(blocks)}`,
+    "",
+    "  Tokens estim\xE9s : caract\xE8res \xF7 " + CHARS_PER_TOKEN + ". Les caract\xE8res, eux, sont exacts.",
+    ...priced ? [
+      "  Co\xFBt : ENTR\xC9E seule, au tarif plein, sans cache. La sortie n'est pas devinable\n  avant l\u2019appel, et le cache ne se constate qu\u2019apr\xE8s."
+    ] : []
+  ].join("\n");
 }
-var rejectsThinking = (status, body) => status === 400 && /think/i.test(body);
-var rejectsThinkingValue = (body) => /invalid think value/i.test(body);
-async function attempt(options) {
-  const started = Date.now();
-  const payload = await request(options);
-  return {
-    content: payload.message?.content ?? "",
-    promptTokens: payload.prompt_eval_count ?? 0,
-    evalTokens: payload.eval_count ?? 0,
-    thinkingChars: payload.message?.thinking?.length ?? 0,
-    durationMs: Date.now() - started
-  };
+function describeBlocks(blocks) {
+  const total = blocks.system + blocks.diff + blocks.touched + blocks.imported + blocks.meta;
+  if (total === 0) return "rien";
+  const share = (value) => `${Math.round(value / total * 100)} %`;
+  return [
+    `diff ${share(blocks.diff)}`,
+    `fichiers touch\xE9s ${share(blocks.touched)}`,
+    `imports ${share(blocks.imported)}`,
+    `syst\xE8me ${share(blocks.system)}`,
+    `reste ${share(blocks.meta)}`
+  ].join(" \xB7 ");
 }
-async function chat(options) {
-  try {
-    return await attempt(options);
-  } catch (error) {
-    if (!(error instanceof OllamaError)) throw error;
-    if (error.thinkingRejected && options.think) {
-      const fallback = rejectsThinkingValue(error.message) ? "true" : "";
-      options.onDowngrade?.(error.message);
-      return attempt({ ...options, think: fallback });
-    }
-    if (!error.retryable) throw error;
-    options.onRetry?.(error.message);
-    await sleep(options.retryDelayMs ?? RETRY_DELAY_MS);
-    return attempt(options);
-  }
-}
-async function request(options) {
-  const host = (process.env.OLLAMA_HOST ?? DEFAULT_HOST).replace(/\/$/, "");
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  let response;
-  try {
-    response = await fetch(`${host}/api/chat`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${options.apiKey}`
-      },
-      body: JSON.stringify({
-        model: options.model,
-        stream: true,
-        ...options.think ? { think: parseThink(options.think) } : {},
-        // Une review doit rester comparable d'un jour à l'autre : c'est la
-        // graine qui s'en charge, pas une température nulle, qui sur un modèle
-        // de raisonnement coûterait la moitié de sa profondeur d'analyse.
-        options: {
-          temperature: options.temperature ?? 1,
-          ...options.seed === void 0 ? {} : { seed: options.seed }
-        },
-        messages: [
-          { role: "system", content: options.system },
-          { role: "user", content: options.user }
-        ]
-      }),
-      signal: AbortSignal.timeout(timeoutMs)
-    });
-  } catch (error) {
-    throw transportError(error, timeoutMs);
-  }
-  try {
-    if (!response.ok) {
-      const text = await response.text();
-      throw new OllamaError(
-        `HTTP ${response.status} ${describeStatus(response.status)}${detail(text)}`,
-        worthRetrying(response.status),
-        rejectsThinking(response.status, text)
-      );
-    }
-    return await collect(response);
-  } catch (error) {
-    if (error instanceof OllamaError) throw error;
-    throw transportError(error, timeoutMs);
-  }
-}
-function transportError(error, timeoutMs) {
-  if (error instanceof Error && error.name === "TimeoutError") {
-    return new OllamaError(`Ollama n'a pas r\xE9pondu en ${Math.round(timeoutMs / 6e4)} min`);
-  }
-  return new OllamaError(`appel \xE0 Ollama impossible (${describeCause(error)})`, true);
-}
-function describeCause(error) {
-  const chain = [];
-  const seen = /* @__PURE__ */ new Set();
-  let current = error;
-  while (current instanceof Error && !seen.has(current)) {
-    seen.add(current);
-    const code = current.code;
-    chain.push(typeof code === "string" ? `${current.message} [${code}]` : current.message);
-    current = current.cause;
-  }
-  return redact(chain.length > 0 ? chain.join(" \u2190 ") : String(error));
-}
-var redact = (text) => text.replace(/\/\/[^/\s@]+@/g, "//***@");
-async function collect(response) {
-  let content = "";
-  let thinking = "";
-  let promptTokens = 0;
-  let evalTokens = 0;
-  let complete = false;
-  let fragments = 0;
-  for await (const line of streamLines(response.body)) {
-    let chunk;
-    try {
-      chunk = JSON.parse(line);
-    } catch {
-      if (fragments > 0) break;
-      throw new OllamaError(`r\xE9ponse illisible d'Ollama (${line.slice(0, 200)})`);
-    }
-    fragments += 1;
-    if (chunk.error) {
-      throw new OllamaError(
-        `Ollama a r\xE9pondu une erreur : ${chunk.error}`,
-        false,
-        /think/i.test(chunk.error)
-      );
-    }
-    content += chunk.message?.content ?? "";
-    thinking += chunk.message?.thinking ?? "";
-    if (chunk.prompt_eval_count !== void 0) promptTokens = chunk.prompt_eval_count;
-    if (chunk.eval_count !== void 0) evalTokens = chunk.eval_count;
-    if (chunk.done) complete = true;
-  }
-  if (!complete) {
-    throw new OllamaError("le flux d'Ollama s'est interrompu avant la fin de la r\xE9ponse", true);
-  }
-  if (!content.trim()) {
-    throw new OllamaError("Ollama a rendu une r\xE9ponse vide");
-  }
-  return {
-    message: { content, thinking },
-    prompt_eval_count: promptTokens,
-    eval_count: evalTokens
-  };
-}
-function describeStatus(status) {
-  if (status === 401 || status === 403) return "(cl\xE9 refus\xE9e)";
-  if (status === 404) return "(mod\xE8le inconnu)";
-  if (status === 429) return "(quota ou limite de d\xE9bit atteinte)";
-  if (status >= 500) return "(panne c\xF4t\xE9 Ollama)";
-  return "";
-}
-function detail(body) {
-  const trimmed = body.trim();
-  return trimmed ? ` : ${trimmed.slice(0, 300)}` : "";
-}
+var statsLine = (payload) => `::stats::${JSON.stringify(payload)}`;
 
 // pr-review/src/render.ts
 var MARKER = "<!-- aristarque -->";
@@ -1311,16 +1706,20 @@ function formatDuration(ms) {
   if (seconds < 60) return `${seconds} s`;
   return `${Math.floor(seconds / 60)} min ${String(seconds % 60).padStart(2, "0")} s`;
 }
-var count = (value) => value.toLocaleString("fr-FR");
+var count2 = (value) => value.toLocaleString("fr-FR");
 function renderFooter(footer) {
+  const cached = footer.cachedInputTokens > 0 ? ` (dont ${count2(footer.cachedInputTokens)} en cache)` : "";
   const bits = [
-    `${footer.model} via Ollama Cloud`,
+    footer.models,
     `effort ${footer.effort}`,
     formatDuration(footer.durationMs),
-    `${count(footer.promptTokens)} tokens en entr\xE9e, ${count(footer.evalTokens)} en sortie`
+    `${count2(footer.inputTokens)} tokens en entr\xE9e${cached}, ${count2(footer.outputTokens)} en sortie`
   ];
-  if (footer.thinkingChars > 0) {
-    bits.push(`${count(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
+  if (footer.costUsd > 0) {
+    bits.push(`${footer.costPartial ? "au moins " : "~"}${formatCost(footer.costUsd)}`);
+  }
+  if (footer.thinkingChars >= 1024) {
+    bits.push(`${count2(Math.round(footer.thinkingChars / 1024))} Ko de raisonnement`);
   }
   if (footer.imported > 0) {
     const withheld = footer.importsWithheld.length > 0 ? ` (hors ${footer.importsWithheld.map((label) => `\xAB ${label} \xBB`).join(", ")})` : "";
@@ -1387,67 +1786,6 @@ La review n'a pas pu \xEAtre produite : ${reason}
 <sub>Mod\xE8le vis\xE9 : ${model}. Le check reste vert, cette review n'est pas bloquante.</sub>`;
 }
 
-// pr-review/src/stats.ts
-var CHARS_PER_TOKEN = 3.5;
-var estimateTokens = (chars) => Math.round(chars / CHARS_PER_TOKEN);
-var count2 = (value) => value.toLocaleString("fr-FR");
-function totals(calls) {
-  return calls.reduce(
-    (sum, call) => ({
-      promptTokens: sum.promptTokens + call.promptTokens,
-      evalTokens: sum.evalTokens + call.evalTokens,
-      thinkingChars: sum.thinkingChars + call.thinkingChars
-    }),
-    { promptTokens: 0, evalTokens: 0, thinkingChars: 0 }
-  );
-}
-function reasoningShare(call) {
-  const total = call.thinkingChars + call.contentChars;
-  if (call.thinkingChars === 0 || total === 0) return null;
-  return call.thinkingChars / total;
-}
-function describeCall(call) {
-  const share = reasoningShare(call);
-  const reasoning = share === null ? "" : ` dont ~${Math.round(share * 100)} % de raisonnement`;
-  const think = call.think ? `, think=${call.think}` : "";
-  return `${call.label} en ${Math.round(call.durationMs / 1e3)} s (${count2(call.promptTokens)} tokens en entr\xE9e, ${count2(call.evalTokens)} en sortie${reasoning}${think}).`;
-}
-var pad = (text, width) => text.padEnd(width);
-var padStart = (text, width) => text.padStart(width);
-function renderBreakdown(calls, blocks) {
-  const labels = calls.map((call) => call.label);
-  const width = Math.max(...labels.map((label) => label.length), "appel".length);
-  const rows = calls.map((call) => {
-    const total = call.systemChars + call.userChars;
-    return `  ${pad(call.label, width)}  ${padStart(count2(call.systemChars), 9)}  ${padStart(count2(call.userChars), 10)}  ${padStart(count2(total), 10)}  ${padStart(`~${count2(estimateTokens(total))}`, 10)}`;
-  });
-  const grand = calls.reduce((sum, call) => sum + call.systemChars + call.userChars, 0);
-  const header = `  ${pad("appel", width)}  ${padStart("syst\xE8me", 9)}  ${padStart("user", 10)}  ${padStart("total", 10)}  ${padStart("\u2248 tokens", 10)}`;
-  const rule = `  ${"\u2500".repeat(width + 46)}`;
-  return [
-    header,
-    ...rows,
-    rule,
-    `  ${pad("total entr\xE9e", width)}  ${padStart("", 9)}  ${padStart("", 10)}  ${padStart(count2(grand), 10)}  ${padStart(`~${count2(estimateTokens(grand))}`, 10)}`,
-    `  dont : ${describeBlocks(blocks)}`,
-    "",
-    "  Tokens estim\xE9s : caract\xE8res \xF7 " + CHARS_PER_TOKEN + ". Les caract\xE8res, eux, sont exacts."
-  ].join("\n");
-}
-function describeBlocks(blocks) {
-  const total = blocks.system + blocks.diff + blocks.touched + blocks.imported + blocks.meta;
-  if (total === 0) return "rien";
-  const share = (value) => `${Math.round(value / total * 100)} %`;
-  return [
-    `diff ${share(blocks.diff)}`,
-    `fichiers touch\xE9s ${share(blocks.touched)}`,
-    `imports ${share(blocks.imported)}`,
-    `syst\xE8me ${share(blocks.system)}`,
-    `reste ${share(blocks.meta)}`
-  ].join(" \xB7 ");
-}
-var statsLine = (payload) => `::stats::${JSON.stringify(payload)}`;
-
 // pr-review/src/index.ts
 var WINDOW = {
   pad: 60,
@@ -1455,7 +1793,10 @@ var WINDOW = {
   joinGap: 25,
   maxCoverage: 0.7
 };
-var DEFAULT_KEY_REF = "op://Personal/Ollama/add more/api_key";
+var DEFAULT_KEY_REFS = {
+  ollama: "op://Personal/Ollama/add more/api_key",
+  deepseek: "op://Personal/DeepSeek/api_key"
+};
 function repoRoot() {
   return process.env.GITHUB_WORKSPACE ?? process.cwd();
 }
@@ -1487,133 +1828,221 @@ async function warnOnDetachedContext(headSha) {
   }
   return false;
 }
-async function keyFrom1Password() {
+async function keyFrom1Password(provider) {
   if (process.env.GITHUB_ACTIONS === "true") return "";
-  const ref = process.env.OLLAMA_API_KEY_REF ?? DEFAULT_KEY_REF;
+  const ref = process.env[`${provider.toUpperCase()}_API_KEY_REF`] ?? DEFAULT_KEY_REFS[provider];
+  if (!ref) return "";
   try {
     return (await run("op", ["read", ref])).trim();
   } catch {
-    console.warn(`\u26A0 Cl\xE9 absente et lecture de ${ref} impossible (1Password verrouill\xE9 ?).`);
+    console.warn(`\u26A0 Cl\xE9 ${provider} absente et lecture de ${ref} impossible (1Password verrouill\xE9 ?).`);
     return "";
   }
 }
+function endpointFor(config, target) {
+  const spec = PROVIDERS[target.provider];
+  if (!spec) return null;
+  const baseUrl = target.provider === "openai" ? (
+    // Le provider générique n'existe que pour viser l'adresse qu'on lui
+    // donne. `openai-base-url` ne vaut QUE pour lui : appliquée à DeepSeek,
+    // elle enverrait la review chez le voisin sans que rien ne le dise.
+    config.openaiBaseUrl
+  ) : (
+    // `OLLAMA_HOST` est historique et documenté ; le motif vaut pour tout
+    // provider qui a une base par défaut, ce qui donne un bac à sable local
+    // gratuit. Le provider générique n'en est pas : son adresse ne vient que
+    // de `openai-base-url`, faute de défaut à surcharger.
+    (process.env[`${target.provider.toUpperCase()}_HOST`] ?? spec.defaultBaseUrl).replace(
+      /\/$/,
+      ""
+    )
+  );
+  const apiKey = config.keys[target.provider] ?? "";
+  if (!baseUrl || !apiKey) return null;
+  return { baseUrl, apiKey };
+}
+function warnOnClearTextKey(config, targets) {
+  const risky = /* @__PURE__ */ new Set();
+  for (const target of targets) {
+    const endpoint = endpointFor(config, target);
+    if (!endpoint) continue;
+    if (/^https:/i.test(endpoint.baseUrl)) continue;
+    if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(endpoint.baseUrl)) continue;
+    risky.add(endpoint.baseUrl);
+  }
+  for (const baseUrl of risky) {
+    console.warn(
+      `\u26A0 ${baseUrl} n'est pas en HTTPS : la cl\xE9 part en clair dans un en-t\xEAte.
+  Acceptable sur un h\xF4te local, jamais vers un endpoint distant.`
+    );
+  }
+}
+function cachesPrefixes(config, provider) {
+  if (provider === "openai") return config.openaiPrefixCache;
+  return PROVIDERS[provider]?.prefixCache ?? false;
+}
+function sizes(messages) {
+  const context = messages.find((message) => message.role === "user");
+  const total = messages.reduce((sum, message) => sum + message.content.length, 0);
+  const contextChars = context?.content.length ?? 0;
+  return { instructionChars: total - contextChars, contextChars };
+}
 async function callModel(config, run2, args) {
-  const sizes = { systemChars: args.system.length, userChars: args.user.length };
+  const { target } = args;
+  const shape = {
+    id: args.id,
+    label: args.label,
+    provider: target.provider,
+    model: target.model,
+    think: target.thinking,
+    ...sizes(args.messages)
+  };
+  const endpoint = endpointFor(config, target);
   let result;
   try {
-    result = await chat({
-      apiKey: config.apiKey,
-      model: config.model,
-      system: args.system,
-      user: args.user,
-      think: args.think,
+    if (endpoint === null) {
+      throw new LlmError(`aucun endpoint utilisable pour \xAB ${target.provider} \xBB`);
+    }
+    result = await PROVIDERS[target.provider].client({
+      apiKey: endpoint.apiKey,
+      baseUrl: endpoint.baseUrl,
+      model: target.model,
+      messages: args.messages,
+      think: target.thinking,
       temperature: config.temperature,
       seed: config.seed,
       timeoutMs: config.timeoutMs,
       onRetry: (reason) => console.warn(`\u26A0 [${args.label}] ${reason} \u2014 nouvelle tentative dans 20 s.`),
       onDowngrade: (reason) => console.warn(
-        `\u26A0 [${args.label}] ${config.model} n'a pas accept\xE9 \xAB thinking: ${args.think} \xBB (${reason}).
+        `\u26A0 [${args.label}] ${target.model} n'a pas accept\xE9 \xAB thinking: ${target.thinking} \xBB (${reason}).
   Relanc\xE9 sans raisonnement explicite : ce sera moins fouill\xE9.`
       )
     });
   } catch (error) {
-    const reason = error instanceof OllamaError ? error.message : String(error);
+    const reason = error instanceof LlmError ? error.message : String(error);
     console.error(`\u2717 ${args.label} : ${reason}`);
     run2.failures.push(reason);
     run2.calls.push({
-      id: args.id,
-      label: args.label,
-      think: args.think,
-      ...sizes,
-      promptTokens: 0,
-      evalTokens: 0,
+      ...shape,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
       thinkingChars: 0,
       contentChars: 0,
       durationMs: 0,
+      costUsd: null,
       ok: false
     });
     return null;
   }
   const stat = {
-    id: args.id,
-    label: args.label,
-    think: args.think,
-    ...sizes,
-    promptTokens: result.promptTokens,
-    evalTokens: result.evalTokens,
+    ...shape,
+    inputTokens: result.usage.inputTokens,
+    cachedInputTokens: result.usage.cachedInputTokens,
+    outputTokens: result.usage.outputTokens,
+    reasoningTokens: result.usage.reasoningTokens,
     thinkingChars: result.thinkingChars,
     contentChars: result.content.length,
     durationMs: result.durationMs,
+    // Le régime horaire au moment de l'appel : DeepSeek facture moitié prix
+    // hors des heures pleines, et supposer le pire gonflerait de deux le seul
+    // chiffre qui sert à juger cette refonte.
+    costUsd: estimateCost(target.provider, target.model, result.usage, isPeakHour(/* @__PURE__ */ new Date())),
     ok: true
   };
   run2.calls.push(stat);
   console.log(`\u2713 ${describeCall(stat)}`);
   return result;
 }
-async function runPasses(config, run2, plan) {
-  const results = await Promise.all(
-    plan.map(async ({ pass, system, user, think }) => {
-      const result = await callModel(config, run2, {
-        id: pass.id,
-        system,
-        user,
-        think,
-        label: `passe ${pass.label}`
-      });
-      if (result === null) return null;
-      return { pass, findings: extractReview(result.content, PASS_HEADING) };
-    })
-  );
-  return results.filter((result) => result !== null);
-}
 function planPasses(config, promptOptions, meta, context, passes) {
   return passes.map((pass) => {
-    const wantsImports = pass.imports[config.effort];
-    const seen = contextFor(context, wantsImports);
+    const target = config.passConfigs[pass.id];
+    const seen = contextFor(context, pass.imports[config.effort]);
+    const messages = buildPassMessages(pass, promptOptions, meta, seen);
     return {
       pass,
-      // La consigne sur les doutes ne s'écrit que s'il y a bien une section de
-      // fichiers de contexte à lire : sinon elle désigne du vide.
-      system: buildPassSystemPrompt(pass, promptOptions, seen.imported.length > 0),
-      user: buildUserPrompt(meta, seen),
-      think: stepDown(config.thinking, pass.thinkingSteps[config.effort]),
-      seen
+      target,
+      messages,
+      seen,
+      provider: target.provider,
+      model: target.model,
+      chars: messages.reduce((sum, message) => sum + message.content.length, 0),
+      cacheable: cachesPrefixes(config, target.provider)
     };
   });
+}
+async function runPasses(config, run2, plan) {
+  const groups = await Promise.all(
+    groupForCache(plan).map(async (group) => {
+      const outcomes = [];
+      for (const { pass, target, messages } of group) {
+        const result = await callModel(config, run2, {
+          id: pass.id,
+          target,
+          messages,
+          label: `passe ${pass.label}`
+        });
+        if (result !== null) {
+          outcomes.push({ pass, findings: extractReview(result.content, PASS_HEADING) });
+        }
+      }
+      return outcomes;
+    })
+  );
+  const done = new Map(groups.flat().map((outcome) => [outcome.pass, outcome]));
+  return plan.map(({ pass }) => done.get(pass)).filter((outcome) => outcome !== void 0);
 }
 function breakdown(plan) {
   const first = plan[0];
   const sum = (files) => files.reduce((total, file) => total + file.numbered.length, 0);
   const seen = first?.seen;
-  const system = first?.system.length ?? 0;
+  const measured = first ? sizes(first.messages) : { instructionChars: 0, contextChars: 0 };
   const diff = seen?.diff.length ?? 0;
   const touched = sum(seen?.files ?? []);
   const imported = sum(seen?.imported ?? []);
   return {
-    system,
+    // Le préambule commun ET l'objectif de la passe : les deux sont de la
+    // consigne, quel que soit le rôle du message qui les porte.
+    system: measured.instructionChars,
     diff,
     touched,
     imported,
-    // Ce qui reste du prompt user : titre, description, liste des fichiers et
-    // consignes. Déduit plutôt que recompté, pour que la somme des parts fasse
-    // toujours exactement le prompt envoyé.
-    meta: Math.max(0, (first?.user.length ?? 0) - diff - touched - imported)
+    // Ce qui reste du bloc de contexte : titre, description, liste des fichiers
+    // et bannières. Déduit plutôt que recompté, pour que la somme des parts
+    // fasse toujours exactement le prompt envoyé.
+    meta: Math.max(0, measured.contextChars - diff - touched - imported)
   };
 }
 function countOnly(config, plan, context) {
-  const calls = plan.map(({ pass, system, user, think }) => ({
-    id: pass.id,
-    label: `passe ${pass.label}`,
-    think,
-    systemChars: system.length,
-    userChars: user.length,
-    promptTokens: 0,
-    evalTokens: 0,
-    thinkingChars: 0,
-    contentChars: 0,
-    durationMs: 0,
-    ok: true
-  }));
+  const calls = plan.map(({ pass, target, messages }) => {
+    const measured = sizes(messages);
+    const inputTokens = estimateTokens(measured.instructionChars + measured.contextChars);
+    return {
+      id: pass.id,
+      label: `passe ${pass.label}`,
+      provider: target.provider,
+      model: target.model,
+      think: target.thinking,
+      ...measured,
+      inputTokens,
+      // Rien n'est encore parti : aucun cache ne peut être supposé, et le
+      // supposer flatterait précisément le chiffre qu'on veut vérifier.
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      thinkingChars: 0,
+      contentChars: 0,
+      durationMs: 0,
+      costUsd: estimateCost(
+        target.provider,
+        target.model,
+        { inputTokens, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0 },
+        isPeakHour(/* @__PURE__ */ new Date())
+      ),
+      ok: true
+    };
+  });
   console.log(
     `
 PR #${config.pr} \xB7 ${context.files.length} fichier(s) touch\xE9s \xB7 ${context.imported.length} import\xE9(s) \xB7 variante \xAB ${config.variant} \xBB
@@ -1623,6 +2052,59 @@ PR #${config.pr} \xB7 ${context.files.length} fichier(s) touch\xE9s \xB7 ${conte
   console.log(
     "\n  La fusion n\u2019est pas compt\xE9e : son entr\xE9e est faite des trouvailles des passes,\n  qui n\u2019existent pas sans appel. Mesur\xE9e en production, elle p\xE8se ~2 000 tokens."
   );
+  for (const group of groupForCache(plan).filter((chain) => chain.length > 1)) {
+    console.log(
+      `
+  ${group.map(({ pass }) => `\xAB ${pass.label} \xBB`).join(" puis ")} : m\xEAme destination,
+  donc lanc\xE9es \xE0 la suite pour que la seconde rejoue le pr\xE9fixe de la premi\xE8re en cache.`
+    );
+    console.log(`  ${describePrefix(group)}`);
+  }
+}
+function describePrefix(group) {
+  const shared = group.reduce((prefix, { messages }) => {
+    const whole = messages.map((message) => message.content).join("\n");
+    if (prefix === null) return whole;
+    let cut = 0;
+    while (cut < prefix.length && cut < whole.length && prefix[cut] === whole[cut]) cut += 1;
+    return prefix.slice(0, cut);
+  }, null);
+  const chars = shared?.length ?? 0;
+  const smallest = Math.min(...group.map(({ chars: total }) => total));
+  const share = Math.round(chars / smallest * 100);
+  if (share < 90) {
+    return `\u26A0 pr\xE9fixe commun : ${chars.toLocaleString("fr-FR")} caract\xE8res seulement, soit ${share} %
+    du plus court des deux prompts. Le cache ne portera que sur cette part : une consigne
+    accord\xE9e diff\xE9remment selon la passe a d\xFB diverger avant le contexte.`;
+  }
+  return `pr\xE9fixe commun : ${chars.toLocaleString("fr-FR")} caract\xE8res, ~${chars > 0 ? Math.round(chars / 3.5).toLocaleString("fr-FR") : 0} tokens r\xE9utilisables.`;
+}
+function resolveTarget(config, id, label, warn) {
+  const target = config.passConfigs[id];
+  if (endpointFor(config, target) !== null) return target;
+  const fallback = { ...target, provider: config.provider, model: config.model };
+  if (endpointFor(config, fallback) === null) return null;
+  warn(
+    `\xAB ${label} \xBB : aucune cl\xE9 pour \xAB ${target.provider} \xBB.
+  Repli sur ${fallback.provider}/${fallback.model}, qui en a une.`
+  );
+  config.passConfigs[id] = fallback;
+  return fallback;
+}
+function usableTargets(config, passes, warn) {
+  const runnable = [];
+  const skipped = [];
+  for (const pass of passes) {
+    if (resolveTarget(config, pass.id, `passe ${pass.label}`, warn) !== null) {
+      runnable.push(pass);
+    } else {
+      skipped.push({
+        label: pass.label,
+        reason: `aucune cl\xE9 pour \xAB ${config.passConfigs[pass.id].provider} \xBB`
+      });
+    }
+  }
+  return { run: runnable, skipped };
 }
 async function review(config) {
   const root = repoRoot();
@@ -1682,37 +2164,83 @@ async function review(config) {
       warn: (message) => console.warn(`\u26A0 ${message}`)
     }
   );
+  if (!config.countOnly) {
+    const usable = usableTargets(config, selection.run, (message) => console.warn(`\u26A0 ${message}`));
+    selection.run = usable.run;
+    selection.skipped.push(...usable.skipped);
+  }
   const plan = planPasses(config, promptOptions, meta, context, selection.run);
   console.log(
-    `Contexte : ${context.files.length} fichier(s) touch\xE9s, ${context.imported.length} import\xE9(s), ${plan.length} passe(s) + fusion (${config.model}, effort ${config.effort}).`
+    `Contexte : ${context.files.length} fichier(s) touch\xE9s, ${context.imported.length} import\xE9(s), ${plan.length} passe(s) + fusion (effort ${config.effort}).`
   );
+  for (const { pass, target } of plan) {
+    console.log(`\xB7 passe \xAB ${pass.label} \xBB \u2192 ${target.provider}/${target.model}, think=${target.thinking || "d\xE9faut"}.`);
+  }
   for (const { label, reason } of selection.skipped) {
     console.log(`\xB7 passe \xAB ${label} \xBB non lanc\xE9e : ${reason}.`);
+  }
+  warnOnClearTextKey(config, plan.map(({ target }) => target));
+  if (config.seed !== void 0) {
+    const ignoring = [...new Set(plan.map(({ target }) => target.provider))].filter(
+      (provider) => PROVIDERS[provider]?.supportsSeed === false
+    );
+    if (ignoring.length > 0) {
+      console.warn(
+        `\u26A0 \xAB seed \xBB n'est pas transmis \xE0 ${ignoring.join(", ")} : ce param\xE8tre n'y est pas
+  document\xE9. Ces passes varieront d\u2019une ex\xE9cution \xE0 l\u2019autre.`
+      );
+    }
   }
   if (config.countOnly) {
     countOnly(config, plan, context);
     return;
   }
-  const started = Date.now();
-  const run2 = { calls: [], failures: [] };
-  const outcomes = await runPasses(config, run2, plan);
-  if (outcomes.length === 0) {
-    const reason = run2.failures[0] ?? "raison inconnue";
-    console.error(`\xC9chec de la review : aucune passe n'a abouti (${reason}).`);
+  if (plan.length === 0) {
+    const reason = selection.skipped.map(({ label, reason: why }) => `\xAB ${label} \xBB : ${why}`).join(" ; ");
+    console.error(`\xC9chec de la review : aucune passe lan\xE7able (${reason}).`);
     if (!config.dryRun) await postComment(config.pr, renderFailureComment(reason, config.model));
     return;
   }
-  const merged = await callModel(config, run2, {
+  const started = Date.now();
+  const run2 = { calls: [], failures: [] };
+  const outcomes = await runPasses(config, run2, plan);
+  const targets = [...new Set(plan.map(({ target }) => `${target.provider}/${target.model}`))];
+  if (outcomes.length === 0) {
+    const reason = run2.failures[0] ?? "raison inconnue";
+    console.error(`\xC9chec de la review : aucune passe n'a abouti (${reason}).`);
+    if (!config.dryRun) {
+      await postComment(config.pr, renderFailureComment(reason, targets.join(", ") || config.model));
+    }
+    return;
+  }
+  const mergeTarget = resolveTarget(
+    config,
+    "merge",
+    "fusion",
+    (message) => console.warn(`\u26A0 ${message}`)
+  );
+  if (mergeTarget === null) {
+    const reason = `aucune cl\xE9 pour \xAB ${config.passConfigs.merge.provider} \xBB`;
+    console.error(`\u2717 fusion : ${reason}`);
+    run2.failures.push(reason);
+  }
+  const merged = mergeTarget === null ? null : await callModel(config, run2, {
     id: "merge",
-    // Les passes qui ont abouti, pas celles qui étaient prévues : annoncer un
-    // relecteur qui n'a rien rendu ferait chercher à la fusion un axe absent.
-    system: buildMergeSystemPrompt({
-      repo,
-      maxFindings: config.maxFindings,
-      passes: outcomes.map((outcome) => outcome.pass)
-    }),
-    user: buildMergeUserPrompt(meta, outcomes),
-    think: config.mergeThinking,
+    target: mergeTarget,
+    messages: [
+      {
+        role: "system",
+        // Les passes qui ont abouti, pas celles qui étaient prévues :
+        // annoncer un relecteur qui n'a rien rendu ferait chercher à la
+        // fusion un axe absent.
+        content: buildMergeSystemPrompt({
+          repo,
+          maxFindings: config.maxFindings,
+          passes: outcomes.map((outcome) => outcome.pass)
+        })
+      },
+      { role: "user", content: buildMergeUserPrompt(meta, outcomes) }
+    ],
     label: "fusion"
   });
   const server = (process.env.GITHUB_SERVER_URL ?? "https://github.com").replace(/\/$/, "");
@@ -1723,7 +2251,7 @@ async function review(config) {
     // Le filtre garde son rôle contre les chemins que le modèle invente.
     knownPaths: knownPaths(meta, context),
     footer: {
-      model: config.model,
+      models: describeTargets(run2.calls.filter((call) => call.ok)),
       durationMs: Date.now() - started,
       ...totals(run2.calls),
       skipped: context.skipped,
@@ -1770,21 +2298,36 @@ function knownPaths(meta, context) {
     ...context.imported.map((file) => file.path)
   ]);
 }
+async function loadLocalKeys(env) {
+  const enriched = { ...env };
+  if (process.env.GITHUB_ACTIONS === "true") return enriched;
+  for (const provider of Object.keys(DEFAULT_KEY_REFS)) {
+    const variable = `${provider.toUpperCase()}_API_KEY`;
+    if (readInput(enriched, `${provider}-api-key`) || enriched[variable]?.trim()) continue;
+    const key = await keyFrom1Password(provider);
+    if (key) enriched[variable] = key;
+  }
+  return enriched;
+}
 async function main() {
   if (!isEnabled(process.env)) {
     console.log("Review d\xE9sactiv\xE9e (input \xAB enable \xBB).");
     return;
   }
+  const countOnly2 = process.argv.slice(2).includes("--count-only");
   const config = resolveConfig({
     argv: process.argv.slice(2),
-    env: process.env,
+    env: countOnly2 ? process.env : await loadLocalKeys(process.env),
     warn: (message) => console.warn(`\u26A0 ${message}`)
   });
   if (config.githubToken) process.env.GH_TOKEN = config.githubToken;
-  if (!config.apiKey && !config.countOnly) config.apiKey = await keyFrom1Password();
-  if (!config.apiKey && !config.countOnly) {
-    console.log("Cl\xE9 Ollama absente : review ignor\xE9e.");
-    return;
+  if (!config.countOnly) {
+    const wanted = new Set(Object.values(config.passConfigs).map((target) => target.provider));
+    wanted.add(config.provider);
+    if ([...wanted].every((provider) => !config.keys[provider])) {
+      console.log("Aucune cl\xE9 de provider : review ignor\xE9e.");
+      return;
+    }
   }
   await review(config);
 }

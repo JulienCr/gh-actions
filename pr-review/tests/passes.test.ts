@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
+import type { AssembledContext } from '../src/context';
 import type { PrMeta } from '../src/gh';
 import {
   buildMergeSystemPrompt,
   buildMergeUserPrompt,
-  buildPassSystemPrompt,
+  buildPassMessages,
+  groupForCache,
   PASSES,
   PASS_HEADING,
   selectPasses,
@@ -30,6 +32,27 @@ const META: PrMeta = {
 };
 
 const pass = (id: string) => PASSES.find((entry) => entry.id === id)!;
+
+const context = (imports: boolean): AssembledContext => ({
+  diff: 'diff --git a/src/app/page.tsx b/src/app/page.tsx',
+  files: [{ path: 'src/app/page.tsx', numbered: '   1 | export default function Page() {}' }],
+  imported: imports ? [{ path: 'src/lib/util.ts', numbered: '   1 | export const x = 1;' }] : [],
+  skipped: [],
+  omitted: [],
+  windowed: [],
+});
+
+/**
+ * Ce qu'une passe reçoit, tous messages confondus.
+ *
+ * L'objectif de la passe a quitté le prompt système pour le dernier message
+ * user, afin que le préfixe reste partageable : les assertions portent sur ce
+ * qui est envoyé, pas sur le rôle qui le porte.
+ */
+const buildPassSystemPrompt = (entry: Pass, options: PromptOptions, imports: boolean) =>
+  buildPassMessages(entry, options, META, context(imports))
+    .map((message) => message.content)
+    .join('\n\n');
 
 describe('les trois passes', () => {
   it('couvrent les trois familles, une seule chacune', () => {
@@ -364,5 +387,111 @@ describe('une liste de passes partiellement fautive', () => {
 
   it('lance les trois quand rien n’est reconnu', () => {
     expect(forced(['nawak']).ids).toEqual(['regression', 'doctrine', 'data']);
+  });
+});
+
+describe('les messages d’une passe', () => {
+  const messages = (id: string, imports = true) =>
+    buildPassMessages(pass(id), OPTIONS, META, context(imports));
+
+  /**
+   * Trois messages, et l'objectif en dernier. Le prompt système portait
+   * auparavant le préambule ET l'objectif : deux passes divergeaient dès leur
+   * premier octet, et le contexte qui suivait était repayé intégralement.
+   */
+  it('met le préambule en système, le contexte puis l’objectif en user', () => {
+    const built = messages('regression');
+    expect(built.map((message) => message.role)).toEqual(['system', 'user', 'user']);
+    expect(built[0]!.content).toContain('DOCTRINE_SENTINELLE');
+    expect(built[1]!.content).toContain('## Diff');
+    expect(built[2]!.content).toContain('functional regressions');
+    expect(built[2]!.content).toContain(PASS_HEADING);
+  });
+
+  /** C'est la propriété que le cache exploite, et elle se vérifie sans appel. */
+  it('rend un préambule et un contexte identiques d’une passe à l’autre', () => {
+    const regression = messages('regression');
+    const data = messages('data');
+    expect(data[0]!.content).toBe(regression[0]!.content);
+    expect(data[1]!.content).toBe(regression[1]!.content);
+    expect(data[2]!.content).not.toBe(regression[2]!.content);
+  });
+});
+
+describe('le regroupement par destination', () => {
+  const item = (id: string, provider: string, model: string, chars: number, cacheable = true) => ({
+    id,
+    provider,
+    model,
+    chars,
+    cacheable,
+  });
+
+  it('sépare les destinations, qui ne partagent aucun cache', () => {
+    const groups = groupForCache([
+      item('regression', 'ollama', 'glm-5.2:cloud', 300_000),
+      item('doctrine', 'deepseek', 'deepseek-v4-flash', 200_000),
+    ]);
+    expect(groups).toHaveLength(2);
+    expect(groups.map((group) => group.map((entry) => entry.id))).toEqual([
+      ['regression'],
+      ['doctrine'],
+    ]);
+  });
+
+  /**
+   * Un cache s'écrit à la fin de l'entrée qui l'a produit : la passe dont le
+   * prompt est un préfixe de l'autre doit partir en premier, sinon la seconde
+   * n'a rien à réutiliser.
+   */
+  it('range le prompt le plus court en tête de son groupe', () => {
+    const groups = groupForCache([
+      item('data', 'deepseek', 'deepseek-v4-flash', 320_000),
+      item('doctrine', 'deepseek', 'deepseek-v4-flash', 210_000),
+    ]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.map((entry) => entry.id)).toEqual(['doctrine', 'data']);
+  });
+
+  /** Un même modèle chez deux providers ne partage rien : la clé porte les deux. */
+  it('ne regroupe pas deux providers qui servent le même nom de modèle', () => {
+    const groups = groupForCache([
+      item('doctrine', 'deepseek', 'deepseek-v4-flash', 200_000),
+      item('data', 'openai', 'deepseek-v4-flash', 200_000),
+    ]);
+    expect(groups).toHaveLength(2);
+  });
+
+  it('garde l’ordre des passes quand deux entrées pèsent pareil', () => {
+    const groups = groupForCache([
+      item('doctrine', 'deepseek', 'm', 100),
+      item('data', 'deepseek', 'm', 100),
+    ]);
+    expect(groups[0]!.map((entry) => entry.id)).toEqual(['doctrine', 'data']);
+  });
+
+  it('ne perd aucune entrée', () => {
+    const groups = groupForCache([
+      item('regression', 'ollama', 'glm', 3, false),
+      item('doctrine', 'deepseek', 'ds', 2),
+      item('data', 'deepseek', 'ds', 1),
+    ]);
+    expect(groups.flat()).toHaveLength(3);
+  });
+
+  /**
+   * Sans ce garde-fou, un dépôt sans clé DeepSeek verrait ses trois passes,
+   * toutes sur Ollama, se sérialiser : le mur du job triplerait en échange d'un
+   * cache qu'Ollama n'expose pas. Un input neuf doit reproduire le comportement
+   * d'avant, pas le ralentir.
+   */
+  it('laisse en parallèle les appels qui n’ont aucun cache à gagner', () => {
+    const groups = groupForCache([
+      item('regression', 'ollama', 'glm-5.2:cloud', 300_000, false),
+      item('doctrine', 'ollama', 'glm-5.2:cloud', 200_000, false),
+      item('data', 'ollama', 'glm-5.2:cloud', 300_000, false),
+    ]);
+    expect(groups).toHaveLength(3);
+    expect(groups.map((group) => group[0]!.id)).toEqual(['regression', 'doctrine', 'data']);
   });
 });

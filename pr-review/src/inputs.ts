@@ -12,8 +12,9 @@
  * là pour l'ajuster, pas pour la faire démarrer.
  */
 
+import { isProvider, PROVIDER_IDS, PROVIDERS } from './llm';
 import { parseList } from './globs';
-import { EFFORTS, isEffort, type Effort } from './passes';
+import { EFFORTS, isEffort, PASSES, stepDown, type Effort } from './passes';
 
 /**
  * Fichiers jamais relus, quels que soient les inputs.
@@ -73,6 +74,8 @@ export const DEFAULT_DOCTRINE: readonly string[] = [
 ];
 
 export const DEFAULTS = {
+  /** Provider des passes qui n'en désignent pas d'autre. */
+  provider: 'ollama',
   model: 'glm-5.2:cloud',
   maxFindings: 20,
   budgetChars: 500_000,
@@ -134,14 +137,112 @@ export const DEFAULTS = {
   windowMinLines: { full: 0, balanced: 250, lean: 120 } as Record<Effort, number>,
 } as const;
 
+/**
+ * Les quatre appels que fait une review : les trois passes de lecture, puis la
+ * fusion. Chacun se configure séparément.
+ */
+export const PASS_IDS = ['regression', 'doctrine', 'data', 'merge'] as const;
+
+export type PassId = (typeof PASS_IDS)[number];
+
+export interface PassConfig {
+  provider: string;
+  model: string;
+  /** Niveau **final**, cran d'effort déjà appliqué. Vide : défaut du modèle. */
+  thinking: string;
+}
+
+/**
+ * Le modèle bon marché, sous le nom que chaque provider lui donne.
+ *
+ * Le même poids (284 milliards de paramètres dont 13 actifs), servi par deux
+ * routes. Ollama le facture en temps GPU, à un **niveau d'usage moyen** là où
+ * `glm-5.2:cloud` est à un niveau élevé : le déplacement paie déjà avec la
+ * seule clé Ollama. DeepSeek le facture au token, et y ajoute un cache de
+ * préfixe qui rend le contexte commun des deux passes presque gratuit.
+ */
+const CHEAP_MODEL: Record<string, string> = {
+  ollama: 'deepseek-v4-flash:cloud',
+  deepseek: 'deepseek-v4-flash',
+};
+
+/**
+ * Le mix recommandé : trois appels sur quatre quittent le modèle flagship.
+ *
+ * Pourquoi ces trois-là, et pas le quatrième :
+ *
+ * - **régression** n'y est pas. C'est la passe la plus complexe, la valeur de
+ *   GLM-5.2 y est observée empiriquement, et rien ne prouve qu'un autre modèle
+ *   la tienne. Elle garde le provider et le modèle globaux.
+ * - **doctrine** est une tâche `règle -> conformité -> preuve`, très guidée par
+ *   un document qu'elle a sous les yeux. Un modèle bien moins cher y suffit.
+ * - **données et accès** est plus subtile, mais V4-Flash est un point de départ
+ *   solide. Première escalade prévue si le recall baisse sur de vraies PR :
+ *   `data-model: deepseek-v4-pro`, et rien d'autre à toucher.
+ * - **fusion** ne reçoit pas le code : elle trie une trentaine de puces. Un
+ *   flagship n'y achèterait que de la latence, d'où `low`.
+ *
+ * Doctrine et données partagent volontairement le même couple provider+modèle.
+ * Chez un provider qui cache les préfixes, c'est ce qui leur permet de ne payer
+ * qu'une fois les quatre-vingt-dix kilo-octets de contexte commun. Les séparer
+ * annulerait ce levier.
+ */
+export function mixFor(provider: string): Partial<Record<PassId, PassConfig>> {
+  const model = CHEAP_MODEL[provider];
+  if (!model) return {};
+  return {
+    doctrine: { provider, model, thinking: 'high' },
+    data: { provider, model, thinking: 'high' },
+    merge: { provider, model, thinking: 'low' },
+  };
+}
+
+/**
+ * Par quelle route le mix passe, ou `null` quand il ne s'applique pas.
+ *
+ * Un dépôt qui a désigné son provider global a pris la main : on ne renvoie pas
+ * ses passes ailleurs dans son dos, clé DeepSeek ou non. Ce test passait
+ * autrefois APRÈS celui de la clé, et un `provider: openai` se faisait quand
+ * même déplacer : trois passes partaient chez DeepSeek pendant que la
+ * régression restait seule sur un endpoint étranger, avec un nom de modèle
+ * Ollama qu'il ne sert pas.
+ *
+ * Le provider resté au défaut, DeepSeek en direct l'emporte dès qu'une clé
+ * existe, parce que son cache de préfixe est le levier le plus fort. Sinon
+ * Ollama, qui sert le même modèle et suffit à descendre d'un niveau d'usage.
+ */
+export function mixRoute(provider: string, hasDeepSeekKey: boolean): string | null {
+  if (provider !== DEFAULTS.provider) return null;
+  return hasDeepSeekKey ? 'deepseek' : 'ollama';
+}
+
 export interface Config {
   pr: number;
   dryRun: boolean;
+  /**
+   * Le modèle du provider global.
+   *
+   * Ce n'est plus « le modèle de la review » : chaque appel a le sien, dans
+   * `passConfigs`. Celui-ci reste parce qu'un commentaire d'échec doit nommer
+   * quelque chose alors qu'aucune passe n'a tourné.
+   */
   model: string;
-  /** Niveau passé à `think` pour les passes. Vide : le modèle garde son défaut. */
-  thinking: string;
-  /** Idem pour la fusion, qui n'a pas besoin d'autant. */
-  mergeThinking: string;
+  /** Provider des passes qui n'en désignent pas d'autre. */
+  provider: string;
+  /** Provider, modèle et raisonnement de chacun des quatre appels. */
+  passConfigs: Record<PassId, PassConfig>;
+  /** Clés par identifiant de provider. Remplies tard, cf. `main`. */
+  keys: Record<string, string>;
+  /** Base du provider `openai` générique. Vide : ce provider est inutilisable. */
+  openaiBaseUrl: string;
+  /**
+   * L'endpoint générique cache-t-il les préfixes ?
+   *
+   * Faux par défaut, parce que « OpenAI-compatible » décrit un protocole et pas
+   * une garantie de cache : sérialiser deux passes chez un endpoint qui ne
+   * cache rien coûte du temps contre rien.
+   */
+  openaiPrefixCache: boolean;
   temperature: number;
   /** `undefined` : pas de graine, le modèle varie d'une exécution à l'autre. */
   seed: number | undefined;
@@ -163,7 +264,6 @@ export interface Config {
   skip: string[];
   /** Cadrage libre du projet, quand la doctrine n'en donne pas. */
   projectSummary: string;
-  apiKey: string;
   githubToken: string;
   /** Imprimer ce qui partirait, et ne rien envoyer. Réglage local seulement. */
   countOnly: boolean;
@@ -291,6 +391,134 @@ function readSeed(env: Env, warn: (message: string) => void): number | undefined
   return parsed;
 }
 
+/**
+ * Lit un identifiant de provider, ou prévient et rend le repli.
+ *
+ * Un provider inconnu ne doit pas annuler la review : même politique que tout
+ * input illisible. Le taire, en revanche, ferait tourner la passe sur un
+ * provider que personne n'a demandé sans que rien ne le dise.
+ */
+function readProvider(env: Env, name: string, fallback: string, warn: (m: string) => void): string {
+  const raw = readInput(env, name).toLowerCase();
+  if (raw === '') return fallback;
+  if (isProvider(raw)) return raw;
+  warn(
+    `input « ${name} » : provider inconnu (« ${raw} ») : on garde ${fallback}.\n` +
+      `  Connus : ${PROVIDER_IDS.join(', ')}.`,
+  );
+  return fallback;
+}
+
+/** Ce qui s'applique à une passe quand ni elle ni le mix n'ont rien à dire. */
+interface PassFallback {
+  provider: string;
+  model: string;
+  /** Niveau écrit globalement par le dépôt, cran appliqué. Vide : rien d'écrit. */
+  thinkingWritten: string;
+  /** Niveau intégré, cran appliqué. Toujours renseigné. */
+  thinkingDefault: string;
+}
+
+/**
+ * Résout la configuration d'UN appel.
+ *
+ * L'ordre de priorité est le seul point subtil de ce module :
+ *
+ * 1. `<passe>-provider` / `<passe>-model` / `<passe>-thinking` ;
+ * 2. l'input global écrit à la main par le dépôt ;
+ * 3. le mix recommandé, s'il est actif ;
+ * 4. les défauts intégrés.
+ *
+ * Le mix passe APRÈS ce qui est écrit à la main, et c'est délibéré : un input
+ * posé dans un workflow ne doit pas se faire ignorer en silence parce qu'une
+ * clé DeepSeek est apparue dans les secrets. C'est aussi pourquoi `action.yml`
+ * ne pose plus de défaut sur `model`, `thinking` ni `merge-thinking` : le
+ * runner écrit les défauts du manifeste dans `INPUT_*`, et le code ne pourrait
+ * plus distinguer « écrit par le dépôt » de « jamais touché ».
+ *
+ * Un `model` écrit à la main va plus loin et désactive le mix ENTIER (voir
+ * `resolveConfig`) : déplacer une passe vers un provider tout en lui laissant
+ * le modèle d'un autre produirait un 404, pas un compromis.
+ *
+ * Le niveau de raisonnement d'un `<passe>-thinking` échappe au cran d'effort :
+ * deux mécanismes qui règlent la même valeur finiraient par se battre, et le
+ * perdant serait celui que quelqu'un a écrit.
+ */
+function resolvePass(
+  env: Env,
+  id: PassId,
+  mix: PassConfig | undefined,
+  fallback: PassFallback,
+  warn: (message: string) => void,
+): PassConfig {
+  const provider = readProvider(env, `${id}-provider`, mix?.provider ?? fallback.provider, warn);
+  // Le mix ne vaut que pour SON provider : un dépôt qui redirige une passe
+  // ailleurs ne doit pas hériter du modèle d'un provider qu'il vient d'écarter.
+  const applicable = mix && provider === mix.provider ? mix : undefined;
+  // Une passe renvoyée vers un autre provider ne doit pas garder le modèle de
+  // celui qu'elle quitte : `doctrine-provider: deepseek` sans `doctrine-model`
+  // partait avec un nom Ollama, donc en 404.
+  const providerDefault =
+    provider === fallback.provider ? '' : (PROVIDERS[provider]?.defaultModel ?? '');
+  return {
+    provider,
+    model:
+      readInput(env, `${id}-model`) || applicable?.model || providerDefault || fallback.model,
+    thinking:
+      readInput(env, `${id}-thinking`) ||
+      fallback.thinkingWritten ||
+      applicable?.thinking ||
+      fallback.thinkingDefault,
+  };
+}
+
+export interface MixOptions {
+  provider: string;
+  model: string;
+  /** `thinking` tel qu'écrit par le dépôt, ou vide. */
+  thinking: string;
+  /** `merge-thinking` tel qu'écrit par le dépôt, ou vide. */
+  mergeThinking: string;
+  effort: Effort;
+  /** Le mix qui s'applique. Vide : chaque passe suit les inputs globaux. */
+  mix: Partial<Record<PassId, PassConfig>>;
+}
+
+/**
+ * La configuration des quatre appels.
+ *
+ * Une table plutôt que douze champs : ajouter une passe ne doit pas demander de
+ * toucher quatre endroits, et une ligne par appel se lit d'un coup d'oeil.
+ */
+export function resolvePassConfigs(
+  env: Env,
+  options: MixOptions,
+  warn: (message: string) => void = () => {},
+): Record<PassId, PassConfig> {
+  const configs = {} as Record<PassId, PassConfig>;
+  for (const id of PASS_IDS) {
+    // La fusion ne lit pas de code : elle a son propre niveau, et le cran
+    // d'effort ne la concerne pas. Les passes de lecture, elles, descendent du
+    // nombre de crans que leur table leur assigne.
+    const steps = PASSES.find((pass) => pass.id === id)?.thinkingSteps[options.effort] ?? 0;
+    const written = id === 'merge' ? options.mergeThinking : options.thinking;
+    configs[id] = resolvePass(
+      env,
+      id,
+      options.mix[id],
+      {
+        provider: options.provider,
+        model: options.model,
+        thinkingWritten: written ? stepDown(written, steps) : '',
+        thinkingDefault:
+          id === 'merge' ? DEFAULTS.mergeThinking : stepDown(DEFAULTS.thinking, steps),
+      },
+      warn,
+    );
+  }
+  return configs;
+}
+
 export interface ResolveOptions {
   argv: string[];
   env: Env;
@@ -307,7 +535,9 @@ export interface ResolveOptions {
 export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): Config {
   let pr: number | null = null;
   let dryRun = readBoolean(env, 'dry-run');
-  let model = readInput(env, 'model') || env.OLLAMA_REVIEW_MODEL?.trim() || DEFAULTS.model;
+  // Vide tant que personne n'a rien écrit : c'est cette distinction qui permet
+  // au mix de s'appliquer sans jamais écraser un input posé à la main.
+  let model = readInput(env, 'model') || env.OLLAMA_REVIEW_MODEL?.trim() || '';
   let countOnly = false;
   let variant = readInput(env, 'variant') || DEFAULTS.variant;
 
@@ -348,14 +578,51 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   const doctrineInput = parseList(readInput(env, 'doctrine'));
   const effort = readEffort(env, warn);
 
+  const keys: Record<string, string> = {
+    ollama: readInput(env, 'ollama-api-key') || env.OLLAMA_API_KEY?.trim() || '',
+    deepseek: readInput(env, 'deepseek-api-key') || env.DEEPSEEK_API_KEY?.trim() || '',
+    openai: readInput(env, 'openai-api-key') || env.OPENAI_API_KEY?.trim() || '',
+  };
+
+  const provider = readProvider(env, 'provider', DEFAULTS.provider, warn);
+  // Le modèle par défaut suit le provider, et n'est plus un nom Ollama envoyé à
+  // qui n'en sert pas : c'était un 404 sur les quatre appels, avec un journal
+  // qui accusait le modèle plutôt que la configuration. Le provider générique
+  // n'a pas de catalogue connu, donc pas de défaut : on prévient.
+  const providerDefault = PROVIDERS[provider]?.defaultModel || '';
+  if (model === '' && providerDefault === '') {
+    warn(
+      `provider « ${provider} » sans « model » : cet endpoint n'a pas de catalogue connu,\n` +
+        `  donc aucun modèle par défaut. Nomme-en un, sinon les appels partiront à vide.`,
+    );
+  }
+  // Un modèle écrit à la main contredit le mix : déplacer une passe ailleurs en
+  // lui laissant le modèle d'un autre provider produirait un 404, pas un
+  // compromis. L'écrire garde donc le comportement d'avant, pour les quatre.
+  const route = model === '' ? mixRoute(provider, keys.deepseek !== '') : null;
+
   return {
     pr,
     dryRun,
-    model,
+    model: model || providerDefault || DEFAULTS.model,
+    provider,
     // Pas de validation contre une liste de niveaux : ils varient d'un modèle à
     // l'autre, et un niveau refusé est rattrapé à l'appel.
-    thinking: readInput(env, 'thinking') || DEFAULTS.thinking,
-    mergeThinking: readInput(env, 'merge-thinking') || DEFAULTS.mergeThinking,
+    passConfigs: resolvePassConfigs(
+      env,
+      {
+        provider,
+        model: model || providerDefault || DEFAULTS.model,
+        thinking: readInput(env, 'thinking'),
+        mergeThinking: readInput(env, 'merge-thinking'),
+        effort,
+        mix: route === null ? {} : mixFor(route),
+      },
+      warn,
+    ),
+    keys,
+    openaiBaseUrl: readInput(env, 'openai-base-url').replace(/\/$/, ''),
+    openaiPrefixCache: readBoolean(env, 'openai-prefix-cache'),
     temperature: readTemperature(env, warn),
     seed: readSeed(env, warn),
     maxFindings: readNumber(env, 'max-findings', DEFAULTS.maxFindings, warn),
@@ -386,7 +653,6 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     projectSummary: readInput(env, 'project-summary'),
     countOnly,
     variant,
-    apiKey: readInput(env, 'ollama-api-key') || env.OLLAMA_API_KEY?.trim() || '',
     githubToken: readInput(env, 'github-token') || env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || '',
   };
 }

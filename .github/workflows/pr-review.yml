@@ -28,9 +28,13 @@ jobs:
   review:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    # Le mur vaut « passe la plus lente + fusion », soit jusqu'à deux fois le
-    # timeout-minutes de l'action, plus la marge du commentaire d'échec.
-    timeout-minutes: 40
+    # Le mur vaut « le plus gros groupe séquencé + fusion ». Les passes ne
+    # s'enchaînent que chez un provider qui cache les préfixes ; sur Ollama
+    # elles restent parallèles, soit deux fois le « timeout-minutes » de
+    # l'action. Avec une clé DeepSeek, trois fois. Plus la marge du commentaire
+    # d'échec. Mesuré sur la PR #8 : 8 min 08 s au total, dont 470 s pour la
+    # seule régression.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
@@ -43,9 +47,10 @@ jobs:
       - uses: ./pr-review
         with:
           pr: ${{ github.event.pull_request.number || inputs.pr }}
-          # Éteint : le quota Ollama restant est gardé pour la prochaine version
-          # de l'action. Remettre `true` quand elle sera prête.
-          enable: false
           ollama-api-key: ${{ secrets.OLLAMA_API_KEY }}
+          # Facultative, et absente aujourd'hui : sans elle, les trois appels
+          # bon marché partent quand même, sur le deepseek-v4-flash d'Ollama.
+          # La poser ajouterait le cache de préfixe de l'API directe.
+          deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
           skip: |
             */dist/**

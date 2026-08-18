@@ -83,11 +83,14 @@ describe('linkifyPaths', () => {
   });
 });
 
-const FOOTER = {
-  model: 'glm-5.2:cloud',
+const FOOTER: Footer = {
+  models: 'ollama/glm-5.2:cloud (régression fonctionnelle)',
   durationMs: 134_000,
-  promptTokens: 84_312,
-  evalTokens: 1204,
+  inputTokens: 84_312,
+  cachedInputTokens: 0,
+  outputTokens: 1204,
+  costUsd: 0,
+  costPartial: false,
   thinkingChars: 0,
   skipped: [],
   omitted: [],
@@ -104,7 +107,7 @@ describe('renderComment', () => {
     const comment = renderComment({ ...OPTIONS, review: '## Verdict\nok', footer: FOOTER });
     expect(comment.startsWith(MARKER)).toBe(true);
     expect(comment).toContain('## Aristarque — review automatique');
-    expect(comment).toContain('glm-5.2:cloud via Ollama Cloud');
+    expect(comment).toContain('ollama/glm-5.2:cloud (régression fonctionnelle)');
     expect(comment).toContain('2 min 14 s');
   });
 
@@ -200,7 +203,7 @@ describe('renderPartialComment', () => {
 
   it('pose quand même les liens et le pied de page', () => {
     expect(comment).toContain('/blob/abc123/src/lib/content.ts#L9');
-    expect(comment).toContain('glm-5.2:cloud via Ollama Cloud');
+    expect(comment).toContain('ollama/glm-5.2:cloud (régression fonctionnelle)');
     expect(comment).toContain('⚠ passe « doctrine du dépôt » non aboutie');
   });
 });
@@ -263,5 +266,41 @@ describe('le pied de page déclare ce que le cran a retiré', () => {
     const comment = footer({ imported: 21 });
     expect(comment).toContain('21 fichier(s) importés joints en contexte');
     expect(comment).not.toContain('hors «');
+  });
+});
+
+describe('le pied de page rapporte le cache et le coût', () => {
+  const footer = (over: Partial<Footer>) =>
+    renderComment({ ...OPTIONS, review: '## Verdict\nok', footer: { ...FOOTER, ...over } });
+
+  /** La seule mesure du levier : sans elle, un préfixe qui a divergé ne se voit pas. */
+  it('dit la part d’entrée servie par le cache', () => {
+    expect(footer({ cachedInputTokens: 141_694 })).toContain(
+      `dont ${(141_694).toLocaleString('fr-FR')} en cache`,
+    );
+  });
+
+  it('tait le cache quand il n’y en a pas eu', () => {
+    expect(footer({ cachedInputTokens: 0 })).not.toContain('en cache');
+  });
+
+  /**
+   * Un quota Ollama consommé n'est pas un appel gratuit : annoncer « ~ » sur un
+   * total dont une part n'est pas chiffrable sous-estimerait la review de tout
+   * son plus gros appel.
+   */
+  it('dit « au moins » quand une part du total n’a pas de tarif connu', () => {
+    expect(footer({ costUsd: 0.0697, costPartial: true })).toContain('au moins 0,0697 $');
+    expect(footer({ costUsd: 0.0697, costPartial: false })).toContain('~0,0697 $');
+  });
+
+  it('tait le coût quand rien n’est chiffrable', () => {
+    expect(footer({ costUsd: 0 })).not.toContain('$');
+  });
+
+  /** Un arrondi à zéro se lit comme une mesure : mieux vaut le silence. */
+  it('n’annonce pas « 0 Ko de raisonnement »', () => {
+    expect(footer({ thinkingChars: 19 })).not.toContain('Ko de raisonnement');
+    expect(footer({ thinkingChars: 40_960 })).toContain('40 Ko de raisonnement');
   });
 });
