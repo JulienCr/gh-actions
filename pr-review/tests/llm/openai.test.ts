@@ -315,6 +315,8 @@ describe('la politique de reprise', () => {
     expect(calls).toBe(2);
     expect(downgrades[0]).toMatchObject({ cause: 'reasoning-exhausted', from: 'high', to: '' });
     expect(lastBody.reasoning_effort).toBeUndefined();
+    // Le niveau rendu est celui du repli, pas celui de la consigne.
+    expect(result.think).toBe('');
   });
 
   /**

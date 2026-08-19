@@ -27,7 +27,7 @@ import {
   withRetries,
   worthRetrying,
 } from './http';
-import { LlmError, type ChatRequest, type ChatResult } from './types';
+import { LlmError, type Attempt, type ChatRequest, type ChatResult } from './types';
 
 interface ChatPayload {
   message?: { content?: string; thinking?: string };
@@ -94,7 +94,7 @@ const rejectsThinking = (status: number, body: string) => status === 400 && /thi
  * tentative ratée et l'attente entre les deux ne mesurerait plus la génération,
  * qui est la seule chose que le pied de page prétend rapporter.
  */
-async function attempt(request: ChatRequest): Promise<ChatResult> {
+async function attempt(request: ChatRequest): Promise<Attempt> {
   const started = Date.now();
   const payload = await send(request);
   return {

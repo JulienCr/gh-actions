@@ -19,6 +19,7 @@
 
 import {
   LlmError,
+  type Attempt,
   type ChatRequest,
   type ChatResult,
   type Downgrade,
@@ -178,11 +179,11 @@ const rejectsThinkingValue = (body: string) => /invalid (think|reasoning_effort)
  * appelant change de modèle.
  */
 export async function withRetries(
-  attempt: (request: ChatRequest) => Promise<ChatResult>,
+  attempt: (request: ChatRequest) => Promise<Attempt>,
   request: ChatRequest,
 ): Promise<ChatResult> {
   try {
-    return await attempt(request);
+    return await played(attempt, request);
   } catch (error) {
     if (!(error instanceof LlmError)) throw error;
     // Le raisonnement a tout mangé : on rejoue SANS raisonnement, pas d'un cran
@@ -215,8 +216,22 @@ export async function withRetries(
     if (!error.retryable) throw error;
     request.onRetry?.(error.message);
     await sleep(request.retryDelayMs ?? RETRY_DELAY_MS);
-    return attempt(request);
+    return played(attempt, request);
   }
+}
+
+/**
+ * Un aller-retour, estampillé du niveau qui est vraiment parti.
+ *
+ * Ici et pas dans les clients : c'est cette couche qui décide du repli, donc la
+ * seule qui sache, au moment où le résultat revient, sous quel niveau il a été
+ * obtenu.
+ */
+async function played(
+  attempt: (request: ChatRequest) => Promise<Attempt>,
+  request: ChatRequest,
+): Promise<ChatResult> {
+  return { ...(await attempt(request)), think: request.think ?? '' };
 }
 
 /**
@@ -227,14 +242,14 @@ export async function withRetries(
  * honore aucun, et le mur du job vaut un délai par appel.
  */
 function replay(
-  attempt: (request: ChatRequest) => Promise<ChatResult>,
+  attempt: (request: ChatRequest) => Promise<Attempt>,
   request: ChatRequest,
   cause: DowngradeCause,
   to: string,
   reason: string,
 ): Promise<ChatResult> {
   request.onDowngrade?.({ cause, from: request.think ?? '', to, reason });
-  return attempt({ ...request, think: to });
+  return played(attempt, { ...request, think: to });
 }
 
 /**

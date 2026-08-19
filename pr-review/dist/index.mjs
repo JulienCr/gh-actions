@@ -518,7 +518,7 @@ var redact = (text) => text.replace(/\/\/[^/\s@]+@/g, "//***@");
 var rejectsThinkingValue = (body) => /invalid (think|reasoning_effort) value/i.test(body);
 async function withRetries(attempt2, request) {
   try {
-    return await attempt2(request);
+    return await played(attempt2, request);
   } catch (error) {
     if (!(error instanceof LlmError)) throw error;
     if (error.reasoningExhausted && request.think) {
@@ -539,12 +539,15 @@ async function withRetries(attempt2, request) {
     if (!error.retryable) throw error;
     request.onRetry?.(error.message);
     await sleep(request.retryDelayMs ?? RETRY_DELAY_MS);
-    return attempt2(request);
+    return played(attempt2, request);
   }
+}
+async function played(attempt2, request) {
+  return { ...await attempt2(request), think: request.think ?? "" };
 }
 function replay(attempt2, request, cause, to, reason) {
   request.onDowngrade?.({ cause, from: request.think ?? "", to, reason });
-  return attempt2({ ...request, think: to });
+  return played(attempt2, { ...request, think: to });
 }
 function describeDowngrade(event, model) {
   const { cause, from, to, reason } = event;
@@ -1973,6 +1976,9 @@ async function callModel(config, run2, args) {
     label: args.label,
     provider: target.provider,
     model: target.model,
+    // Le niveau DEMANDÉ. Un appel qui aboutit le remplace par celui qui a été
+    // joué, que le repli a pu changer en cours de route ; un appel raté le
+    // garde, faute d'avoir jamais rien retenu.
     think: target.thinking,
     ...sizes(args.messages)
   };
@@ -2015,6 +2021,7 @@ async function callModel(config, run2, args) {
   }
   const stat = {
     ...shape,
+    think: result.think,
     inputTokens: result.usage.inputTokens,
     cachedInputTokens: result.usage.cachedInputTokens,
     outputTokens: result.usage.outputTokens,

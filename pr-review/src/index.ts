@@ -276,6 +276,9 @@ async function callModel(
     label: args.label,
     provider: target.provider,
     model: target.model,
+    // Le niveau DEMANDÉ. Un appel qui aboutit le remplace par celui qui a été
+    // joué, que le repli a pu changer en cours de route ; un appel raté le
+    // garde, faute d'avoir jamais rien retenu.
     think: target.thinking,
     ...sizes(args.messages),
   };
@@ -326,6 +329,7 @@ async function callModel(
 
   const stat: CallStat = {
     ...shape,
+    think: result.think,
     inputTokens: result.usage.inputTokens,
     cachedInputTokens: result.usage.cachedInputTokens,
     outputTokens: result.usage.outputTokens,

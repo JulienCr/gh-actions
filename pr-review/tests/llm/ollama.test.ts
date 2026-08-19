@@ -148,8 +148,10 @@ describe('chat · requête', () => {
 
   it('transmet le niveau de raisonnement demandé', async () => {
     queue.push({ status: 200, body: ok('ok') });
-    await call({ think: 'max' });
+    const result = await call({ think: 'max' });
     expect(lastBody.think).toBe('max');
+    // Sans repli, le joué est le demandé : c'est le cas de base du champ.
+    expect(result.think).toBe('max');
   });
 
   it('n’envoie pas « think » du tout quand aucun niveau n’est demandé', async () => {
@@ -563,6 +565,10 @@ describe('un raisonnement qui ne conclut jamais', () => {
     expect(downgrades).toEqual([
       { cause: 'reasoning-exhausted', from: 'high', to: '', reason: expect.any(String) },
     ]);
+    // Ce que la ligne de statistiques affichera : le niveau JOUÉ, pas celui
+    // qu'on avait demandé. Mesuré sur gh-actions#10, où elle annonçait
+    // « think=high » pour un appel parti sans raisonnement.
+    expect(result.think).toBe('');
   });
 
   /** Le compte des tokens brûlés : sans lui, l'incident est indiagnosticable. */

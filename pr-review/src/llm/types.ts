@@ -45,6 +45,16 @@ export interface Usage {
 export interface ChatResult {
   content: string;
   /**
+   * Le niveau de raisonnement de l'appel RETENU, qui n'est pas toujours celui
+   * qu'on a demandé : un repli le change en cours de route (cf. `withRetries`).
+   *
+   * Mesuré sur gh-actions#10 : la ligne de statistiques annonçait « think=high »
+   * pour un appel parti sans raisonnement, parce qu'elle lisait la consigne au
+   * lieu de lire ce qui s'était joué. Le même défaut que la phrase de repli
+   * qu'on venait de corriger, un cran plus bas.
+   */
+  think: string;
+  /**
    * Taille du raisonnement rendu à part, en caractères.
    *
    * Doublonne `usage.reasoningTokens` là où le provider le donne, et le
@@ -155,6 +165,15 @@ export class LlmError extends Error {
     this.reasoningExhausted = reasoningExhausted;
   }
 }
+
+/**
+ * Ce qu'un client rend d'un aller-retour : tout sauf le niveau joué.
+ *
+ * Un client ne sait pas s'il est la première tentative ou un repli — c'est
+ * `withRetries` qui mène la danse, et le type le dit plutôt que de compter sur
+ * chaque client pour recopier une valeur qu'il n'a pas.
+ */
+export type Attempt = Omit<ChatResult, 'think'>;
 
 export type LlmClient = (request: ChatRequest) => Promise<ChatResult>;
 

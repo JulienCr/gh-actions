@@ -28,7 +28,13 @@ import {
   withRetries,
   worthRetrying,
 } from './http';
-import { LlmError, type ChatRequest, type ChatResult, type Usage } from './types';
+import {
+  LlmError,
+  type Attempt,
+  type ChatRequest,
+  type ChatResult,
+  type Usage,
+} from './types';
 
 export interface OpenAiDialect {
   /** Nom affiché dans les messages d'erreur. */
@@ -111,7 +117,7 @@ const rejectsThinking = (status: number, body: string) =>
   status === 400 && /reasoning|thinking/i.test(body);
 
 export function createOpenAiClient(dialect: OpenAiDialect) {
-  async function attempt(request: ChatRequest): Promise<ChatResult> {
+  async function attempt(request: ChatRequest): Promise<Attempt> {
     const started = Date.now();
     const collected = await send(request, dialect);
     return { ...collected, durationMs: Date.now() - started };
@@ -120,7 +126,7 @@ export function createOpenAiClient(dialect: OpenAiDialect) {
   return (request: ChatRequest): Promise<ChatResult> => withRetries(attempt, request);
 }
 
-type Collected = Omit<ChatResult, 'durationMs'>;
+type Collected = Omit<Attempt, 'durationMs'>;
 
 async function send(request: ChatRequest, dialect: OpenAiDialect): Promise<Collected> {
   const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
