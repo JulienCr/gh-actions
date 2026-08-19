@@ -36,6 +36,7 @@ import {
   type PassId,
 } from './inputs';
 import {
+  describeDowngrade,
   estimateCost,
   isPeakHour,
   LlmError,
@@ -297,12 +298,9 @@ async function callModel(
       temperature: config.temperature,
       seed: config.seed,
       timeoutMs: config.timeoutMs,
+      maxOutputTokens: config.maxOutputTokens,
       onRetry: (reason) => console.warn(`⚠ [${args.label}] ${reason} — nouvelle tentative dans 20 s.`),
-      onDowngrade: (reason) =>
-        console.warn(
-          `⚠ [${args.label}] ${target.model} n'a pas accepté « thinking: ${target.thinking} » (${reason}).\n` +
-            '  Relancé sans raisonnement explicite : ce sera moins fouillé.',
-        ),
+      onDowngrade: (event) => console.warn(`⚠ [${args.label}] ${describeDowngrade(event, target.model)}`),
     });
   } catch (error) {
     const reason = error instanceof LlmError ? error.message : String(error);

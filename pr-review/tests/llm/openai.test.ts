@@ -8,7 +8,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import { createOpenAiClient } from '../../src/llm/openai';
-import { LlmError } from '../../src/llm/types';
+import { LlmError, type Downgrade } from '../../src/llm/types';
 
 /**
  * Ce qui se teste ici et qui n'a pas d'équivalent côté Ollama :
@@ -231,6 +231,15 @@ describe('les réponses inexploitables', () => {
     await expect(call()).rejects.toThrow(/vide/);
   });
 
+  it('borne la sortie quand le dépôt a écrit un plafond, et pas autrement', async () => {
+    queue.push({ status: 200, body: ok() });
+    await call({});
+    expect(lastBody).not.toHaveProperty('max_tokens');
+    queue.push({ status: 200, body: ok() });
+    await call({ maxOutputTokens: 32_000 });
+    expect(lastBody.max_tokens).toBe(32_000);
+  });
+
   it('remonte une erreur applicative arrivée en 200', async () => {
     queue.push({ status: 200, body: `data: ${JSON.stringify({ error: { message: 'quota' } })}\n\n` });
     await expect(call()).rejects.toThrow(/quota/);
@@ -260,11 +269,72 @@ describe('la politique de reprise', () => {
   it('rejoue sans raisonnement quand le modèle refuse le paramètre', async () => {
     queue.push({ status: 400, body: '{"error":{"message":"reasoning_effort not supported"}}' });
     queue.push({ status: 200, body: ok() });
-    const downgrades: string[] = [];
-    await call({ think: 'max', onDowngrade: (reason) => downgrades.push(reason) });
+    const downgrades: Downgrade[] = [];
+    await call({ think: 'max', onDowngrade: (event) => downgrades.push(event) });
     expect(calls).toBe(2);
-    expect(downgrades).toHaveLength(1);
+    expect(downgrades).toEqual([
+      { cause: 'thinking-unsupported', from: 'max', to: '', reason: expect.any(String) },
+    ]);
     expect(lastBody.reasoning_effort).toBeUndefined();
+  });
+
+  /**
+   * Le pendant du « invalid think value » d'Ollama, jamais couvert ici alors
+   * que `rejectsThinkingValue` teste explicitement les deux mots. Une coquille
+   * dans un input ne doit coûter que le niveau, pas la profondeur d'analyse.
+   */
+  it('garde le raisonnement quand seul le niveau est fautif', async () => {
+    queue.push({ status: 400, body: '{"error":{"message":"invalid reasoning_effort value: nawak"}}' });
+    queue.push({ status: 200, body: ok() });
+    const downgrades: Downgrade[] = [];
+    await call({ think: 'nawak', onDowngrade: (event) => downgrades.push(event) });
+    expect(calls).toBe(2);
+    expect(downgrades[0]?.cause).toBe('level-rejected');
+    // `true` côté requête veut dire « le défaut du modèle » : `reasoningBody`
+    // n'envoie alors aucun champ, plutôt qu'un niveau inventé.
+    expect(lastBody.reasoning_effort).toBeUndefined();
+  });
+
+  /**
+   * Le 4e drapeau de `LlmError` est bien posé par ce client depuis toujours,
+   * mais rien ne vérifiait qu'il déclenchait le repli — le trou était côté
+   * OpenAI seulement, la variante Ollama étant couverte.
+   */
+  it('rejoue sans raisonnement quand tout est parti dans le raisonnement', async () => {
+    queue.push({
+      status: 200,
+      body: sse(
+        { choices: [{ delta: { reasoning_content: 'et puis rien' }, finish_reason: 'stop' }] },
+        usage(),
+      ),
+    });
+    queue.push({ status: 200, body: ok() });
+    const downgrades: Downgrade[] = [];
+    const result = await call({ think: 'high', onDowngrade: (event) => downgrades.push(event) });
+    expect(result.content).toBe('trouvailles');
+    expect(calls).toBe(2);
+    expect(downgrades[0]).toMatchObject({ cause: 'reasoning-exhausted', from: 'high', to: '' });
+    expect(lastBody.reasoning_effort).toBeUndefined();
+  });
+
+  /**
+   * L'ordre des gardes, et il n'est pas cosmétique : ce cas-ci était testé
+   * comme une troncature AVANT d'être testé comme un vide, donc refusé sans
+   * rejeu alors que la passe était encore récupérable. C'est exactement la
+   * forme qu'a prise l'incident mesuré sur avolo-shorts#99.
+   */
+  it('replie un vide coupé au plafond, au lieu de le refuser sèchement', async () => {
+    queue.push({
+      status: 200,
+      body: sse(
+        { choices: [{ delta: { reasoning_content: 'sans fin' }, finish_reason: 'length' }] },
+        usage(),
+      ),
+    });
+    queue.push({ status: 200, body: ok() });
+    const result = await call({ think: 'high' });
+    expect(result.content).toBe('trouvailles');
+    expect(calls).toBe(2);
   });
 
   /** Un 400 qui parle d'autre chose ne se rejoue pas : le prompt reste trop long. */

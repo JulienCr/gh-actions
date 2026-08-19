@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { estimateCost, isPeakHour, isProvider, PRICES, PROVIDERS } from '../../src/llm';
+import {
+  describeDowngrade,
+  estimateCost,
+  isPeakHour,
+  isProvider,
+  PRICES,
+  PROVIDERS,
+} from '../../src/llm';
 
 describe('les providers connus', () => {
   it('couvre Ollama, DeepSeek et un endpoint OpenAI-compatible générique', () => {
@@ -125,5 +132,48 @@ describe('les défauts par provider', () => {
     expect(PROVIDERS.openai!.prefixCache).toBe(false);
     expect(PROVIDERS.deepseek!.prefixCache).toBe(true);
     expect(PROVIDERS.ollama!.prefixCache).toBe(false);
+  });
+});
+
+/**
+ * Mesuré sur avolo-shorts#99 (run 32248459701) : le journal annonçait
+ *
+ *   « deepseek-v4-flash:cloud n'a pas accepté « thinking: high »
+ *     (… — on rejoue en « medium »).
+ *     Relancé sans raisonnement explicite : ce sera moins fouillé. »
+ *
+ * Trois affirmations, deux fausses et une qui se contredit dans la même phrase :
+ * le modèle avait accepté le niveau, et le rejeu se faisait en « medium ». Une
+ * seule phrase écrite en dur servait les trois causes de repli. Ces tests
+ * existent pour qu'aucune d'elles ne promette un rejeu qui n'a pas lieu.
+ */
+describe('la phrase d’un repli', () => {
+  it('dit un raisonnement épuisé pour ce qu’il est, et pas un refus', () => {
+    const phrase = describeDowngrade(
+      { cause: 'reasoning-exhausted', from: 'high', to: '', reason: 'réponse vide' },
+      'deepseek-v4-flash:cloud',
+    );
+    expect(phrase).toContain('a brûlé toute sa sortie en raisonnement sans conclure');
+    expect(phrase).toContain('sans raisonnement explicite');
+    expect(phrase).not.toContain("n'a pas accepté");
+  });
+
+  it('n’annonce pas un rejeu sans raisonnement quand le raisonnement reste', () => {
+    const phrase = describeDowngrade(
+      { cause: 'level-rejected', from: 'nawak', to: 'true', reason: 'invalid think value' },
+      'glm-5.2:cloud',
+    );
+    expect(phrase).toContain("n'a pas accepté « thinking: nawak »");
+    expect(phrase).toContain('au niveau de raisonnement par défaut du modèle');
+    expect(phrase).not.toContain('sans raisonnement');
+  });
+
+  it('nomme le seul cas où le modèle ne sait vraiment pas raisonner', () => {
+    const phrase = describeDowngrade(
+      { cause: 'thinking-unsupported', from: 'max', to: '', reason: 'does not support thinking' },
+      'un-modele',
+    );
+    expect(phrase).toContain('ne sait pas raisonner sur demande');
+    expect(phrase).toContain('sans raisonnement explicite');
   });
 });

@@ -90,6 +90,14 @@ export const DEFAULTS = {
   importsBudgetChars: 300_000,
   timeoutMinutes: 15,
   /**
+   * Plafond de tokens de sortie. `0` : rien n'est envoyé, le modèle garde le sien.
+   *
+   * Pas de valeur livrée, parce qu'aucune ne vaut pour tous les modèles : ce
+   * qui borne un dérapage sur l'un tronquerait une review légitime sur l'autre.
+   * Le dépôt qui a mesuré son besoin l'écrit.
+   */
+  maxOutputTokens: 0,
+  /**
    * Effort de raisonnement demandé au modèle.
    *
    * `max` parce qu'une review vaut par ce qu'elle trouve, pas par sa latence :
@@ -260,6 +268,8 @@ export interface Config {
   /** Taille au-delà de laquelle un fichier part par extraits. `0` : jamais. */
   windowMinLines: number;
   timeoutMs: number;
+  /** Plafond de tokens de SORTIE d'une requête. `0` : rien n'est envoyé. */
+  maxOutputTokens: number;
   /** Chemins de doctrine, dans l'ordre où ils seront injectés dans le prompt. */
   doctrine: string[];
   /** Motifs ajoutés au plancher `ALWAYS_SKIPPED`. */
@@ -649,6 +659,7 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
       0,
     ),
     timeoutMs: readNumber(env, 'timeout-minutes', DEFAULTS.timeoutMinutes, warn) * 60_000,
+    maxOutputTokens: readNumber(env, 'max-output-tokens', DEFAULTS.maxOutputTokens, warn),
     doctrine: doctrineInput.length > 0 ? doctrineInput : [...DEFAULT_DOCTRINE],
     // Le plancher d'abord : ce qui suit ne peut qu'ajouter, jamais retirer.
     skip: [...ALWAYS_SKIPPED, ...parseList(readInput(env, 'skip'))],

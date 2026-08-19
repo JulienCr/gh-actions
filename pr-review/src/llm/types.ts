@@ -75,11 +75,51 @@ export interface ChatRequest {
   /** Ignoré par les providers qui ne le prennent pas, sans que ce soit une erreur. */
   seed?: number;
   timeoutMs?: number;
+  /**
+   * Plafond de tokens de SORTIE d'une requête. `0` ou absent : rien n'est
+   * envoyé, et le modèle garde le sien.
+   *
+   * Borne l'autre dimension que `timeoutMs` : un modèle qui part en boucle de
+   * raisonnement ne dépasse pas le délai, il consomme son plafond à lui, et le
+   * job le paie en entier avant d'apprendre qu'il n'y avait pas de réponse.
+   */
+  maxOutputTokens?: number;
   /** Sert aux tests, qui ne peuvent pas attendre vingt secondes. */
   retryDelayMs?: number;
   onRetry?: (reason: string) => void;
-  /** Prévient quand le modèle a refusé `think` et qu'on rejoue sans. */
-  onDowngrade?: (reason: string) => void;
+  /**
+   * Prévient qu'une tentative est rejouée avec moins de raisonnement.
+   *
+   * Un événement et non une phrase : les trois causes ci-dessous mènent à trois
+   * rejeux différents, et le point d'appel n'a aucun moyen de deviner lequel a
+   * eu lieu. Il en a déjà écrit un faux (cf. `describeDowngrade`).
+   */
+  onDowngrade?: (event: Downgrade) => void;
+}
+
+/**
+ * Pourquoi une tentative est rejouée avec moins de raisonnement.
+ *
+ * Trois causes distinctes, qu'un seul libellé confondait : un modèle qui a trop
+ * raisonné n'est pas un modèle qui a refusé de raisonner, et un niveau mal
+ * orthographié n'est pas un modèle sans raisonnement.
+ */
+export type DowngradeCause =
+  /** Le raisonnement a mangé toute la génération, sans laisser de réponse. */
+  | 'reasoning-exhausted'
+  /** « invalid think value » : le niveau est refusé, pas la fonctionnalité. */
+  | 'level-rejected'
+  /** Le modèle ne sait pas raisonner sur demande. */
+  | 'thinking-unsupported';
+
+export interface Downgrade {
+  cause: DowngradeCause;
+  /** Le niveau demandé avant repli. */
+  from: string;
+  /** Ce qui repart : un niveau, `'true'`, ou `''` pour « sans raisonnement ». */
+  to: string;
+  /** Le message du provider, déjà passé par `scrub`. */
+  reason: string;
 }
 
 /**

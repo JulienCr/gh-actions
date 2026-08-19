@@ -516,26 +516,25 @@ function describeCause(error) {
 }
 var redact = (text) => text.replace(/\/\/[^/\s@]+@/g, "//***@");
 var rejectsThinkingValue = (body) => /invalid (think|reasoning_effort) value/i.test(body);
-var LEVELS = ["low", "medium", "high", "max"];
-function oneLevelDown(level) {
-  const index = LEVELS.indexOf(level.trim().toLowerCase());
-  if (index === -1) return "";
-  return index === 0 ? "" : LEVELS[index - 1];
-}
 async function withRetries(attempt2, request) {
   try {
     return await attempt2(request);
   } catch (error) {
     if (!(error instanceof LlmError)) throw error;
     if (error.reasoningExhausted && request.think) {
-      const lower = oneLevelDown(request.think);
-      request.onDowngrade?.(`${error.message} \u2014 on rejoue en \xAB ${lower || "sans raisonnement"} \xBB`);
-      return attempt2({ ...request, think: lower });
+      return replay(attempt2, request, "reasoning-exhausted", "", error.message);
     }
     if (error.thinkingRejected && request.think) {
-      const fallback = rejectsThinkingValue(error.message) ? "true" : "";
-      request.onDowngrade?.(error.message);
-      return attempt2({ ...request, think: fallback });
+      const badValue = rejectsThinkingValue(error.message);
+      return replay(
+        attempt2,
+        request,
+        badValue ? "level-rejected" : "thinking-unsupported",
+        // `true` garde le raisonnement au niveau par défaut du modèle, là où le
+        // retirer coûterait la profondeur qu'on paie.
+        badValue ? "true" : "",
+        error.message
+      );
     }
     if (!error.retryable) throw error;
     request.onRetry?.(error.message);
@@ -543,11 +542,33 @@ async function withRetries(attempt2, request) {
     return attempt2(request);
   }
 }
+function replay(attempt2, request, cause, to, reason) {
+  request.onDowngrade?.({ cause, from: request.think ?? "", to, reason });
+  return attempt2({ ...request, think: to });
+}
+function describeDowngrade(event, model) {
+  const { cause, from, to, reason } = event;
+  if (cause === "reasoning-exhausted") {
+    return `${model} a br\xFBl\xE9 toute sa sortie en raisonnement sans conclure (${reason}).
+  Rejou\xE9 ${describeTo(to)} : ce sera moins fouill\xE9.`;
+  }
+  if (cause === "level-rejected") {
+    return `${model} n'a pas accept\xE9 \xAB thinking: ${from} \xBB (${reason}).
+  Rejou\xE9 ${describeTo(to)}.`;
+  }
+  return `${model} ne sait pas raisonner sur demande (${reason}).
+  Rejou\xE9 ${describeTo(to)} : ce sera moins fouill\xE9.`;
+}
+function describeTo(to) {
+  if (to === "") return "sans raisonnement explicite";
+  if (to === "true") return "au niveau de raisonnement par d\xE9faut du mod\xE8le";
+  return `en \xAB ${to} \xBB`;
+}
 
 // pr-review/src/llm/ollama.ts
 function parseThink(value) {
   const normalised = value.trim().toLowerCase();
-  if (normalised === "true") return true;
+  if (/^(true|yes|on)$/.test(normalised)) return true;
   if (wantsNoThinking(normalised)) return false;
   return normalised;
 }
@@ -591,7 +612,10 @@ async function send(request) {
         // de raisonnement coûterait la moitié de sa profondeur d'analyse.
         options: {
           temperature: request.temperature ?? 1,
-          ...request.seed === void 0 ? {} : { seed: request.seed }
+          ...request.seed === void 0 ? {} : { seed: request.seed },
+          // Absent par défaut : le plafond du modèle est le seul que personne
+          // n'a à deviner. Posé, il borne ce que coûte un appel qui déraille.
+          ...request.maxOutputTokens ? { num_predict: request.maxOutputTokens } : {}
         },
         messages: request.messages
       }),
@@ -622,6 +646,7 @@ async function collect(response, apiKey) {
   let evalTokens = 0;
   let complete = false;
   let fragments = 0;
+  let doneReason = "";
   for await (const line of streamLines(response.body)) {
     let chunk;
     try {
@@ -642,14 +667,16 @@ async function collect(response, apiKey) {
     thinking += chunk.message?.thinking ?? "";
     if (chunk.prompt_eval_count !== void 0) promptTokens = chunk.prompt_eval_count;
     if (chunk.eval_count !== void 0) evalTokens = chunk.eval_count;
+    if (chunk.done_reason) doneReason = chunk.done_reason;
     if (chunk.done) complete = true;
   }
   if (!complete) {
     throw new LlmError("le flux d'Ollama s'est interrompu avant la fin de la r\xE9ponse", true);
   }
+  const atCeiling = doneReason === "length";
   if (!content.trim()) {
     throw new LlmError(
-      `Ollama a rendu une r\xE9ponse vide (${evalTokens} tokens de sortie, dont ${thinking.length} caract\xE8res de raisonnement, sur ${promptTokens} en entr\xE9e)`,
+      `Ollama a rendu une r\xE9ponse vide (${evalTokens} tokens de sortie, dont ${thinking.length} caract\xE8res de raisonnement, sur ${promptTokens} en entr\xE9e${atCeiling ? ", plafond de sortie atteint" : ""})`,
       false,
       false,
       // Du raisonnement mais pas de réponse : la génération s'est arrêtée AVANT
@@ -658,10 +685,16 @@ async function collect(response, apiKey) {
       thinking.trim().length > 0
     );
   }
+  if (atCeiling) {
+    throw new LlmError(
+      `Ollama a coup\xE9 sa r\xE9ponse au plafond de tokens de sortie (${evalTokens} tokens)`
+    );
+  }
   return {
     message: { content, thinking },
     prompt_eval_count: promptTokens,
-    eval_count: evalTokens
+    eval_count: evalTokens,
+    done_reason: doneReason
   };
 }
 
@@ -709,6 +742,10 @@ async function send2(request, dialect) {
         // des dialectes visés, et un paramètre inconnu se paie d'un 400 sur les
         // serveurs stricts. La stabilité y repose sur la température seule.
         temperature: request.temperature ?? 1,
+        // `max_tokens` et non `max_completion_tokens` : c'est le champ que
+        // DeepSeek documente et que les endpoints OpenAI-compatibles acceptent.
+        // Un champ par dialecte le jour où l'un des deux le refuse, pas avant.
+        ...request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {},
         ...reasoningBody(request.think, dialect),
         messages: request.messages
       }),
@@ -777,16 +814,16 @@ async function collect2(response, dialect, apiKey) {
   if (!complete) {
     throw new LlmError(`le flux de ${dialect.name} s'est interrompu avant la fin de la r\xE9ponse`, true);
   }
-  if (truncated) {
-    throw new LlmError(`${dialect.name} a coup\xE9 sa r\xE9ponse au plafond de tokens de sortie`);
-  }
   if (!content.trim()) {
     throw new LlmError(
-      `${dialect.name} a rendu une r\xE9ponse vide (${usage?.outputTokens ?? 0} tokens de sortie, dont ${thinking.length} caract\xE8res de raisonnement)`,
+      `${dialect.name} a rendu une r\xE9ponse vide (${usage?.outputTokens ?? 0} tokens de sortie, dont ${thinking.length} caract\xE8res de raisonnement${truncated ? ", plafond de sortie atteint" : ""})`,
       false,
       false,
       thinking.trim().length > 0
     );
+  }
+  if (truncated) {
+    throw new LlmError(`${dialect.name} a coup\xE9 sa r\xE9ponse au plafond de tokens de sortie`);
   }
   return {
     content,
@@ -1030,12 +1067,12 @@ Found nothing? Return \`${PASS_HEADING}\` and a single bullet \xAB - [rien] : \x
 actually checked to be able to say it. Never an empty section.`;
 var EFFORTS = ["full", "balanced", "lean"];
 var isEffort = (value) => EFFORTS.includes(value);
-var LEVELS2 = ["low", "medium", "high", "max"];
+var LEVELS = ["low", "medium", "high", "max"];
 function stepDown(level, steps) {
   if (steps <= 0) return level;
-  const index = LEVELS2.indexOf(level.trim().toLowerCase());
+  const index = LEVELS.indexOf(level.trim().toLowerCase());
   if (index === -1) return level;
-  return LEVELS2[Math.max(0, index - steps)];
+  return LEVELS[Math.max(0, index - steps)];
 }
 var PROSE_ONLY = [".md", ".txt", ".rst", ".adoc"];
 function extensionOf(path) {
@@ -1336,6 +1373,14 @@ var DEFAULTS = {
   importsBudgetChars: 3e5,
   timeoutMinutes: 15,
   /**
+   * Plafond de tokens de sortie. `0` : rien n'est envoyé, le modèle garde le sien.
+   *
+   * Pas de valeur livrée, parce qu'aucune ne vaut pour tous les modèles : ce
+   * qui borne un dérapage sur l'un tronquerait une review légitime sur l'autre.
+   * Le dépôt qui a mesuré son besoin l'écrit.
+   */
+  maxOutputTokens: 0,
+  /**
    * Effort de raisonnement demandé au modèle.
    *
    * `max` parce qu'une review vaut par ce qu'elle trouve, pas par sa latence :
@@ -1597,6 +1642,7 @@ function resolveConfig({ argv, env, warn = () => {
       0
     ),
     timeoutMs: readNumber(env, "timeout-minutes", DEFAULTS.timeoutMinutes, warn) * 6e4,
+    maxOutputTokens: readNumber(env, "max-output-tokens", DEFAULTS.maxOutputTokens, warn),
     doctrine: doctrineInput.length > 0 ? doctrineInput : [...DEFAULT_DOCTRINE],
     // Le plancher d'abord : ce qui suit ne peut qu'ajouter, jamais retirer.
     skip: [...ALWAYS_SKIPPED, ...parseList(readInput(env, "skip"))],
@@ -1945,11 +1991,9 @@ async function callModel(config, run2, args) {
       temperature: config.temperature,
       seed: config.seed,
       timeoutMs: config.timeoutMs,
+      maxOutputTokens: config.maxOutputTokens,
       onRetry: (reason) => console.warn(`\u26A0 [${args.label}] ${reason} \u2014 nouvelle tentative dans 20 s.`),
-      onDowngrade: (reason) => console.warn(
-        `\u26A0 [${args.label}] ${target.model} n'a pas accept\xE9 \xAB thinking: ${target.thinking} \xBB (${reason}).
-  Relanc\xE9 sans raisonnement explicite : ce sera moins fouill\xE9.`
-      )
+      onDowngrade: (event) => console.warn(`\u26A0 [${args.label}] ${describeDowngrade(event, target.model)}`)
     });
   } catch (error) {
     const reason = error instanceof LlmError ? error.message : String(error);

@@ -287,6 +287,18 @@ inputs:
     required: false
     default: '15'
 
+  max-output-tokens:
+    description: >-
+      Plafond de tokens de SORTIE d'une requête. Ne pas confondre avec
+      « budget-chars », qui borne l'entrée. Laissé vide, rien n'est envoyé et le
+      modèle garde son propre plafond. Le poser borne ce que coûte un appel qui
+      déraille : mesuré sur un modèle parti en boucle de raisonnement, chaque
+      tentative perdue a brûlé 65 536 tokens sans rendre un caractère, soit
+      quatre minutes de job à chaque fois. Trop bas, il tronque une review
+      légitime sur un gros diff, ce que l'action refuse de poster.
+    required: false
+    default: ''
+
   dry-run:
     description: "true : la review est écrite dans les logs et rien n'est posté."
     required: false

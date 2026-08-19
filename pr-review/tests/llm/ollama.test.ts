@@ -8,7 +8,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { ollamaClient } from '../../src/llm/ollama';
-import { LlmError } from '../../src/llm/types';
+import { LlmError, type Downgrade } from '../../src/llm/types';
 
 /**
  * La politique de reprise se teste contre un vrai serveur HTTP local plutôt que
@@ -164,6 +164,29 @@ describe('chat · requête', () => {
     expect(lastBody.think).toBe(false);
   });
 
+  /**
+   * `reasoningBody`, côté OpenAI, traite « yes » et « on » comme « true ». Ici,
+   * ils partaient en niveau brut : un aller-retour 400 payé pour apprendre ce
+   * que la liste disait déjà.
+   */
+  it('traduit « yes » comme « true », à l’identique du client OpenAI', async () => {
+    queue.push({ status: 200, body: ok('ok') });
+    await call({ think: 'yes' });
+    expect(lastBody.think).toBe(true);
+  });
+
+  it('n’envoie aucun plafond de sortie tant qu’on ne lui en donne pas', async () => {
+    queue.push({ status: 200, body: ok('ok') });
+    await call({});
+    expect(lastBody.options).not.toHaveProperty('num_predict');
+  });
+
+  it('borne la sortie quand le dépôt a écrit un plafond', async () => {
+    queue.push({ status: 200, body: ok('ok') });
+    await call({ maxOutputTokens: 32_000 });
+    expect((lastBody.options as Record<string, unknown>).num_predict).toBe(32_000);
+  });
+
   it('agrège les fragments du flux en une seule réponse', async () => {
     queue.push({
       status: 200,
@@ -207,8 +230,8 @@ describe('chat · modèle sans raisonnement', () => {
       { status: 400, body: '{"error":"registry.ollama.ai/library/x does not support thinking"}' },
       { status: 200, body: ok('review sans raisonnement') },
     );
-    const downgrades: string[] = [];
-    const result = await call({ think: 'max', onDowngrade: (reason) => downgrades.push(reason) });
+    const downgrades: Downgrade[] = [];
+    const result = await call({ think: 'max', onDowngrade: (event) => downgrades.push(event) });
 
     expect(result.content).toBe('review sans raisonnement');
     expect(calls).toBe(2);
@@ -511,25 +534,35 @@ describe('les secrets ne sortent pas dans un message d’erreur', () => {
  * flux s'est terminé proprement SANS aucun contenu. Les runs qui aboutissaient
  * rendaient « ~99 % de raisonnement » : ces appels vivent à la limite, et le
  * jour où le raisonnement déborde, la review est perdue en entier.
+ *
+ * Puis sur #99, le 19 août (run 32248459701) : le même modèle a brûlé 65 536
+ * tokens — son plafond — en `high`, et exactement autant au rejeu en `medium`.
+ * C'est ce second incident qui a fait tomber le repli d'un cran au profit d'un
+ * repli sec.
  */
 describe('un raisonnement qui ne conclut jamais', () => {
-  const thinkingOnly = (thinking: string) =>
+  const thinkingOnly = (thinking: string, doneReason?: string) =>
     JSON.stringify({
       message: { role: 'assistant', content: '', thinking },
       done: true,
+      ...(doneReason === undefined ? {} : { done_reason: doneReason }),
       prompt_eval_count: 173_109,
       eval_count: 36_000,
     });
 
-  it('rejoue d’UN cran plus bas, plutôt que de perdre la passe', async () => {
+  it('rejoue SANS raisonnement, plutôt que de perdre la passe sur un cran', async () => {
     queue.push({ status: 200, body: thinkingOnly('je réfléchis sans jamais conclure') });
     queue.push({ status: 200, body: ok('## Trouvailles\n- [rien] : relu.') });
-    const downgrades: string[] = [];
-    const result = await call({ think: 'high', onDowngrade: (r) => downgrades.push(r) });
+    const downgrades: Downgrade[] = [];
+    const result = await call({ think: 'high', onDowngrade: (event) => downgrades.push(event) });
     expect(result.content).toContain('Trouvailles');
     expect(calls).toBe(2);
-    expect(lastBody.think).toBe('medium');
-    expect(downgrades[0]).toContain('medium');
+    // Pas « medium » : un cran plus bas a été mesuré, et il épuise le même
+    // budget. Voir le commentaire de `withRetries`.
+    expect(lastBody).not.toHaveProperty('think');
+    expect(downgrades).toEqual([
+      { cause: 'reasoning-exhausted', from: 'high', to: '', reason: expect.any(String) },
+    ]);
   });
 
   /** Le compte des tokens brûlés : sans lui, l'incident est indiagnosticable. */
@@ -545,12 +578,30 @@ describe('un raisonnement qui ne conclut jamais', () => {
     expect(error.message).toContain('173109 en entrée');
   });
 
-  /** Sous « low » il n'y a plus de cran : on retire le raisonnement. */
-  it('retire le raisonnement quand il n’y a plus de cran sous le pied', async () => {
-    queue.push({ status: 200, body: thinkingOnly('encore') });
-    queue.push({ status: 200, body: ok('ok') });
-    await call({ think: 'low' });
-    expect(lastBody.think).toBeUndefined();
+  /**
+   * Deux pannes opposées sous un même symptôme : un modèle qui tape son plafond
+   * se règle en montant `max-output-tokens` ou en baissant le raisonnement, un
+   * modèle qui s'arrête de lui-même non. Les compteurs seuls ne les distinguent
+   * pas ; `done_reason` si.
+   */
+  it('nomme le plafond de sortie quand c’est lui qui a coupé', async () => {
+    queue.push({ status: 200, body: thinkingOnly('sans fin', 'length') });
+    queue.push({ status: 200, body: thinkingOnly('sans fin', 'length') });
+    const error = await call({ think: 'high' }).then(
+      () => new Error('aurait dû échouer'),
+      (caught: Error) => caught,
+    );
+    expect(error.message).toContain('plafond de sortie atteint');
+  });
+
+  it('ne parle pas de plafond quand le modèle s’est arrêté de lui-même', async () => {
+    queue.push({ status: 200, body: thinkingOnly('sans fin', 'stop') });
+    queue.push({ status: 200, body: thinkingOnly('sans fin', 'stop') });
+    const error = await call({ think: 'high' }).then(
+      () => new Error('aurait dû échouer'),
+      (caught: Error) => caught,
+    );
+    expect(error.message).not.toContain('plafond');
   });
 
   /**
@@ -561,5 +612,35 @@ describe('un raisonnement qui ne conclut jamais', () => {
     queue.push({ status: 200, body: thinkingOnly('') });
     await expect(call({ think: 'high' })).rejects.toThrow(/vide/);
     expect(calls).toBe(1);
+  });
+});
+
+/**
+ * Le pendant de « le flux s'est interrompu », du côté du modèle plutôt que du
+ * réseau : une réponse coupée à son plafond est bien formée et se lit comme une
+ * review entière. Le client OpenAI-compatible tenait déjà cette garde ;
+ * celui-ci ne lisait pas `done_reason` du tout.
+ */
+describe('une réponse coupée à son plafond', () => {
+  const cut = (content: string) =>
+    JSON.stringify({
+      message: { role: 'assistant', content },
+      done: true,
+      done_reason: 'length',
+      prompt_eval_count: 100,
+      eval_count: 65_536,
+    });
+
+  it('refuse une review amputée plutôt que de la poster comme entière', async () => {
+    queue.push({ status: 200, body: cut('## Trouvailles\n- fichier.ts:12 : le test ne vérifie que') });
+    await expect(call({})).rejects.toThrow(/plafond de tokens de sortie/);
+    // Rien à rejouer : le même prompt reproduirait la même coupe.
+    expect(calls).toBe(1);
+  });
+
+  it('laisse passer une réponse que le modèle a terminée', async () => {
+    queue.push({ status: 200, body: ok('review complète') });
+    const result = await call({});
+    expect(result.content).toBe('review complète');
   });
 });

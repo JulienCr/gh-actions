@@ -229,6 +229,7 @@ Seul `pr` est obligatoire.
 | `window-min-lines` | selon le cran | Taille à partir de laquelle un fichier part par extraits. `0` : jamais. |
 | `imports-budget-chars` | `300000` | Plafond des fichiers **importés**, joints en contexte. `0` : aucun. `120000` au cran `lean`. |
 | `timeout-minutes` | `15` | Délai d'**une** requête. Le mur du job vaut « le plus gros groupe séquencé, plus la fusion » ; voir ci-dessous. |
+| `max-output-tokens` | *(vide)* | Plafond de tokens de **sortie** d'une requête ; `budget-chars` borne l'entrée. Vide : le plafond du modèle. Le poser borne ce que coûte un appel qui part en boucle de raisonnement. |
 | `dry-run` | `false` | `true` : la review part dans les logs, rien n'est posté. |
 
 ### Le mix par passe
