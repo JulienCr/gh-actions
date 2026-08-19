@@ -15,6 +15,9 @@ import { createOpenAiClient } from './openai';
 import type { LlmClient, Usage } from './types';
 
 export * from './types';
+// La phrase d'un repli se formule là où la décision se prend, pas au point
+// d'appel : voir l'en-tête de `describeDowngrade`.
+export { describeDowngrade } from './http';
 
 export interface ProviderSpec {
   /** Nom lisible, pour les avertissements adressés à un humain. */

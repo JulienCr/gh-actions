@@ -27,12 +27,21 @@ import {
   withRetries,
   worthRetrying,
 } from './http';
-import { LlmError, type ChatRequest, type ChatResult } from './types';
+import { LlmError, type Attempt, type ChatRequest, type ChatResult } from './types';
 
 interface ChatPayload {
   message?: { content?: string; thinking?: string };
   prompt_eval_count?: number;
   eval_count?: number;
+  /**
+   * Pourquoi la génération s'est arrêtée : « stop » ou « length ».
+   *
+   * Relevé dans la source d'Ollama (`DoneReason.String()`) : ce sont les deux
+   * seules valeurs qu'un fragment final porte. « length » veut dire que le
+   * modèle a tapé son plafond de sortie, et c'est la différence entre une
+   * réponse qui s'arrête et une réponse qu'on coupe.
+   */
+  done_reason?: string;
   error?: string;
 }
 
@@ -54,7 +63,10 @@ interface StreamChunk extends ChatPayload {
  */
 function parseThink(value: string): string | boolean {
   const normalised = value.trim().toLowerCase();
-  if (normalised === 'true') return true;
+  // `yes` et `on` comme `true` : la même liste que `reasoningBody` du client
+  // OpenAI-compatible. Sans ça, `thinking: yes` partait en niveau brut et
+  // coûtait un aller-retour 400 avant de se replier sur ce qu'on savait déjà.
+  if (/^(true|yes|on)$/.test(normalised)) return true;
   // La même définition que le client OpenAI-compatible, et pas une seconde
   // écrite à côté : celle-ci ignorait « no » et « 0 », si bien qu'un
   // « thinking: no » coupait le raisonnement chez un provider et le laissait
@@ -82,7 +94,7 @@ const rejectsThinking = (status: number, body: string) => status === 400 && /thi
  * tentative ratée et l'attente entre les deux ne mesurerait plus la génération,
  * qui est la seule chose que le pied de page prétend rapporter.
  */
-async function attempt(request: ChatRequest): Promise<ChatResult> {
+async function attempt(request: ChatRequest): Promise<Attempt> {
   const started = Date.now();
   const payload = await send(request);
   return {
@@ -126,6 +138,9 @@ async function send(request: ChatRequest): Promise<ChatPayload> {
         options: {
           temperature: request.temperature ?? 1,
           ...(request.seed === undefined ? {} : { seed: request.seed }),
+          // Absent par défaut : le plafond du modèle est le seul que personne
+          // n'a à deviner. Posé, il borne ce que coûte un appel qui déraille.
+          ...(request.maxOutputTokens ? { num_predict: request.maxOutputTokens } : {}),
         },
         messages: request.messages,
       }),
@@ -164,6 +179,7 @@ async function collect(response: Response, apiKey: string): Promise<ChatPayload>
   let evalTokens = 0;
   let complete = false;
   let fragments = 0;
+  let doneReason = '';
 
   for await (const line of streamLines(response.body!)) {
     let chunk: StreamChunk;
@@ -193,6 +209,7 @@ async function collect(response: Response, apiKey: string): Promise<ChatPayload>
     // Écrasement et non cumul : ces compteurs sont des totaux, pas des deltas.
     if (chunk.prompt_eval_count !== undefined) promptTokens = chunk.prompt_eval_count;
     if (chunk.eval_count !== undefined) evalTokens = chunk.eval_count;
+    if (chunk.done_reason) doneReason = chunk.done_reason;
     if (chunk.done) complete = true;
   }
 
@@ -203,6 +220,7 @@ async function collect(response: Response, apiKey: string): Promise<ChatPayload>
     // le lecteur ne peut pas deviner ce qui manque.
     throw new LlmError("le flux d'Ollama s'est interrompu avant la fin de la réponse", true);
   }
+  const atCeiling = doneReason === 'length';
   if (!content.trim()) {
     // Un contenu vide arrive quand tout est parti dans `thinking` : le dire
     // vaut mieux que poster un commentaire vide.
@@ -212,9 +230,15 @@ async function collect(response: Response, apiKey: string): Promise<ChatPayload>
     // modèle a rendu trois tokens ou brûlé trente mille à réfléchir sans
     // conclure. Ce sont deux pannes opposées, et on ne peut pas les distinguer
     // après coup, l'appel ayant été payé pour rien dans les deux cas.
+    //
+    // `done_reason` nomme la troisième chose que les compteurs seuls ne disent
+    // pas : le modèle a-t-il tapé son plafond de sortie, ou s'est-il arrêté de
+    // lui-même sans conclure ? Le premier cas se règle en baissant le
+    // raisonnement ou en montant le plafond, le second non.
     throw new LlmError(
       `Ollama a rendu une réponse vide (${evalTokens} tokens de sortie, ` +
-        `dont ${thinking.length} caractères de raisonnement, sur ${promptTokens} en entrée)`,
+        `dont ${thinking.length} caractères de raisonnement, sur ${promptTokens} en entrée` +
+        `${atCeiling ? ', plafond de sortie atteint' : ''})`,
       false,
       false,
       // Du raisonnement mais pas de réponse : la génération s'est arrêtée AVANT
@@ -223,9 +247,20 @@ async function collect(response: Response, apiKey: string): Promise<ChatPayload>
       thinking.trim().length > 0,
     );
   }
+  if (atCeiling) {
+    // Le même vice que le flux coupé, du côté du modèle plutôt que du réseau :
+    // une réponse coupée au plafond est bien formée mais amputée, et la poster
+    // avec l'aplomb d'une review entière est pire que ne rien poster, parce que
+    // le lecteur ne peut pas deviner ce qui manque. Le client OpenAI-compatible
+    // tient déjà cette garde ; celui-ci l'ignorait.
+    throw new LlmError(
+      `Ollama a coupé sa réponse au plafond de tokens de sortie (${evalTokens} tokens)`,
+    );
+  }
   return {
     message: { content, thinking },
     prompt_eval_count: promptTokens,
     eval_count: evalTokens,
+    done_reason: doneReason,
   };
 }

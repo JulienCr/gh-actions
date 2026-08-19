@@ -138,6 +138,27 @@ describe('resolveConfig · nombres illisibles', () => {
     expect(config.timeoutMs).toBe(20 * 60_000);
   });
 
+  /**
+   * Le plafond de sortie n'a pas de valeur livrée : aucune ne vaut pour tous
+   * les modèles. Zéro veut dire « rien n'est envoyé », et c'est ce que les
+   * clients testent avant d'ajouter le champ à leur corps de requête.
+   */
+  it('n’impose aucun plafond de sortie tant que le dépôt n’en écrit pas', () => {
+    expect(resolve().maxOutputTokens).toBe(0);
+    expect(resolve({ 'INPUT_MAX-OUTPUT-TOKENS': '32000' }).maxOutputTokens).toBe(32_000);
+  });
+
+  it('garde l’absence de plafond plutôt qu’un plafond illisible', () => {
+    const warn = vi.fn();
+    const config = resolveConfig({
+      argv: ['42'],
+      env: { 'INPUT_MAX-OUTPUT-TOKENS': 'beaucoup' },
+      warn,
+    });
+    expect(config.maxOutputTokens).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
   it('accepte zéro là où il veut dire quelque chose : couper le contexte importé', () => {
     const warn = vi.fn();
     const config = resolveConfig({ argv: ['42'], env: { 'INPUT_IMPORTS-BUDGET-CHARS': '0' }, warn });

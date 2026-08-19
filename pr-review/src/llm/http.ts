@@ -17,7 +17,14 @@
  * se réarme à chaque fragment.
  */
 
-import { LlmError, type ChatRequest, type ChatResult } from './types';
+import {
+  LlmError,
+  type Attempt,
+  type ChatRequest,
+  type ChatResult,
+  type Downgrade,
+  type DowngradeCause,
+} from './types';
 
 /** 15 minutes par défaut, réglable par l'input `timeout-minutes`. */
 export const DEFAULT_TIMEOUT_MS = 15 * 60_000;
@@ -165,55 +172,118 @@ export const redact = (text: string) => text.replace(/\/\/[^/\s@]+@/g, '//***@')
 const rejectsThinkingValue = (body: string) => /invalid (think|reasoning_effort) value/i.test(body);
 
 /**
- * La reprise et les deux replis, communs aux providers.
+ * La reprise et les replis, communs aux providers.
  *
  * Un modèle sans raisonnement explicite reste un modèle utilisable : on rejoue
  * sans `think` plutôt que de rendre l'action inutilisable dès que le dépôt
  * appelant change de modèle.
  */
-/**
- * Un cran de raisonnement en dessous, sans jamais descendre sous « low ».
- *
- * Volontairement recopié ici plutôt qu'importé de `passes.ts` : la couche
- * transport ne doit rien savoir des passes de review, et cette échelle est
- * celle des providers, pas celle du découpage.
- */
-const LEVELS = ['low', 'medium', 'high', 'max'];
-
-function oneLevelDown(level: string): string {
-  const index = LEVELS.indexOf(level.trim().toLowerCase());
-  // Hors échelle (un booléen, le niveau d'un modèle qu'on ne connaît pas) : on
-  // ne devine pas, on retire le raisonnement. C'est le seul repli sûr.
-  if (index === -1) return '';
-  return index === 0 ? '' : LEVELS[index - 1]!;
-}
-
 export async function withRetries(
-  attempt: (request: ChatRequest) => Promise<ChatResult>,
+  attempt: (request: ChatRequest) => Promise<Attempt>,
   request: ChatRequest,
 ): Promise<ChatResult> {
   try {
-    return await attempt(request);
+    return await played(attempt, request);
   } catch (error) {
     if (!(error instanceof LlmError)) throw error;
-    // Le raisonnement a tout mangé : on rejoue d'UN cran plus bas. Une passe
-    // rendue à « medium » vaut incomparablement mieux qu'une passe perdue, et
-    // retirer le raisonnement d'un coup coûterait la profondeur qu'on paie.
+    // Le raisonnement a tout mangé : on rejoue SANS raisonnement, pas d'un cran
+    // plus bas.
+    //
+    // Le cran intermédiaire a été essayé et mesuré : sur avolo-shorts#99 (run
+    // 32248459701), `deepseek-v4-flash:cloud` a brûlé 65 536 tokens de sortie —
+    // son plafond — en `high`, puis EXACTEMENT autant en `medium`, sans rendre
+    // un caractère ni l'une ni l'autre fois. Baisser d'un cran ne change pas la
+    // nature d'un modèle qui ne conclut pas ; ça achète un second appel au prix
+    // fort pour le même vide, et retarde de quatre minutes le seul rejeu qui
+    // avait une chance. Une passe moins fouillée vaut mieux qu'une passe perdue.
     if (error.reasoningExhausted && request.think) {
-      const lower = oneLevelDown(request.think);
-      request.onDowngrade?.(`${error.message} — on rejoue en « ${lower || 'sans raisonnement'} »`);
-      return attempt({ ...request, think: lower });
+      return replay(attempt, request, 'reasoning-exhausted', '', error.message);
     }
     if (error.thinkingRejected && request.think) {
       // Un niveau mal orthographié ne coûte que le niveau ; un modèle qui ne
       // raisonne pas coûte le raisonnement. Deux replis, pas un.
-      const fallback = rejectsThinkingValue(error.message) ? 'true' : '';
-      request.onDowngrade?.(error.message);
-      return attempt({ ...request, think: fallback });
+      const badValue = rejectsThinkingValue(error.message);
+      return replay(
+        attempt,
+        request,
+        badValue ? 'level-rejected' : 'thinking-unsupported',
+        // `true` garde le raisonnement au niveau par défaut du modèle, là où le
+        // retirer coûterait la profondeur qu'on paie.
+        badValue ? 'true' : '',
+        error.message,
+      );
     }
     if (!error.retryable) throw error;
     request.onRetry?.(error.message);
     await sleep(request.retryDelayMs ?? RETRY_DELAY_MS);
-    return attempt(request);
+    return played(attempt, request);
   }
+}
+
+/**
+ * Un aller-retour, estampillé du niveau qui est vraiment parti.
+ *
+ * Ici et pas dans les clients : c'est cette couche qui décide du repli, donc la
+ * seule qui sache, au moment où le résultat revient, sous quel niveau il a été
+ * obtenu.
+ */
+async function played(
+  attempt: (request: ChatRequest) => Promise<Attempt>,
+  request: ChatRequest,
+): Promise<ChatResult> {
+  return { ...(await attempt(request)), think: request.think ?? '' };
+}
+
+/**
+ * Le rejeu, annoncé puis joué.
+ *
+ * Une seule tentative de plus, par `attempt` et non par `withRetries` : un
+ * repli qui se replierait à son tour ferait trois appels sur un modèle qui n'en
+ * honore aucun, et le mur du job vaut un délai par appel.
+ */
+function replay(
+  attempt: (request: ChatRequest) => Promise<Attempt>,
+  request: ChatRequest,
+  cause: DowngradeCause,
+  to: string,
+  reason: string,
+): Promise<ChatResult> {
+  request.onDowngrade?.({ cause, from: request.think ?? '', to, reason });
+  return played(attempt, { ...request, think: to });
+}
+
+/**
+ * La phrase du journal, pour un repli donné.
+ *
+ * Ici et pas au point d'appel : mesuré sur avolo-shorts#99, la phrase écrite en
+ * dur dans `index.ts` annonçait « n'a pas accepté thinking: high » et « relancé
+ * sans raisonnement » alors que le modèle avait accepté le niveau et qu'on
+ * rejouait en `medium`. Seule cette couche sait laquelle des trois causes a
+ * joué et ce qui repart vraiment ; une fonction pure, elle, se teste.
+ */
+export function describeDowngrade(event: Downgrade, model: string): string {
+  const { cause, from, to, reason } = event;
+  if (cause === 'reasoning-exhausted') {
+    return (
+      `${model} a brûlé toute sa sortie en raisonnement sans conclure (${reason}).\n` +
+      `  Rejoué ${describeTo(to)} : ce sera moins fouillé.`
+    );
+  }
+  if (cause === 'level-rejected') {
+    return (
+      `${model} n'a pas accepté « thinking: ${from} » (${reason}).\n` +
+      `  Rejoué ${describeTo(to)}.`
+    );
+  }
+  return (
+    `${model} ne sait pas raisonner sur demande (${reason}).\n` +
+    `  Rejoué ${describeTo(to)} : ce sera moins fouillé.`
+  );
+}
+
+/** Ce qui repart, dit en français plutôt qu'en valeur de champ. */
+function describeTo(to: string): string {
+  if (to === '') return 'sans raisonnement explicite';
+  if (to === 'true') return 'au niveau de raisonnement par défaut du modèle';
+  return `en « ${to} »`;
 }

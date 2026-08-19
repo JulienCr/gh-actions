@@ -28,7 +28,13 @@ import {
   withRetries,
   worthRetrying,
 } from './http';
-import { LlmError, type ChatRequest, type ChatResult, type Usage } from './types';
+import {
+  LlmError,
+  type Attempt,
+  type ChatRequest,
+  type ChatResult,
+  type Usage,
+} from './types';
 
 export interface OpenAiDialect {
   /** Nom affiché dans les messages d'erreur. */
@@ -111,7 +117,7 @@ const rejectsThinking = (status: number, body: string) =>
   status === 400 && /reasoning|thinking/i.test(body);
 
 export function createOpenAiClient(dialect: OpenAiDialect) {
-  async function attempt(request: ChatRequest): Promise<ChatResult> {
+  async function attempt(request: ChatRequest): Promise<Attempt> {
     const started = Date.now();
     const collected = await send(request, dialect);
     return { ...collected, durationMs: Date.now() - started };
@@ -120,7 +126,7 @@ export function createOpenAiClient(dialect: OpenAiDialect) {
   return (request: ChatRequest): Promise<ChatResult> => withRetries(attempt, request);
 }
 
-type Collected = Omit<ChatResult, 'durationMs'>;
+type Collected = Omit<Attempt, 'durationMs'>;
 
 async function send(request: ChatRequest, dialect: OpenAiDialect): Promise<Collected> {
   const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -142,6 +148,10 @@ async function send(request: ChatRequest, dialect: OpenAiDialect): Promise<Colle
         // des dialectes visés, et un paramètre inconnu se paie d'un 400 sur les
         // serveurs stricts. La stabilité y repose sur la température seule.
         temperature: request.temperature ?? 1,
+        // `max_tokens` et non `max_completion_tokens` : c'est le champ que
+        // DeepSeek documente et que les endpoints OpenAI-compatibles acceptent.
+        // Un champ par dialecte le jour où l'un des deux le refuse, pas avant.
+        ...(request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {}),
         ...reasoningBody(request.think, dialect),
         messages: request.messages,
       }),
@@ -234,19 +244,26 @@ async function collect(
   if (!complete) {
     throw new LlmError(`le flux de ${dialect.name} s'est interrompu avant la fin de la réponse`, true);
   }
-  if (truncated) {
-    throw new LlmError(`${dialect.name} a coupé sa réponse au plafond de tokens de sortie`);
-  }
   if (!content.trim()) {
     // Un contenu vide arrive quand tout est parti dans le raisonnement : le
     // dire vaut mieux que poster un commentaire vide.
+    //
+    // AVANT la garde de troncature, et l'ordre compte : un vide coupé au
+    // plafond est le cas même qui doit déclencher un repli du raisonnement.
+    // Testé d'abord comme une troncature, il partait en erreur sèche, sans
+    // rejeu, alors que la passe était encore récupérable. Le client Ollama
+    // range ses gardes dans le même ordre.
     throw new LlmError(
       `${dialect.name} a rendu une réponse vide (${usage?.outputTokens ?? 0} tokens de sortie, ` +
-        `dont ${thinking.length} caractères de raisonnement)`,
+        `dont ${thinking.length} caractères de raisonnement` +
+        `${truncated ? ', plafond de sortie atteint' : ''})`,
       false,
       false,
       thinking.trim().length > 0,
     );
+  }
+  if (truncated) {
+    throw new LlmError(`${dialect.name} a coupé sa réponse au plafond de tokens de sortie`);
   }
 
   return {

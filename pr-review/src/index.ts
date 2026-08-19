@@ -36,6 +36,7 @@ import {
   type PassId,
 } from './inputs';
 import {
+  describeDowngrade,
   estimateCost,
   isPeakHour,
   LlmError,
@@ -275,6 +276,9 @@ async function callModel(
     label: args.label,
     provider: target.provider,
     model: target.model,
+    // Le niveau DEMANDÉ. Un appel qui aboutit le remplace par celui qui a été
+    // joué, que le repli a pu changer en cours de route ; un appel raté le
+    // garde, faute d'avoir jamais rien retenu.
     think: target.thinking,
     ...sizes(args.messages),
   };
@@ -297,12 +301,9 @@ async function callModel(
       temperature: config.temperature,
       seed: config.seed,
       timeoutMs: config.timeoutMs,
+      maxOutputTokens: config.maxOutputTokens,
       onRetry: (reason) => console.warn(`⚠ [${args.label}] ${reason} — nouvelle tentative dans 20 s.`),
-      onDowngrade: (reason) =>
-        console.warn(
-          `⚠ [${args.label}] ${target.model} n'a pas accepté « thinking: ${target.thinking} » (${reason}).\n` +
-            '  Relancé sans raisonnement explicite : ce sera moins fouillé.',
-        ),
+      onDowngrade: (event) => console.warn(`⚠ [${args.label}] ${describeDowngrade(event, target.model)}`),
     });
   } catch (error) {
     const reason = error instanceof LlmError ? error.message : String(error);
@@ -328,6 +329,7 @@ async function callModel(
 
   const stat: CallStat = {
     ...shape,
+    think: result.think,
     inputTokens: result.usage.inputTokens,
     cachedInputTokens: result.usage.cachedInputTokens,
     outputTokens: result.usage.outputTokens,
