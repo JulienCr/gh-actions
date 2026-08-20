@@ -301,3 +301,59 @@ La review n'a pas pu être produite : ${reason}
 
 <sub>Modèle visé : ${model}. Le check reste vert, cette review n'est pas bloquante.</sub>`;
 }
+
+/**
+ * Commentaire posté AVANT les appels au modèle.
+ *
+ * Il répond à une ambiguïté qui a coûté deux PR non relues : « pas de
+ * commentaire » ne distinguait pas *pas déclenché*, *encore en cours*, *clé
+ * absente* et *rien à dire*. Une annonce lève le deuxième cas, et le rapport
+ * final vient la remplacer en place (cf. `upsertComment` dans `gh.ts`) : la PR
+ * ne porte jamais deux commentaires d'Aristarque.
+ *
+ * Elle dit aussi ce qu'on attend, parce qu'une review de huit minutes qu'on
+ * croit instantanée se fait doubler par un auto-merge armé.
+ */
+const PENDING_HEADING = '⏳ **Review en cours.**';
+
+/**
+ * Ce commentaire est-il une annonce, et non un rapport ?
+ *
+ * Sert au nettoyage d'un run tué (`mode: abort`) : un job annulé dans les
+ * secondes qui suivent la pose du rapport ferait tourner ce nettoyage sur une
+ * review qui a abouti, et l'écraserait par un « interrompue » faux.
+ */
+export function isPendingComment(body: string): boolean {
+  return body.includes(PENDING_HEADING);
+}
+
+export function renderPendingComment(input: {
+  passes: string[];
+  runUrl?: string;
+}): string {
+  const lines = input.passes.map((label) => `- ${label}`).join('\n');
+  return `${MARKER}
+${HEADING}
+
+${PENDING_HEADING} ${input.passes.length} passe(s) partent maintenant, puis leur fusion ;
+comptez plusieurs minutes. Ce commentaire sera remplacé par le rapport.
+
+${lines}
+${input.runUrl ? `\n<sub>[Suivre le run](${input.runUrl})</sub>` : ''}`;
+}
+
+/**
+ * Commentaire posté quand le run a été tué sans repasser par sa fin.
+ *
+ * Un run annulé par `cancel-in-progress` ou tranché par `timeout-minutes` ne
+ * réécrit rien : sans ceci, l'annonce ci-dessus resterait « en cours » pour
+ * toujours, ce qui est exactement le silence trompeur qu'elle devait supprimer.
+ */
+export function renderAbortedComment(runUrl?: string): string {
+  return `${MARKER}
+${HEADING}
+
+⚠️ **Review interrompue** avant d'avoir rendu quoi que ce soit — run annulé, ou délai dépassé.
+Cette PR n'a pas été relue. Commenter « @aristarque review » pour la relancer.
+${runUrl ? `\n<sub>[Voir le run](${runUrl})</sub>` : ''}`;
+}

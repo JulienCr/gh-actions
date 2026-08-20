@@ -111,3 +111,119 @@ export async function resolveRepo(): Promise<string> {
   const stdout = await run('gh', ['repo', 'view', '--json', 'nameWithOwner']);
   return (JSON.parse(stdout) as { nameWithOwner: string }).nameWithOwner;
 }
+
+/**
+ * Identifiant du commentaire d'Aristarque sur cette PR, s'il y en a un.
+ *
+ * Le marqueur est en tête de corps depuis toujours (`MARKER` dans `render.ts`),
+ * mais personne ne le relisait : chaque run posait un commentaire neuf, si bien
+ * qu'une PR relue trois fois portait trois rapports dont deux périmés. On prend
+ * le DERNIER trouvé : si un run ancien en a laissé un que le nettoyage a raté,
+ * c'est le plus récent qui fait foi.
+ */
+export interface MarkedComment {
+  id: number;
+  body: string;
+}
+
+export async function findMarkedComment(
+  repo: string,
+  pr: number,
+  marker: string,
+): Promise<MarkedComment | null> {
+  const stdout = await run('gh', [
+    'api',
+    `repos/${repo}/issues/${pr}/comments`,
+    '--paginate',
+    '--jq',
+    // Une ligne de JSON compact par commentaire : le corps porte des retours à
+    // la ligne, donc `\(.id) \(.body)` en collerait plusieurs sur une seule.
+    `.[] | select(.body | startswith(${JSON.stringify(marker)})) | {id, body} | tojson`,
+  ]);
+  const found = stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .map((line) => JSON.parse(line) as MarkedComment);
+  return found.at(-1) ?? null;
+}
+
+/**
+ * Réécrit un commentaire existant.
+ *
+ * Le corps part en JSON par stdin plutôt qu'en `-f body=…` : un rapport de
+ * review fait plusieurs kilo-octets, contient des backticks et des retours à la
+ * ligne, et `-f` le passerait en argv. Même raison que `--body-file -` pour
+ * `gh pr comment` (cf. `runWithStdin` dans `exec.ts`).
+ */
+export async function updateComment(repo: string, id: number, body: string): Promise<void> {
+  await runWithStdin(
+    'gh',
+    ['api', '--method', 'PATCH', `repos/${repo}/issues/comments/${id}`, '--input', '-'],
+    JSON.stringify({ body }),
+  );
+}
+
+/**
+ * Pose le rapport là où il est déjà, ou le crée.
+ *
+ * C'est ce qui rend l'annonce possible : le commentaire « review en cours »
+ * posté au démarrage EST celui que le rapport final vient remplir. Un lecteur
+ * n'a donc jamais à se demander si l'absence de rapport veut dire « pas encore »
+ * ou « pas déclenché ».
+ *
+ * Une réécriture qui échoue (commentaire supprimé à la main entre-temps)
+ * retombe sur un commentaire neuf : perdre le rapport vaudrait moins que perdre
+ * l'unicité.
+ */
+export async function upsertComment(
+  repo: string,
+  pr: number,
+  marker: string,
+  body: string,
+): Promise<void> {
+  const existing = await findMarkedComment(repo, pr, marker).catch(() => null);
+  if (existing === null) {
+    await postComment(pr, body);
+    return;
+  }
+  try {
+    await updateComment(repo, existing.id, body);
+  } catch {
+    await postComment(pr, body);
+  }
+}
+
+/** Les états qu'accepte l'API des statuts de commit. */
+export type StatusState = 'pending' | 'success' | 'failure' | 'error';
+
+/**
+ * Pose un statut de commit sur la tête de la PR.
+ *
+ * C'est le seul mécanisme qui fait *attendre* une review. Un commentaire ne
+ * gate rien : `mergeStateStatus` ne le voit pas, et un auto-merge armé part
+ * par-dessus une review encore en cours. Un statut, lui, se déclare requis dans
+ * la protection de branche.
+ *
+ * Et il couvre le cas plus vicieux de l'événement qui n'arrive jamais : un
+ * statut requis mais ABSENT bloque aussi le merge, là où un commentaire absent
+ * ne se distingue pas d'une PR jugée irréprochable.
+ */
+export async function postStatus(
+  repo: string,
+  sha: string,
+  status: { state: StatusState; context: string; description: string; targetUrl?: string },
+): Promise<void> {
+  await runWithStdin(
+    'gh',
+    ['api', '--method', 'POST', `repos/${repo}/statuses/${sha}`, '--input', '-'],
+    JSON.stringify({
+      state: status.state,
+      context: status.context,
+      // L'API tronque au-delà de 140 caractères ; le faire ici garde le message
+      // lisible plutôt que coupé au milieu d'un mot par GitHub.
+      description: status.description.slice(0, 140),
+      ...(status.targetUrl ? { target_url: status.targetUrl } : {}),
+    }),
+  );
+}

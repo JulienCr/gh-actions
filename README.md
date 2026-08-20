@@ -56,6 +56,9 @@ permissions:
   # Pour réagir 👀 au commentaire déclencheur. Un commentaire de conversation de
   # PR est un commentaire d'issue au sens de l'API : « pull-requests » ne suffit pas.
   issues: write
+  # Pour le statut de commit « aristarque/review », le seul mécanisme qui fasse
+  # attendre la review. Voir « Faire attendre la review ».
+  statuses: write
 
 jobs:
   review:
@@ -125,6 +128,24 @@ jobs:
           skip: |
             src/generated/**
             deploy/**
+          # Voir « Faire attendre la review ». Sans ceci, un auto-merge armé
+          # part par-dessus une review encore en cours.
+          status-check: true
+
+      # Un run tué par « cancel-in-progress » ou par « timeout-minutes » ne
+      # repasse pas par la fin du programme : sans cette étape, son annonce
+      # resterait « review en cours » et son statut « pending » pour toujours,
+      # et ce pending bloquerait le merge sans fin. En « continue-on-error »
+      # pour la même raison que l'accusé de réception : un nettoyage qui échoue
+      # ne doit pas emporter ce qu'il nettoie.
+      - name: Signaler une review interrompue
+        if: always() && (cancelled() || failure())
+        continue-on-error: true
+        uses: JulienCr/gh-actions/pr-review@v3
+        with:
+          pr: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+          mode: abort
+          status-check: true
 ```
 
 Aucune dépendance à installer : l'action n'importe que des builtins Node et pilote GitHub par le
@@ -203,6 +224,10 @@ Seul `pr` est obligatoire.
 | --- | --- | --- |
 | `pr` | — | Numéro de la PR à relire. |
 | `enable` | `true` | `false` : l'action sort sans rien lire ni appeler. Coupe la review sans démonter le workflow. |
+| `announce` | `true` | Poste « review en cours » **avant** les appels, que le rapport remplace en place. `false` : rien avant le rapport. |
+| `status-check` | `false` | Pose le statut de commit qui fait attendre la review. Demande `statuses: write`. Voir ci-dessous. |
+| `status-context` | `aristarque/review` | Nom du statut, à recopier tel quel dans la protection de branche. |
+| `mode` | `review` | `abort` : ne rien lire ni appeler, seulement conclure ce qu'un run tué a laissé en suspens. |
 | `ollama-api-key` | `''` | Clé Ollama Cloud. Vide : review ignorée sans bruit, job vert. |
 | `deepseek-api-key` | `''` | Clé DeepSeek. Fait passer le [mix](#le-mix-par-passe) par l'API directe, qui **ajoute un cache de préfixe**. Vide : le même modèle, servi par Ollama. |
 | `openai-api-key` | `''` | Clé du provider `openai` générique. Inutile sans `openai-base-url`. |
@@ -231,6 +256,60 @@ Seul `pr` est obligatoire.
 | `timeout-minutes` | `15` | Délai d'**une** requête. Le mur du job vaut « le plus gros groupe séquencé, plus la fusion » ; voir ci-dessous. |
 | `max-output-tokens` | *(vide)* | Plafond de tokens de **sortie** d'une requête ; `budget-chars` borne l'entrée. Vide : le plafond du modèle. Le poser borne ce que coûte un appel qui part en boucle de raisonnement. |
 | `dry-run` | `false` | `true` : la review part dans les logs, rien n'est posté. |
+
+### Faire attendre la review
+
+Un commentaire ne bloque rien. `mergeStateStatus` ne le voit pas, et un auto-merge armé part
+par-dessus une review encore en cours : mesuré sur `avolo-shorts`, une PR mergée dix minutes après
+le lancement d'une review qui en demandait quinze, et dont le run tournait encore sur une PR déjà
+fermée.
+
+Poser `status-check: true` fait poser à l'action un **statut de commit** sur la tête de la PR :
+
+| Moment | État | Ce que ça dit |
+| --- | --- | --- |
+| au démarrage, avant tout appel | `pending` | une review est prévue, et elle n'est pas finie |
+| rapport posté | `success` | la PR a été relue |
+| aucune passe lançable, ou aucune qui aboutit | `failure` | la PR n'a **pas** été relue |
+| run annulé ou délai dépassé (étape `mode: abort`) | `error` | la review a été interrompue |
+
+**Le statut ne juge pas le contenu.** Un rapport plein de « Bloquant » sort en `success` : il
+atteste qu'elle a été lue, pas qu'elle est propre. La doctrine tient — une review est un avis, pas
+un gate — et ce qu'on gate est l'existence de la lecture, pas son verdict.
+
+Il reste à le déclarer requis, côté dépôt, une fois pour toutes :
+
+```
+gh api -X PUT repos/<owner>/<repo>/branches/main/protection/required_status_checks \
+  -f 'checks[][context]=aristarque/review'
+```
+
+Ce qui fait la valeur de ce mécanisme est le cas qu'un check ordinaire ne couvre pas : **un statut
+requis mais absent bloque aussi le merge.** Toujours sur `avolo-shorts`, une PR passée en « prêt »
+n'a produit *aucun run* — l'événement `ready_for_review` figure bien dans la timeline, le workflow
+n'a jamais démarré. Un check requis y aurait bloqué le merge ; un commentaire absent, lui, ne se
+distingue pas d'une PR jugée irréprochable. C'est le pendant du piège documenté plus haut : une PR
+en conflit n'émet aucun événement `pull_request`, donc aucune review, donc aucun signal.
+
+⚠️ **N'activer `status-check` que là où la clé est posée.** Sans clé, l'action sort avant de rien
+poser (c'est le silence promis aux PR venues d'un fork, qui n'ont pas les secrets) : le check reste
+absent, et le merge reste bloqué sans recours. Sur un dépôt qui reçoit des contributions
+extérieures, laisser `false`.
+
+### Dire qu'une review arrive
+
+`announce` est allumée par défaut. Avant le premier appel au modèle, Aristarque pose un commentaire
+« review en cours » qui nomme les passes qui partent et lie le run ; le rapport final **remplace ce
+commentaire en place**, par son marqueur `<!-- aristarque -->`.
+
+Ça lève une ambiguïté qui coûtait cher. Une PR sans commentaire ne distinguait pas quatre choses :
+la review n'a pas été déclenchée, elle tourne encore, la clé est absente (l'action est alors
+*totalement silencieuse*), ou il n'y avait rien à relire. Une annonce répond du deuxième cas, et le
+statut ci-dessus des trois autres.
+
+Effet de bord voulu : une PR relue plusieurs fois — `@aristarque review` après corrections — ne
+porte plus qu'**un seul** commentaire, le dernier. Les rapports périmés ne s'empilent plus sous le
+courant.
 
 ### Le mix par passe
 

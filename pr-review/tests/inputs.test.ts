@@ -463,3 +463,48 @@ describe('resolveConfig · ce que la review a trouvé', () => {
     expect(resolve({ 'INPUT_OPENAI-PREFIX-CACHE': 'true' }).openaiPrefixCache).toBe(true);
   });
 });
+
+/**
+ * Ces quatre inputs existent parce que deux PR ont été mergées sans relecture.
+ * Leurs défauts portent la décision : l'annonce est allumée pour tout le monde,
+ * le statut ne l'est que sur demande, parce qu'il bloque un merge.
+ */
+describe('l’annonce et le statut de commit', () => {
+  it('annonce par défaut, puisqu’un silence se lit comme un feu vert', () => {
+    expect(resolve().announce).toBe(true);
+    expect(resolve({ INPUT_ANNOUNCE: 'false' }).announce).toBe(false);
+    expect(resolve({ INPUT_ANNOUNCE: 'off' }).announce).toBe(false);
+  });
+
+  /** Éteint par défaut : un check requis absent bloque un merge sans recours. */
+  it('ne pose le statut que sur demande explicite', () => {
+    expect(resolve().statusCheck).toBe(false);
+    expect(resolve({ 'INPUT_STATUS-CHECK': 'true' }).statusCheck).toBe(true);
+  });
+
+  it('nomme le statut « aristarque/review », sauf indication contraire', () => {
+    expect(resolve().statusContext).toBe('aristarque/review');
+    expect(resolve({ 'INPUT_STATUS-CONTEXT': 'ci/review' }).statusContext).toBe('ci/review');
+  });
+
+  /** Tout ce qui n'est pas « abort » est une review : un mode fautif ne doit pas taire la review. */
+  it('ne connaît que « abort » comme mode second', () => {
+    expect(resolve().mode).toBe('review');
+    expect(resolve({ INPUT_MODE: 'abort' }).mode).toBe('abort');
+    expect(resolve({ INPUT_MODE: 'ABORT' }).mode).toBe('abort');
+    expect(resolve({ INPUT_MODE: 'n’importe quoi' }).mode).toBe('review');
+  });
+
+  /** Dérivée du runner, pas d'un input : le dépôt n'a pas à recopier trois variables. */
+  it('reconstitue l’URL du run depuis l’environnement Actions', () => {
+    expect(
+      resolve({
+        GITHUB_SERVER_URL: 'https://github.com',
+        GITHUB_REPOSITORY: 'o/r',
+        GITHUB_RUN_ID: '99',
+      }).runUrl,
+    ).toBe('https://github.com/o/r/actions/runs/99');
+    // Une variable manquante donne une URL fausse : mieux vaut pas d'URL.
+    expect(resolve({ GITHUB_SERVER_URL: 'https://github.com', GITHUB_REPOSITORY: 'o/r' }).runUrl).toBe('');
+  });
+});

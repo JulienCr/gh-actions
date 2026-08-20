@@ -23,7 +23,17 @@ import { join } from 'node:path';
 
 import { assembleContext, contextFor, type AssembledContext, type WindowOptions } from './context';
 import { run } from './exec';
-import { currentHeadSha, fetchPrDiff, fetchPrMeta, postComment, resolveRepo, type PrMeta } from './gh';
+import {
+  currentHeadSha,
+  fetchPrDiff,
+  fetchPrMeta,
+  findMarkedComment,
+  postStatus,
+  resolveRepo,
+  upsertComment,
+  type PrMeta,
+  type StatusState,
+} from './gh';
 import { compileMatcher } from './globs';
 import {
   isEnabled,
@@ -54,7 +64,16 @@ import {
   selectPasses,
   type Pass,
 } from './passes';
-import { extractReview, renderComment, renderFailureComment, renderPartialComment } from './render';
+import {
+  extractReview,
+  MARKER,
+  renderAbortedComment,
+  isPendingComment,
+  renderComment,
+  renderFailureComment,
+  renderPartialComment,
+  renderPendingComment,
+} from './render';
 import {
   describeCall,
   describeTargets,
@@ -640,6 +659,94 @@ function usableTargets(
   return { run: runnable, skipped };
 }
 
+/**
+ * Ce qu'Aristarque laisse sur la PR : un commentaire unique et un statut.
+ *
+ * Regroupés ici parce qu'ils vont toujours par deux — un rapport sans statut
+ * laisse partir un auto-merge, un statut sans rapport ne dit pas quoi corriger —
+ * et parce que chaque sortie de `review()` doit conclure les deux. Un chemin qui
+ * oublie de conclure laisse un « en cours » éternel, qui bloquerait le merge
+ * pour de mauvaises raisons.
+ */
+interface Reporter {
+  /** Le commentaire d'attente, posté avant le premier appel au modèle. */
+  announce(passes: string[]): Promise<void>;
+  /** Le mot de la fin : le commentaire s'il y en a un, et l'état du statut. */
+  settle(state: StatusState, description: string, body?: string): Promise<void>;
+}
+
+function reporterFor(config: Config, repo: string, headSha: string): Reporter {
+  // `dry-run` et `--count-only` ne touchent à rien : ce sont des gestes de
+  // réglage, faits depuis un poste, sur une PR qui appartient à quelqu'un.
+  const mute = config.dryRun || config.countOnly;
+
+  /** Un statut posé de travers ne doit pas emporter la review avec lui. */
+  const status = async (state: StatusState, description: string): Promise<void> => {
+    if (mute || !config.statusCheck) return;
+    try {
+      await postStatus(repo, headSha, {
+        state,
+        context: config.statusContext,
+        description,
+        targetUrl: config.runUrl || undefined,
+      });
+      console.log(`Statut « ${config.statusContext} » → ${state}.`);
+    } catch (error) {
+      console.warn(`⚠ Statut « ${config.statusContext} » non posé : ${String(error)}`);
+    }
+  };
+
+  return {
+    async announce(passes) {
+      if (mute || !config.announce) return;
+      try {
+        await upsertComment(repo, config.pr, MARKER, renderPendingComment({ passes, runUrl: config.runUrl }));
+        console.log(`Annonce posée sur la PR #${config.pr}.`);
+      } catch (error) {
+        // Cosmétique au sens strict : l'annonce sert à lever une ambiguïté, pas
+        // à produire la review. La perdre ne justifie pas de perdre la review.
+        console.warn(`⚠ Annonce non posée : ${String(error)}`);
+      }
+    },
+    async settle(state, description, body) {
+      if (body !== undefined && !mute) {
+        await upsertComment(repo, config.pr, MARKER, body);
+      }
+      await status(state, description);
+    },
+  };
+}
+
+/**
+ * Conclut ce qu'un run tué a laissé en suspens (`mode: abort`).
+ *
+ * Un run annulé par `cancel-in-progress` ou tranché par `timeout-minutes` ne
+ * repasse jamais par la fin de `review()` : son annonce resterait « en cours »
+ * et son statut « pending » pour toujours. Le second bloquerait le merge sans
+ * fin, ce qui transformerait un garde-fou en panne.
+ */
+async function abort(config: Config, reason = 'run annulé ou délai dépassé'): Promise<void> {
+  const repo = await resolveRepo();
+  const meta = await fetchPrMeta(config.pr);
+  const report = reporterFor(config, repo, meta.headSha);
+
+  // Un job peut être annulé dans les secondes qui suivent la pose du rapport :
+  // l'étape de nettoyage tourne alors sur une review qui a abouti, et
+  // l'écraserait. On ne remplace donc QUE l'annonce, reconnaissable à son
+  // propre rendu. Le statut, lui, se conclut dans tous les cas — un « pending »
+  // laissé derrière bloquerait le merge pour toujours.
+  const existing = await findMarkedComment(repo, config.pr, MARKER).catch(() => null);
+  const pending = existing === null || isPendingComment(existing.body);
+  if (!pending) {
+    console.log('Le rapport est déjà posé : seul le statut est conclu.');
+    await report.settle('success', 'review rendue');
+    return;
+  }
+
+  await report.settle('error', `review interrompue (${reason})`, renderAbortedComment(config.runUrl));
+  console.log(`Review de la PR #${config.pr} déclarée interrompue.`);
+}
+
 async function review(config: Config): Promise<void> {
   const root = repoRoot();
 
@@ -650,6 +757,13 @@ async function review(config: Config): Promise<void> {
     fetchPrDiff(config.pr),
   ]);
   const detached = await warnOnDetachedContext(meta.headSha);
+
+  // Le « pending » part AVANT tout le reste, et pas au moment de lancer les
+  // passes : entre les deux il y a la lecture de la PR, l'assemblage du
+  // contexte et quelques appels réseau, soit largement de quoi laisser un
+  // auto-merge armé passer devant.
+  const report = reporterFor(config, repo, meta.headSha);
+  await report.settle('pending', 'review en cours');
 
   const isSkipped = compileMatcher(config.skip);
   // Un diff périmé donne des plages périmées, donc des fenêtres qui montrent les
@@ -691,6 +805,10 @@ async function review(config: Config): Promise<void> {
 
   if (context.diff.trim() === '') {
     console.log('Aucun fichier relisible dans cette PR (générés, binaires ou lockfiles seulement).');
+    // Pas de commentaire : il n'y a rien à dire, et le dire encombrerait toutes
+    // les PR de maintenance. Mais le statut, lui, doit conclure — un « pending »
+    // laissé là bloquerait un merge légitime.
+    await report.settle('success', 'aucun fichier relisible');
     return;
   }
 
@@ -755,9 +873,11 @@ async function review(config: Config): Promise<void> {
     // et la taire laisserait une PR non relue passer pour une PR irréprochable.
     const reason = selection.skipped.map(({ label, reason: why }) => `« ${label} » : ${why}`).join(' ; ');
     console.error(`Échec de la review : aucune passe lançable (${reason}).`);
-    if (!config.dryRun) await postComment(config.pr, renderFailureComment(reason, config.model));
+    await report.settle('failure', `aucune passe lançable : ${reason}`, renderFailureComment(reason, config.model));
     return;
   }
+
+  await report.announce(plan.map(({ pass }) => pass.label));
 
   const started = Date.now();
   const run: Run = { calls: [], failures: [] };
@@ -768,9 +888,11 @@ async function review(config: Config): Promise<void> {
   if (outcomes.length === 0) {
     const reason = run.failures[0] ?? 'raison inconnue';
     console.error(`Échec de la review : aucune passe n'a abouti (${reason}).`);
-    if (!config.dryRun) {
-      await postComment(config.pr, renderFailureComment(reason, targets.join(', ') || config.model));
-    }
+    await report.settle(
+      'failure',
+      `aucune passe n'a abouti : ${reason}`,
+      renderFailureComment(reason, targets.join(', ') || config.model),
+    );
     return;
   }
 
@@ -874,7 +996,11 @@ async function review(config: Config): Promise<void> {
     return;
   }
 
-  await postComment(config.pr, comment);
+  await report.settle(
+    'success',
+    merged === null ? 'review rendue, sans fusion' : 'review rendue',
+    comment,
+  );
   console.log(`Review postée sur la PR #${config.pr}.`);
 }
 
@@ -938,6 +1064,14 @@ async function main(): Promise<void> {
   // nom de la variable qu'attend un CLI qu'il n'appelle pas lui-même.
   if (config.githubToken) process.env.GH_TOKEN = config.githubToken;
 
+  // Avant la garde des clés : conclure une annonce laissée en suspens ne
+  // demande aucun provider, et l'exiger rendrait le nettoyage impossible
+  // précisément quand il sert — un run tué avant d'avoir rien appelé.
+  if (config.mode === 'abort') {
+    await abort(config);
+    return;
+  }
+
   // `--count-only` n'appelle rien : exiger une clé pour compter des caractères
   // interdirait de mesurer depuis un poste sans 1Password, ou depuis la CI.
   if (!config.countOnly) {
@@ -957,7 +1091,17 @@ async function main(): Promise<void> {
     }
   }
 
-  await review(config);
+  try {
+    await review(config);
+  } catch (error) {
+    // Le programme sort en 0 quoi qu'il arrive (cf. l'en-tête), mais une panne
+    // inattendue laisserait derrière elle le « pending » posé au démarrage — et
+    // un pending requis bloque le merge pour toujours. L'étape « abort » du
+    // workflow ne rattrape pas ce cas : elle ne tourne que sur job annulé ou en
+    // échec, et celui-ci sort vert.
+    await abort(config, 'panne inattendue').catch(() => {});
+    throw error;
+  }
 }
 
 main().catch((error: unknown) => {

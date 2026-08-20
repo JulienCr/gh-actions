@@ -22,6 +22,51 @@ inputs:
     required: false
     default: 'true'
 
+  announce:
+    description: >-
+      Poster un commentaire « review en cours » avant le premier appel au
+      modèle, que le rapport final vient remplacer en place. Deux PR ont été
+      mergées sans relecture parce qu'une PR sans commentaire ne distinguait pas
+      « encore en cours » de « jamais déclenché » : l'annonce lève le premier
+      cas. Effet de bord voulu, une PR relue plusieurs fois ne porte plus qu'un
+      seul commentaire, le dernier.
+    required: false
+    default: 'true'
+
+  status-check:
+    description: >-
+      Poser un statut de commit (voir « status-context ») sur la tête de la PR :
+      pending au démarrage, success quand la review est rendue, failure quand
+      elle n'a pas pu l'être. C'est le SEUL mécanisme qui fait attendre la
+      review : un commentaire ne gate rien, et un auto-merge armé part par-dessus
+      une review encore en cours. Le statut se déclare ensuite requis dans la
+      protection de branche — et un statut requis mais absent bloque aussi, ce
+      qui rattrape l'événement « ready_for_review » que GitHub n'a pas émis.
+      Demande « statuses: write » dans les permissions du job.
+      ⚠️ Ne l'activer que sur un dépôt où la clé du provider est posée : sans
+      clé, l'action sort avant de rien poser, donc le check reste absent et le
+      merge reste bloqué. Une PR venue d'un fork, qui n'a pas les secrets, est
+      dans ce cas.
+    required: false
+    default: 'false'
+
+  status-context:
+    description: >-
+      Nom du statut de commit. C'est cette chaîne exacte qu'il faut écrire dans
+      la protection de branche pour rendre la review bloquante.
+    required: false
+    default: 'aristarque/review'
+
+  mode:
+    description: >-
+      « review » : le travail normal. « abort » : ne lire ni PR ni modèle, et
+      seulement conclure ce qu'un run tué a laissé en suspens — l'annonce repasse
+      en « review interrompue », le statut en error. À brancher dans une étape
+      « if: always() && (cancelled() || failure()) », sinon un run annulé par
+      cancel-in-progress laisse un pending qui bloque le merge pour toujours.
+    required: false
+    default: 'review'
+
   ollama-api-key:
     description: >-
       Clé Ollama Cloud. Vide (PR venue d'un fork, secret non configuré) : la

@@ -377,6 +377,52 @@ async function resolveRepo() {
   const stdout = await run("gh", ["repo", "view", "--json", "nameWithOwner"]);
   return JSON.parse(stdout).nameWithOwner;
 }
+async function findMarkedComment(repo, pr, marker) {
+  const stdout = await run("gh", [
+    "api",
+    `repos/${repo}/issues/${pr}/comments`,
+    "--paginate",
+    "--jq",
+    // Une ligne de JSON compact par commentaire : le corps porte des retours à
+    // la ligne, donc `\(.id) \(.body)` en collerait plusieurs sur une seule.
+    `.[] | select(.body | startswith(${JSON.stringify(marker)})) | {id, body} | tojson`
+  ]);
+  const found = stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "").map((line) => JSON.parse(line));
+  return found.at(-1) ?? null;
+}
+async function updateComment(repo, id, body) {
+  await runWithStdin(
+    "gh",
+    ["api", "--method", "PATCH", `repos/${repo}/issues/comments/${id}`, "--input", "-"],
+    JSON.stringify({ body })
+  );
+}
+async function upsertComment(repo, pr, marker, body) {
+  const existing = await findMarkedComment(repo, pr, marker).catch(() => null);
+  if (existing === null) {
+    await postComment(pr, body);
+    return;
+  }
+  try {
+    await updateComment(repo, existing.id, body);
+  } catch {
+    await postComment(pr, body);
+  }
+}
+async function postStatus(repo, sha, status) {
+  await runWithStdin(
+    "gh",
+    ["api", "--method", "POST", `repos/${repo}/statuses/${sha}`, "--input", "-"],
+    JSON.stringify({
+      state: status.state,
+      context: status.context,
+      // L'API tronque au-delà de 140 caractères ; le faire ici garde le message
+      // lisible plutôt que coupé au milieu d'un mot par GitHub.
+      description: status.description.slice(0, 140),
+      ...status.targetUrl ? { target_url: status.targetUrl } : {}
+    })
+  );
+}
 
 // pr-review/src/globs.ts
 var SPECIAL = /[.+^${}()|[\]\\]/g;
@@ -1376,6 +1422,14 @@ var DEFAULTS = {
   importsBudgetChars: 3e5,
   timeoutMinutes: 15,
   /**
+   * Nom du statut de commit.
+   *
+   * La barre oblique est celle des statuts d'intégration tierce, et elle range
+   * le check à côté de ses pareils plutôt que parmi les jobs du dépôt. C'est
+   * cette chaîne exacte qu'il faudra écrire dans la protection de branche.
+   */
+  statusContext: "aristarque/review",
+  /**
    * Plafond de tokens de sortie. `0` : rien n'est envoyé, le modèle garde le sien.
    *
    * Pas de valeur livrée, parce qu'aucune ne vaut pour tous les modèles : ce
@@ -1475,6 +1529,15 @@ function readEffort(env, warn) {
 }
 function readBoolean(env, name) {
   return /^(true|1|yes)$/i.test(readInput(env, name));
+}
+function readBooleanDefaultTrue(env, name) {
+  return !/^(false|0|no|off)$/i.test(readInput(env, name));
+}
+function runUrlFrom(env) {
+  const server = env.GITHUB_SERVER_URL?.trim();
+  const repo = env.GITHUB_REPOSITORY?.trim();
+  const id = env.GITHUB_RUN_ID?.trim();
+  return server && repo && id ? `${server}/${repo}/actions/runs/${id}` : "";
 }
 function isEnabled(env) {
   return !/^(false|0|no|off)$/i.test(readInput(env, "enable"));
@@ -1652,7 +1715,12 @@ function resolveConfig({ argv, env, warn = () => {
     projectSummary: readInput(env, "project-summary"),
     countOnly: countOnly2,
     variant,
-    githubToken: readInput(env, "github-token") || env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || ""
+    githubToken: readInput(env, "github-token") || env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || "",
+    announce: readBooleanDefaultTrue(env, "announce"),
+    statusCheck: readBoolean(env, "status-check"),
+    statusContext: readInput(env, "status-context") || DEFAULTS.statusContext,
+    mode: readInput(env, "mode").toLowerCase() === "abort" ? "abort" : "review",
+    runUrl: runUrlFrom(env)
   };
 }
 
@@ -1866,6 +1934,31 @@ ${HEADING}
 La review n'a pas pu \xEAtre produite : ${reason}
 
 <sub>Mod\xE8le vis\xE9 : ${model}. Le check reste vert, cette review n'est pas bloquante.</sub>`;
+}
+var PENDING_HEADING = "\u23F3 **Review en cours.**";
+function isPendingComment(body) {
+  return body.includes(PENDING_HEADING);
+}
+function renderPendingComment(input) {
+  const lines = input.passes.map((label) => `- ${label}`).join("\n");
+  return `${MARKER}
+${HEADING}
+
+${PENDING_HEADING} ${input.passes.length} passe(s) partent maintenant, puis leur fusion ;
+comptez plusieurs minutes. Ce commentaire sera remplac\xE9 par le rapport.
+
+${lines}
+${input.runUrl ? `
+<sub>[Suivre le run](${input.runUrl})</sub>` : ""}`;
+}
+function renderAbortedComment(runUrl) {
+  return `${MARKER}
+${HEADING}
+
+\u26A0\uFE0F **Review interrompue** avant d'avoir rendu quoi que ce soit \u2014 run annul\xE9, ou d\xE9lai d\xE9pass\xE9.
+Cette PR n'a pas \xE9t\xE9 relue. Commenter \xAB @aristarque review \xBB pour la relancer.
+${runUrl ? `
+<sub>[Voir le run](${runUrl})</sub>` : ""}`;
 }
 
 // pr-review/src/index.ts
@@ -2191,6 +2284,54 @@ function usableTargets(config, passes, warn) {
   }
   return { run: runnable, skipped };
 }
+function reporterFor(config, repo, headSha) {
+  const mute = config.dryRun || config.countOnly;
+  const status = async (state, description) => {
+    if (mute || !config.statusCheck) return;
+    try {
+      await postStatus(repo, headSha, {
+        state,
+        context: config.statusContext,
+        description,
+        targetUrl: config.runUrl || void 0
+      });
+      console.log(`Statut \xAB ${config.statusContext} \xBB \u2192 ${state}.`);
+    } catch (error) {
+      console.warn(`\u26A0 Statut \xAB ${config.statusContext} \xBB non pos\xE9 : ${String(error)}`);
+    }
+  };
+  return {
+    async announce(passes) {
+      if (mute || !config.announce) return;
+      try {
+        await upsertComment(repo, config.pr, MARKER, renderPendingComment({ passes, runUrl: config.runUrl }));
+        console.log(`Annonce pos\xE9e sur la PR #${config.pr}.`);
+      } catch (error) {
+        console.warn(`\u26A0 Annonce non pos\xE9e : ${String(error)}`);
+      }
+    },
+    async settle(state, description, body) {
+      if (body !== void 0 && !mute) {
+        await upsertComment(repo, config.pr, MARKER, body);
+      }
+      await status(state, description);
+    }
+  };
+}
+async function abort(config, reason = "run annul\xE9 ou d\xE9lai d\xE9pass\xE9") {
+  const repo = await resolveRepo();
+  const meta = await fetchPrMeta(config.pr);
+  const report = reporterFor(config, repo, meta.headSha);
+  const existing = await findMarkedComment(repo, config.pr, MARKER).catch(() => null);
+  const pending = existing === null || isPendingComment(existing.body);
+  if (!pending) {
+    console.log("Le rapport est d\xE9j\xE0 pos\xE9 : seul le statut est conclu.");
+    await report.settle("success", "review rendue");
+    return;
+  }
+  await report.settle("error", `review interrompue (${reason})`, renderAbortedComment(config.runUrl));
+  console.log(`Review de la PR #${config.pr} d\xE9clar\xE9e interrompue.`);
+}
 async function review(config) {
   const root = repoRoot();
   console.log(`Lecture de la PR #${config.pr}\u2026`);
@@ -2200,6 +2341,8 @@ async function review(config) {
     fetchPrDiff(config.pr)
   ]);
   const detached = await warnOnDetachedContext(meta.headSha);
+  const report = reporterFor(config, repo, meta.headSha);
+  await report.settle("pending", "review en cours");
   const isSkipped = compileMatcher(config.skip);
   if (detached && config.windowMinLines > 0) {
     console.warn("  Fen\xEAtrage d\xE9sactiv\xE9 pour cette ex\xE9cution : les plages du diff ne seraient pas fiables.");
@@ -2233,6 +2376,7 @@ async function review(config) {
   });
   if (context.diff.trim() === "") {
     console.log("Aucun fichier relisible dans cette PR (g\xE9n\xE9r\xE9s, binaires ou lockfiles seulement).");
+    await report.settle("success", "aucun fichier relisible");
     return;
   }
   const promptOptions = {
@@ -2283,9 +2427,10 @@ async function review(config) {
   if (plan.length === 0) {
     const reason = selection.skipped.map(({ label, reason: why }) => `\xAB ${label} \xBB : ${why}`).join(" ; ");
     console.error(`\xC9chec de la review : aucune passe lan\xE7able (${reason}).`);
-    if (!config.dryRun) await postComment(config.pr, renderFailureComment(reason, config.model));
+    await report.settle("failure", `aucune passe lan\xE7able : ${reason}`, renderFailureComment(reason, config.model));
     return;
   }
+  await report.announce(plan.map(({ pass }) => pass.label));
   const started = Date.now();
   const run2 = { calls: [], failures: [] };
   const outcomes = await runPasses(config, run2, plan);
@@ -2293,9 +2438,11 @@ async function review(config) {
   if (outcomes.length === 0) {
     const reason = run2.failures[0] ?? "raison inconnue";
     console.error(`\xC9chec de la review : aucune passe n'a abouti (${reason}).`);
-    if (!config.dryRun) {
-      await postComment(config.pr, renderFailureComment(reason, targets.join(", ") || config.model));
-    }
+    await report.settle(
+      "failure",
+      `aucune passe n'a abouti : ${reason}`,
+      renderFailureComment(reason, targets.join(", ") || config.model)
+    );
     return;
   }
   const mergeTarget = resolveTarget(
@@ -2374,7 +2521,11 @@ async function review(config) {
     console.log(comment);
     return;
   }
-  await postComment(config.pr, comment);
+  await report.settle(
+    "success",
+    merged === null ? "review rendue, sans fusion" : "review rendue",
+    comment
+  );
   console.log(`Review post\xE9e sur la PR #${config.pr}.`);
 }
 function knownPaths(meta, context) {
@@ -2406,6 +2557,10 @@ async function main() {
     warn: (message) => console.warn(`\u26A0 ${message}`)
   });
   if (config.githubToken) process.env.GH_TOKEN = config.githubToken;
+  if (config.mode === "abort") {
+    await abort(config);
+    return;
+  }
   if (!config.countOnly) {
     const wanted = new Set(Object.values(config.passConfigs).map((target) => target.provider));
     wanted.add(config.provider);
@@ -2414,7 +2569,13 @@ async function main() {
       return;
     }
   }
-  await review(config);
+  try {
+    await review(config);
+  } catch (error) {
+    await abort(config, "panne inattendue").catch(() => {
+    });
+    throw error;
+  }
 }
 main().catch((error) => {
   console.error(`Review interrompue : ${error instanceof Error ? error.message : String(error)}`);

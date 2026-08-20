@@ -19,6 +19,8 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  # Pour le statut « aristarque/review », qui fait attendre la review.
+  statuses: write
 
 concurrency:
   group: pr-review-${{ github.event.pull_request.number || inputs.pr }}
@@ -54,3 +56,16 @@ jobs:
           deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
           skip: |
             */dist/**
+          # Le dépôt éprouve son propre garde-fou : le statut n'est pas requis
+          # ici (une PR de ce dépôt n'a pas d'auto-merge armé), mais le poser
+          # vérifie à chaque PR qu'il se pose et qu'il se conclut.
+          status-check: true
+
+      - name: Signaler une review interrompue
+        if: always() && (cancelled() || failure())
+        continue-on-error: true
+        uses: ./pr-review
+        with:
+          pr: ${{ github.event.pull_request.number || inputs.pr }}
+          mode: abort
+          status-check: true

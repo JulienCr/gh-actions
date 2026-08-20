@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
+  isPendingComment,
   MARKER,
+  renderAbortedComment,
+  renderPendingComment,
   extractReview,
   linkifyPaths,
   renderComment,
@@ -302,5 +305,51 @@ describe('le pied de page rapporte le cache et le coût', () => {
   it('n’annonce pas « 0 Ko de raisonnement »', () => {
     expect(footer({ thinkingChars: 19 })).not.toContain('Ko de raisonnement');
     expect(footer({ thinkingChars: 40_960 })).toContain('40 Ko de raisonnement');
+  });
+});
+
+/**
+ * L'annonce et le rapport partagent le marqueur, et c'est tout l'intérêt : le
+ * second remplace la première en place, si bien qu'une PR ne porte jamais deux
+ * commentaires d'Aristarque.
+ */
+describe('l’annonce et l’interruption', () => {
+  it('porte le marqueur, les passes prévues et le lien du run', () => {
+    const comment = renderPendingComment({
+      passes: ['régression fonctionnelle', 'doctrine du dépôt'],
+      runUrl: 'https://example.test/run/1',
+    });
+    expect(comment.startsWith(MARKER)).toBe(true);
+    expect(comment).toContain('Review en cours');
+    expect(comment).toContain('- régression fonctionnelle');
+    expect(comment).toContain('https://example.test/run/1');
+  });
+
+  /** En local il n'y a pas de run : l'annonce s'en passe plutôt que de mentir. */
+  it('se passe du lien quand il n’y en a pas', () => {
+    const comment = renderPendingComment({ passes: ['doctrine du dépôt'] });
+    expect(comment).not.toContain('Suivre le run');
+  });
+
+  /** Sans elle, un run tué laisserait un « en cours » qui ne finit jamais. */
+  it('dit qu’une review interrompue n’a pas relu la PR', () => {
+    const comment = renderAbortedComment('https://example.test/run/2');
+    expect(comment.startsWith(MARKER)).toBe(true);
+    expect(comment).toContain('interrompue');
+    expect(comment).toContain("n'a pas été relue");
+    expect(comment).toContain('@aristarque review');
+  });
+});
+
+/**
+ * Le nettoyage d'un run tué doit savoir ce qu'il écrase. Un job annulé dans les
+ * secondes qui suivent la pose du rapport ferait sinon disparaître une review
+ * qui a abouti, sous un « interrompue » faux.
+ */
+describe('reconnaître une annonce', () => {
+  it('distingue l’annonce du rapport et de l’échec', () => {
+    expect(isPendingComment(renderPendingComment({ passes: ['doctrine du dépôt'] }))).toBe(true);
+    expect(isPendingComment(renderFailureComment('quota épuisé', 'glm-5.2:cloud'))).toBe(false);
+    expect(isPendingComment(renderAbortedComment())).toBe(false);
   });
 });

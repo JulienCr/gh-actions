@@ -90,6 +90,14 @@ export const DEFAULTS = {
   importsBudgetChars: 300_000,
   timeoutMinutes: 15,
   /**
+   * Nom du statut de commit.
+   *
+   * La barre oblique est celle des statuts d'intégration tierce, et elle range
+   * le check à côté de ses pareils plutôt que parmi les jobs du dépôt. C'est
+   * cette chaîne exacte qu'il faudra écrire dans la protection de branche.
+   */
+  statusContext: 'aristarque/review',
+  /**
    * Plafond de tokens de sortie. `0` : rien n'est envoyé, le modèle garde le sien.
    *
    * Pas de valeur livrée, parce qu'aucune ne vaut pour tous les modèles : ce
@@ -277,6 +285,25 @@ export interface Config {
   /** Cadrage libre du projet, quand la doctrine n'en donne pas. */
   projectSummary: string;
   githubToken: string;
+  /**
+   * Poster une annonce « review en cours » avant les appels au modèle.
+   *
+   * Ce n'est pas du confort : sans elle, une PR sans commentaire ne distingue
+   * pas une review en cours d'une review jamais déclenchée, et c'est ce qui a
+   * laissé merger des PR non relues.
+   */
+  announce: boolean;
+  /** Poser un statut de commit « pending » puis conclusif. Voir `statusContext`. */
+  statusCheck: boolean;
+  /** Nom du statut, tel qu'il faudra l'écrire dans la protection de branche. */
+  statusContext: string;
+  /**
+   * `review` : le travail normal. `abort` : ne rien lire ni appeler, seulement
+   * conclure une annonce et un statut qu'un run tué a laissés en suspens.
+   */
+  mode: 'review' | 'abort';
+  /** Lien du run, pour l'annonce et le statut. Vide hors CI. */
+  runUrl: string;
   /** Imprimer ce qui partirait, et ne rien envoyer. Réglage local seulement. */
   countOnly: boolean;
   /** Nom libre du bras mesuré, repris dans la ligne « ::stats:: ». */
@@ -350,6 +377,30 @@ function readEffort(env: Env, warn: (message: string) => void): Effort {
 
 function readBoolean(env: Env, name: string): boolean {
   return /^(true|1|yes)$/i.test(readInput(env, name));
+}
+
+/**
+ * Comme `readBoolean`, mais l'absence vaut « oui ».
+ *
+ * Pour les interrupteurs qu'on veut allumés chez qui n'a rien configuré :
+ * l'annonce sert surtout au dépôt qui n'a pas lu la doc, puisque c'est là qu'un
+ * silence se lit comme un feu vert.
+ */
+function readBooleanDefaultTrue(env: Env, name: string): boolean {
+  return !/^(false|0|no|off)$/i.test(readInput(env, name));
+}
+
+/**
+ * L'URL du run courant, dérivée de l'environnement Actions.
+ *
+ * Pas un input : le dépôt consommateur n'a pas à recopier trois variables que
+ * le runner pose déjà. Absente en local, où l'annonce s'en passe.
+ */
+function runUrlFrom(env: Env): string {
+  const server = env.GITHUB_SERVER_URL?.trim();
+  const repo = env.GITHUB_REPOSITORY?.trim();
+  const id = env.GITHUB_RUN_ID?.trim();
+  return server && repo && id ? `${server}/${repo}/actions/runs/${id}` : '';
 }
 
 /**
@@ -667,5 +718,10 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     countOnly,
     variant,
     githubToken: readInput(env, 'github-token') || env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || '',
+    announce: readBooleanDefaultTrue(env, 'announce'),
+    statusCheck: readBoolean(env, 'status-check'),
+    statusContext: readInput(env, 'status-context') || DEFAULTS.statusContext,
+    mode: readInput(env, 'mode').toLowerCase() === 'abort' ? 'abort' : 'review',
+    runUrl: runUrlFrom(env),
   };
 }
