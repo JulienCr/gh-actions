@@ -482,6 +482,15 @@ describe('l’annonce et le statut de commit', () => {
     expect(resolve({ 'INPUT_STATUS-CHECK': 'true' }).statusCheck).toBe(true);
   });
 
+  /**
+   * Éteint par défaut : sur vingt PR d'`avolo-shorts`, 40 trouvailles sur 55
+   * tombaient dans ces deux rubriques, pour 15 actionnables.
+   */
+  it('tait les rubriques non bloquantes tant qu’on ne les réclame pas', () => {
+    expect(resolve().softSections).toBe(false);
+    expect(resolve({ 'INPUT_SOFT-SECTIONS': 'true' }).softSections).toBe(true);
+  });
+
   it('nomme le statut « aristarque/review », sauf indication contraire', () => {
     expect(resolve().statusContext).toBe('aristarque/review');
     expect(resolve({ 'INPUT_STATUS-CONTEXT': 'ci/review' }).statusContext).toBe('ci/review');

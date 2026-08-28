@@ -248,7 +248,8 @@ Seul `pr` est obligatoire.
 | `doctrine` | voir ci-dessous | Fichiers de conventions injectés dans le prompt, un chemin par ligne. |
 | `skip` | `''` | Motifs de fichiers à ne pas relire, un par ligne. **S'ajoutent** au socle intégré. |
 | `project-summary` | `''` | Deux ou trois lignes situant le projet, si la doctrine ne le fait pas. |
-| `max-findings` | `20` | Plafond de puces pour Bloquant, À corriger et Suggestions. « À vérifier » a son propre plafond de cinq. |
+| `soft-sections` | `false` | Publier « Suggestions » et « À vérifier ». Éteint, le rapport s'arrête aux rubriques actionnables. |
+| `max-findings` | `20` | Plafond de puces pour Bloquant, À corriger et Suggestions. « À vérifier » a son propre plafond de cinq, et les deux dernières rubriques ne comptent que si `soft-sections` est allumé. |
 | `budget-chars` | `500000` | Plafond du contenu intégral des fichiers **touchés**. |
 | `per-file-chars` | `80000` | Plafond par fichier. |
 | `window-min-lines` | selon le cran | Taille à partir de laquelle un fichier part par extraits. `0` : jamais. |
@@ -607,9 +608,22 @@ brutes sont postées telles quelles, sans tri, plutôt que jetées.
 
 ### Ce que le modèle est censé rendre
 
-Cinq rubriques : Verdict, Bloquant, À corriger, Suggestions, **À vérifier**.
+Trois rubriques par défaut : Verdict, Bloquant, À corriger. Deux autres, Suggestions et
+**À vérifier**, ne sont publiées que si `soft-sections` vaut `true`.
 
-La dernière est là pour un motif précis. Un prompt qui réclame de la certitude obtient des
+Le défaut vient d'une mesure. Sur les vingt dernières PR d'`avolo-shorts`, Aristarque a rendu
+55 trouvailles, dont 15 actionnables : les 40 autres tombaient dans ces deux rubriques. Elles
+ne sont pas fausses, mais leur tri se paie à chaque passe, et il se paie chez le relecteur
+humain ou l'agent qui reprend la PR, pas chez le modèle qui les a écrites.
+
+Les passes de lecture, elles, continuent de produire suggestions et doutes quel que soit
+l'input. La fusion en a besoin pour arbitrer une sévérité : une « suggestion » qui s'avère
+perdre des données remonte en « Bloquant », et un « bloquant » qui repose sur une hypothèse
+invérifiable descend en « À vérifier ». Éteindre les rubriques molles ne change que ce qui est
+publié. Le prompt interdit d'ailleurs de sauver une trouvaille molle en la promouvant, sans
+quoi on aurait troqué du bruit contre une inflation de sévérité, qui coûte plus cher.
+
+« À vérifier » est là pour un motif précis. Un prompt qui réclame de la certitude obtient des
 sections vides : le modèle cherche, trouve quelque chose qu'il ne peut pas prouver avec les
 fichiers qu'on lui a donnés, et le jette. « À vérifier » lui donne où le mettre, ce qui coûte
 bien moins cher qu'un bug passé en silence. Le prompt lui interdit en revanche d'y ranger ce

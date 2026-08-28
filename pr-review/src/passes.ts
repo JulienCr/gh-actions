@@ -444,14 +444,16 @@ export function groupByDestination<T extends Sequenceable>(items: readonly T[]):
  * à `## Verdict`. Les traduire casserait l'extraction, c'est pourquoi il n'y a
  * pas d'input de langue.
  */
-const OUTPUT_TEMPLATE = `## Verdict
+const ACTIONABLE_SECTIONS = `## Verdict
 Une seule phrase : ce que tu retiens de cette PR.
 
 ## Bloquant
 - \`chemin/fichier.ts:42\` : ce qui casse, et pourquoi ici.
 
 ## À corriger
-- \`chemin/fichier.tsx:17\` : …
+- \`chemin/fichier.tsx:17\` : …`;
+
+const SOFT_SECTIONS = `
 
 ## Suggestions
 - \`chemin/fichier.ts:88\` : …
@@ -460,9 +462,19 @@ Une seule phrase : ce que tu retiens de cette PR.
 - \`chemin/fichier.ts:120\` : ce que tu soupçonnes sans pouvoir le prouver ici, et ce qu'il
   faudrait regarder pour trancher.`;
 
+const outputTemplate = (softSections: boolean): string =>
+  softSections ? `${ACTIONABLE_SECTIONS}${SOFT_SECTIONS}` : ACTIONABLE_SECTIONS;
+
 export interface MergeOptions {
   repo: string;
   maxFindings: number;
+  /**
+   * Poster « Suggestions » et « À vérifier », les deux rubriques non bloquantes.
+   *
+   * Mesuré sur vingt PR d'`avolo-shorts` : 40 trouvailles sur 55 y tombaient,
+   * pour 15 actionnables. Leur tri est payé par qui relit.
+   */
+  softSections: boolean;
   /**
    * Les passes qui ont RÉELLEMENT lu, pas celles qui étaient prévues.
    *
@@ -523,19 +535,33 @@ their findings into the single comment that gets posted on the PR.
    duplicates.
 2. **Arbitrate the label.** They each judged on their own axis and could not see the others. A
    « corriger » that turns out to lose data is « Bloquant ». A « bloquant » resting on an
-   unverified assumption belongs under « À vérifier ».
-3. **Rank, then cut.** ${options.maxFindings} bullets maximum across Bloquant, À corriger and
-   Suggestions, plus at most five under À vérifier. Past that nobody reads. Keep the costly ones.
+   unverified assumption ${
+     options.softSections
+       ? 'belongs under « À vérifier »'
+       : 'stays under « À corriger », with what would settle it said in the bullet'
+   }.
+3. **Rank, then cut.** ${options.maxFindings} bullets maximum${
+    options.softSections
+      ? ' across Bloquant, À corriger and Suggestions, plus at most five under À vérifier'
+      : ' across Bloquant and À corriger'
+  }. Past that nobody reads. Keep the costly ones.
    **When you cut, say so in the Verdict**: this ceiling ranks findings, it never justifies
    dropping one in silence.
 4. **Drop the « rien » bullets**, but remember what they checked: that is what makes a
-   « Rien à signaler » credible.
+   « Rien à signaler » credible.${
+     options.softSections
+       ? ''
+       : `
+5. **A finding that neither blocks nor has to be fixed does not go in.** Drop it, never promote it
+   to « À corriger » to keep it: trading noise for label inflation costs the reader more than the
+   noise did.`
+   }
 
 # Expected output
 
-Return exactly these five sections, in this order, as markdown, and nothing before them.
+Return exactly these ${options.softSections ? 'five' : 'three'} sections, in this order, as markdown, and nothing before them.
 
-${OUTPUT_TEMPLATE}
+${outputTemplate(options.softSections)}
 
 - A section with nothing in it says what was checked, on the same line:
   « Rien à signaler (chemins d'erreur et valeurs de retour relus) ». Take that from what the

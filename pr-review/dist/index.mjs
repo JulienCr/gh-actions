@@ -1276,14 +1276,15 @@ function groupByDestination(items) {
   }
   return [...groups.values()].map((group) => [...group].sort((a, b) => a.chars - b.chars));
 }
-var OUTPUT_TEMPLATE = `## Verdict
+var ACTIONABLE_SECTIONS = `## Verdict
 Une seule phrase : ce que tu retiens de cette PR.
 
 ## Bloquant
 - \`chemin/fichier.ts:42\` : ce qui casse, et pourquoi ici.
 
 ## \xC0 corriger
-- \`chemin/fichier.tsx:17\` : \u2026
+- \`chemin/fichier.tsx:17\` : \u2026`;
+var SOFT_SECTIONS = `
 
 ## Suggestions
 - \`chemin/fichier.ts:88\` : \u2026
@@ -1291,6 +1292,7 @@ Une seule phrase : ce que tu retiens de cette PR.
 ## \xC0 v\xE9rifier
 - \`chemin/fichier.ts:120\` : ce que tu soup\xE7onnes sans pouvoir le prouver ici, et ce qu'il
   faudrait regarder pour trancher.`;
+var outputTemplate = (softSections) => softSections ? `${ACTIONABLE_SECTIONS}${SOFT_SECTIONS}` : ACTIONABLE_SECTIONS;
 function enumerate(items) {
   if (items.length < 2) return items.join("");
   return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
@@ -1322,19 +1324,21 @@ their findings into the single comment that gets posted on the PR.
    duplicates.
 2. **Arbitrate the label.** They each judged on their own axis and could not see the others. A
    \xAB corriger \xBB that turns out to lose data is \xAB Bloquant \xBB. A \xAB bloquant \xBB resting on an
-   unverified assumption belongs under \xAB \xC0 v\xE9rifier \xBB.
-3. **Rank, then cut.** ${options.maxFindings} bullets maximum across Bloquant, \xC0 corriger and
-   Suggestions, plus at most five under \xC0 v\xE9rifier. Past that nobody reads. Keep the costly ones.
+   unverified assumption ${options.softSections ? "belongs under \xAB \xC0 v\xE9rifier \xBB" : "stays under \xAB \xC0 corriger \xBB, with what would settle it said in the bullet"}.
+3. **Rank, then cut.** ${options.maxFindings} bullets maximum${options.softSections ? " across Bloquant, \xC0 corriger and Suggestions, plus at most five under \xC0 v\xE9rifier" : " across Bloquant and \xC0 corriger"}. Past that nobody reads. Keep the costly ones.
    **When you cut, say so in the Verdict**: this ceiling ranks findings, it never justifies
    dropping one in silence.
 4. **Drop the \xAB rien \xBB bullets**, but remember what they checked: that is what makes a
-   \xAB Rien \xE0 signaler \xBB credible.
+   \xAB Rien \xE0 signaler \xBB credible.${options.softSections ? "" : `
+5. **A finding that neither blocks nor has to be fixed does not go in.** Drop it, never promote it
+   to \xAB \xC0 corriger \xBB to keep it: trading noise for label inflation costs the reader more than the
+   noise did.`}
 
 # Expected output
 
-Return exactly these five sections, in this order, as markdown, and nothing before them.
+Return exactly these ${options.softSections ? "five" : "three"} sections, in this order, as markdown, and nothing before them.
 
-${OUTPUT_TEMPLATE}
+${outputTemplate(options.softSections)}
 
 - A section with nothing in it says what was checked, on the same line:
   \xAB Rien \xE0 signaler (chemins d'erreur et valeurs de retour relus) \xBB. Take that from what the
@@ -1687,6 +1691,7 @@ function resolveConfig({ argv, env, warn = () => {
     temperature: readTemperature(env, warn),
     seed: readSeed(env, warn),
     maxFindings: readNumber(env, "max-findings", DEFAULTS.maxFindings, warn),
+    softSections: readBoolean(env, "soft-sections"),
     budgetChars: readNumber(env, "budget-chars", DEFAULTS.budgetChars, warn),
     perFileChars: readNumber(env, "per-file-chars", DEFAULTS.perFileChars, warn),
     effort,
@@ -2468,6 +2473,7 @@ async function review(config) {
         content: buildMergeSystemPrompt({
           repo,
           maxFindings: config.maxFindings,
+          softSections: config.softSections,
           passes: outcomes.map((outcome) => outcome.pass)
         })
       },

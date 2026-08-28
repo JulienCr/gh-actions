@@ -276,6 +276,18 @@ inputs:
     required: false
     default: ''
 
+  soft-sections:
+    description: >-
+      Poster les rubriques « Suggestions » et « À vérifier », qui ne bloquent
+      rien. Défaut « false » : le rapport s'arrête à « Bloquant » et « À
+      corriger ». Mesuré sur les vingt dernières PR d'avolo-shorts, 40 des 55
+      trouvailles tombaient dans ces deux rubriques pour 15 actionnables ; leur
+      tri est payé par qui relit, à chaque passe. Les passes de lecture, elles,
+      continuent de produire suggestions et doutes : la fusion en a besoin pour
+      arbitrer une sévérité, elle cesse seulement de les publier.
+    required: false
+    default: 'false'
+
   max-findings:
     description: >-
       Nombre maximum de puces pour Bloquant, À corriger et Suggestions. La

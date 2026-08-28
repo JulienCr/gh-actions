@@ -922,6 +922,7 @@ async function review(config: Config): Promise<void> {
               content: buildMergeSystemPrompt({
                 repo,
                 maxFindings: config.maxFindings,
+                softSections: config.softSections,
                 passes: outcomes.map((outcome) => outcome.pass),
               }),
             },

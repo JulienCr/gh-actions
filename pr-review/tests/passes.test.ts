@@ -110,9 +110,9 @@ describe('les trois passes', () => {
 
 describe('buildMergeSystemPrompt', () => {
   const merge = (maxFindings = 20, passes: readonly Pass[] = PASSES) =>
-    buildMergeSystemPrompt({ repo: 'JulienCr/exemple', maxFindings, passes });
+    buildMergeSystemPrompt({ repo: 'JulienCr/exemple', maxFindings, passes, softSections: true });
 
-  it('impose les cinq rubriques, dont l’exutoire des doutes', () => {
+  it('impose les cinq rubriques, dont l’exutoire des doutes, quand les molles sont demandées', () => {
     const prompt = merge();
     for (const heading of ['## Verdict', '## Bloquant', '## À corriger', '## Suggestions', '## À vérifier']) {
       expect(prompt).toContain(heading);
@@ -145,6 +145,59 @@ describe('buildMergeSystemPrompt', () => {
   });
 });
 
+/**
+ * Mesuré sur les vingt dernières PR d'`avolo-shorts` : 40 des 55 trouvailles
+ * d'Aristarque tombaient sous « Suggestions » ou « À vérifier », pour 15
+ * actionnables. Le tri de ces 40 est payé par qui relit.
+ */
+describe('les rubriques molles, coupées par défaut', () => {
+  const merge = (softSections: boolean) =>
+    buildMergeSystemPrompt({ repo: 'JulienCr/exemple', maxFindings: 20, passes: PASSES, softSections });
+
+  it('ne demande que les rubriques actionnables par défaut', () => {
+    const prompt = merge(false);
+    expect(prompt).toContain('## Bloquant');
+    expect(prompt).toContain('## À corriger');
+    expect(prompt).not.toContain('## Suggestions');
+    expect(prompt).not.toContain('## À vérifier');
+  });
+
+  it('les rend dès qu’on les rallume', () => {
+    const prompt = merge(true);
+    expect(prompt).toContain('## Suggestions');
+    expect(prompt).toContain('## À vérifier');
+  });
+
+  it('accorde le nombre de rubriques annoncé à ce qu’il demande', () => {
+    expect(merge(false)).toContain('exactly these three sections');
+    expect(merge(true)).toContain('exactly these five sections');
+  });
+
+  /**
+   * Sans cette phrase la fusion garde la trouvaille en la relabellisant : on
+   * aurait échangé du bruit contre une inflation de sévérité, qui coûte plus.
+   */
+  it('fait tomber la trouvaille molle au lieu de la promouvoir', () => {
+    expect(merge(false)).toContain('Drop it, never promote it');
+    expect(merge(true)).not.toContain('Drop it, never promote it');
+  });
+
+  it('ne plafonne plus une rubrique qu’il ne demande pas', () => {
+    expect(merge(false)).not.toContain('under À vérifier');
+    expect(merge(true)).toContain('under À vérifier');
+  });
+
+  /**
+   * L'arbitrage renvoyait le bloquant douteux vers « À vérifier », rubrique
+   * absente de ce mode : un prompt qui se contredit fait improviser le modèle.
+   */
+  it('n’envoie jamais une trouvaille vers une rubrique qu’il a supprimée', () => {
+    expect(merge(false)).not.toContain('belongs under « À vérifier »');
+    expect(merge(false)).toContain('stays under « À corriger », with what would settle it');
+    expect(merge(true)).toContain('belongs under « À vérifier »');
+  });
+});
+
 describe('buildMergeUserPrompt', () => {
   const prompt = buildMergeUserPrompt(META, [
     { pass: pass('regression'), findings: `${PASS_HEADING}\n- [bloquant] \`src/app/page.tsx:12\` : casse.` },
@@ -173,7 +226,7 @@ describe('buildMergeUserPrompt', () => {
 
 describe('l’ouverture de la fusion, accordée à ce qui a réellement été lu', () => {
   const merge = (passes: readonly Pass[]) =>
-    buildMergeSystemPrompt({ repo: 'JulienCr/exemple', maxFindings: 20, passes });
+    buildMergeSystemPrompt({ repo: 'JulienCr/exemple', maxFindings: 20, passes, softSections: false });
 
   it('annonce trois relecteurs et leurs trois axes quand les trois ont abouti', () => {
     const prompt = merge(PASSES);

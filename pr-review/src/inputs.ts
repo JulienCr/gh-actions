@@ -265,6 +265,13 @@ export interface Config {
   /** `undefined` : pas de graine, le modèle varie d'une exécution à l'autre. */
   seed: number | undefined;
   maxFindings: number;
+  /**
+   * Poster « Suggestions » et « À vérifier ». Défaut : non.
+   *
+   * Mesuré sur vingt PR d'`avolo-shorts` : 40 trouvailles sur 55 y tombaient,
+   * pour 15 actionnables. Le rapport court est celui qu'on relit en entier.
+   */
+  softSections: boolean;
   budgetChars: number;
   perFileChars: number;
   /** Plafond des fichiers importés joints en contexte. `0` : aucun. */
@@ -689,6 +696,7 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     temperature: readTemperature(env, warn),
     seed: readSeed(env, warn),
     maxFindings: readNumber(env, 'max-findings', DEFAULTS.maxFindings, warn),
+    softSections: readBoolean(env, 'soft-sections'),
     budgetChars: readNumber(env, 'budget-chars', DEFAULTS.budgetChars, warn),
     perFileChars: readNumber(env, 'per-file-chars', DEFAULTS.perFileChars, warn),
     effort,
