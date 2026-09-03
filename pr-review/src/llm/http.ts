@@ -186,18 +186,11 @@ export async function withRetries(
     return await played(attempt, request);
   } catch (error) {
     if (!(error instanceof LlmError)) throw error;
-    // Le raisonnement a tout mangé : on rejoue SANS raisonnement, pas d'un cran
-    // plus bas.
-    //
-    // Le cran intermédiaire a été essayé et mesuré : sur avolo-shorts#99 (run
-    // 32248459701), `deepseek-v4-flash:cloud` a brûlé 65 536 tokens de sortie —
-    // son plafond — en `high`, puis EXACTEMENT autant en `medium`, sans rendre
-    // un caractère ni l'une ni l'autre fois. Baisser d'un cran ne change pas la
-    // nature d'un modèle qui ne conclut pas ; ça achète un second appel au prix
-    // fort pour le même vide, et retarde de quatre minutes le seul rejeu qui
-    // avait une chance. Une passe moins fouillée vaut mieux qu'une passe perdue.
-    if (error.reasoningExhausted && request.think) {
-      return replay(attempt, request, 'reasoning-exhausted', '', error.message);
+    // « false » et non la chaîne vide, qui fait OMETTRE le paramètre : un modèle
+    // de raisonnement rejoue alors à son défaut, qui est de raisonner. Rien à
+    // rejouer, en revanche, pour qui l'avait déjà coupé.
+    if (error.reasoningExhausted && request.think && !wantsNoThinking(request.think)) {
+      return replay(attempt, request, 'reasoning-exhausted', 'false', error.message);
     }
     if (error.thinkingRejected && request.think) {
       // Un niveau mal orthographié ne coûte que le niveau ; un modèle qui ne
@@ -283,7 +276,8 @@ export function describeDowngrade(event: Downgrade, model: string): string {
 
 /** Ce qui repart, dit en français plutôt qu'en valeur de champ. */
 function describeTo(to: string): string {
-  if (to === '') return 'sans raisonnement explicite';
+  if (to === '') return 'sans demander de raisonnement';
+  if (to === 'false') return 'avec le raisonnement coupé';
   if (to === 'true') return 'au niveau de raisonnement par défaut du modèle';
   return `en « ${to} »`;
 }

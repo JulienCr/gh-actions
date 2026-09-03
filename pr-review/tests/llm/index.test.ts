@@ -150,11 +150,11 @@ describe('les défauts par provider', () => {
 describe('la phrase d’un repli', () => {
   it('dit un raisonnement épuisé pour ce qu’il est, et pas un refus', () => {
     const phrase = describeDowngrade(
-      { cause: 'reasoning-exhausted', from: 'high', to: '', reason: 'réponse vide' },
+      { cause: 'reasoning-exhausted', from: 'high', to: 'false', reason: 'réponse vide' },
       'deepseek-v4-flash:cloud',
     );
     expect(phrase).toContain('a brûlé toute sa sortie en raisonnement sans conclure');
-    expect(phrase).toContain('sans raisonnement explicite');
+    expect(phrase).toContain('avec le raisonnement coupé');
     expect(phrase).not.toContain("n'a pas accepté");
   });
 
@@ -174,6 +174,6 @@ describe('la phrase d’un repli', () => {
       'un-modele',
     );
     expect(phrase).toContain('ne sait pas raisonner sur demande');
-    expect(phrase).toContain('sans raisonnement explicite');
+    expect(phrase).toContain('sans demander de raisonnement');
   });
 });

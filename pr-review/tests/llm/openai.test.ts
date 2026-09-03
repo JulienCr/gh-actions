@@ -313,10 +313,13 @@ describe('la politique de reprise', () => {
     const result = await call({ think: 'high', onDowngrade: (event) => downgrades.push(event) });
     expect(result.content).toBe('trouvailles');
     expect(calls).toBe(2);
-    expect(downgrades[0]).toMatchObject({ cause: 'reasoning-exhausted', from: 'high', to: '' });
+    expect(downgrades[0]).toMatchObject({ cause: 'reasoning-exhausted', from: 'high', to: 'false' });
     expect(lastBody.reasoning_effort).toBeUndefined();
+    // Le repli COUPE le raisonnement au lieu de simplement cesser de le
+    // demander : sans ça DeepSeek rejoue au défaut, qui est de raisonner.
+    expect(lastBody.thinking).toEqual({ type: 'disabled' });
     // Le niveau rendu est celui du repli, pas celui de la consigne.
-    expect(result.think).toBe('');
+    expect(result.think).toBe('false');
   });
 
   /**

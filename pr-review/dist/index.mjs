@@ -567,8 +567,8 @@ async function withRetries(attempt2, request) {
     return await played(attempt2, request);
   } catch (error) {
     if (!(error instanceof LlmError)) throw error;
-    if (error.reasoningExhausted && request.think) {
-      return replay(attempt2, request, "reasoning-exhausted", "", error.message);
+    if (error.reasoningExhausted && request.think && !wantsNoThinking(request.think)) {
+      return replay(attempt2, request, "reasoning-exhausted", "false", error.message);
     }
     if (error.thinkingRejected && request.think) {
       const badValue = rejectsThinkingValue(error.message);
@@ -609,7 +609,8 @@ function describeDowngrade(event, model) {
   Rejou\xE9 ${describeTo(to)} : ce sera moins fouill\xE9.`;
 }
 function describeTo(to) {
-  if (to === "") return "sans raisonnement explicite";
+  if (to === "") return "sans demander de raisonnement";
+  if (to === "false") return "avec le raisonnement coup\xE9";
   if (to === "true") return "au niveau de raisonnement par d\xE9faut du mod\xE8le";
   return `en \xAB ${to} \xBB`;
 }

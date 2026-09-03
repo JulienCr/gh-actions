@@ -559,16 +559,16 @@ describe('un raisonnement qui ne conclut jamais', () => {
     const result = await call({ think: 'high', onDowngrade: (event) => downgrades.push(event) });
     expect(result.content).toContain('Trouvailles');
     expect(calls).toBe(2);
-    // Pas « medium » : un cran plus bas a été mesuré, et il épuise le même
-    // budget. Voir le commentaire de `withRetries`.
-    expect(lastBody).not.toHaveProperty('think');
+    // `think: false` et non un champ absent : omettre le paramètre laisse le
+    // modèle raisonner à son défaut, ce qui rejoue exactement la panne.
+    expect(lastBody).toHaveProperty('think', false);
     expect(downgrades).toEqual([
-      { cause: 'reasoning-exhausted', from: 'high', to: '', reason: expect.any(String) },
+      { cause: 'reasoning-exhausted', from: 'high', to: 'false', reason: expect.any(String) },
     ]);
     // Ce que la ligne de statistiques affichera : le niveau JOUÉ, pas celui
     // qu'on avait demandé. Mesuré sur gh-actions#10, où elle annonçait
     // « think=high » pour un appel parti sans raisonnement.
-    expect(result.think).toBe('');
+    expect(result.think).toBe('false');
   });
 
   /** Le compte des tokens brûlés : sans lui, l'incident est indiagnosticable. */
@@ -617,6 +617,13 @@ describe('un raisonnement qui ne conclut jamais', () => {
   it('ne rejoue pas un vide qui n’a rien produit du tout', async () => {
     queue.push({ status: 200, body: thinkingOnly('') });
     await expect(call({ think: 'high' })).rejects.toThrow(/vide/);
+    expect(calls).toBe(1);
+  });
+
+  /** Le repli vise déjà `false` : le rejouer renverrait la requête à l'identique. */
+  it('ne rejoue pas un dépôt qui avait déjà coupé le raisonnement', async () => {
+    queue.push({ status: 200, body: thinkingOnly('je réfléchis quand même') });
+    await expect(call({ think: 'false' })).rejects.toThrow(/vide/);
     expect(calls).toBe(1);
   });
 });
