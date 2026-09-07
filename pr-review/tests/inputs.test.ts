@@ -99,6 +99,20 @@ describe('resolveConfig · précédence', () => {
     expect(resolve({ DEEPSEEK_API_KEY: 'ds-env' }).keys.deepseek).toBe('ds-env');
     expect(resolve({ 'INPUT_OPENAI-API-KEY': 'oa' }).keys.openai).toBe('oa');
   });
+  it('accepte VENDOR comme alias de « provider », l’input gardant la main', () => {
+    expect(resolve({ VENDOR: 'aws' }).provider).toBe('aws');
+    expect(resolve({ VENDOR: ' AWS ' }).provider).toBe('aws');
+    expect(resolve({ VENDOR: 'aws', INPUT_PROVIDER: 'deepseek' }).provider).toBe('deepseek');
+  });
+
+  it('prévient sur un VENDOR inconnu plutôt que de retomber sur Ollama en silence', () => {
+    // Le repli muet est le mode de panne coûteux : le dépôt croit viser Bedrock
+    // et lit une review d'Ollama sans qu'une ligne du journal le dise.
+    const warnings: string[] = [];
+    const config = resolveConfig({ argv: ['42'], env: { VENDOR: 'azure' }, warn: (m) => warnings.push(m) });
+    expect(config.provider).toBe(DEFAULTS.provider);
+    expect(warnings.join('\n')).toContain('VENDOR');
+  });
 });
 
 describe('resolveConfig · doctrine et exclusions', () => {
@@ -397,6 +411,45 @@ describe('resolveConfig · la destination de chaque appel', () => {
     expect(config.passConfigs.doctrine.thinking).toBe('low');
     expect(config.passConfigs.data.thinking).toBe('medium');
     expect(config.passConfigs.regression.thinking).toBe('high');
+  });
+
+  const awsEnv = {
+    INPUT_PROVIDER: 'aws',
+    'INPUT_AWS-REGION': 'eu-north-1',
+    AWS_ACCESS_KEY_ID: 'ak',
+    AWS_SECRET_ACCESS_KEY: 'sk',
+  };
+
+  /**
+   * Sur Bedrock, le couple doctrine/données n'existait que pour un cache de
+   * préfixe absent ici (mesuré) ; affaiblir doctrine aggraverait le budget de
+   * raisonnement qu'elle brûlait déjà dans 4 runs sur 9 (commit a6d6846).
+   */
+  it('sur la route aws, ne descend que « données » vers le modèle bon marché', () => {
+    const config = resolve(awsEnv);
+    expect(config.passConfigs.data.provider).toBe('aws');
+    expect(config.passConfigs.data.model).toBe('zai.glm-4.7-flash');
+    expect(config.passConfigs.doctrine.provider).toBe('aws');
+    expect(config.passConfigs.doctrine.model).toBe('zai.glm-5');
+    expect(config.passConfigs.merge.model).toBe('zai.glm-5');
+    expect(config.passConfigs.regression.model).toBe('zai.glm-5');
+  });
+
+  /**
+   * Le défaut « low » suivait « le mix déplace la fusion » et non « un mix est
+   * actif » : sur aws, où seule « données » bouge, la fusion partait à `high`
+   * sur le flagship pour trier trente puces. `high` reste le défaut hors mix.
+   */
+  it('descend le raisonnement de la fusion dès qu’un mix est actif', () => {
+    expect(resolve(awsEnv).passConfigs.merge.thinking).toBe('low');
+    expect(resolve({ INPUT_PROVIDER: 'openai' }).passConfigs.merge.thinking).toBe(
+      DEFAULTS.mergeThinking,
+    );
+  });
+
+  it('laisse « merge-thinking » écrit à la main l’emporter sur le mix', () => {
+    const env = { ...awsEnv, 'INPUT_MERGE-THINKING': 'max' };
+    expect(resolve(env).passConfigs.merge.thinking).toBe('max');
   });
 });
 

@@ -13,6 +13,7 @@
  */
 
 import { isProvider, PROVIDER_IDS, PROVIDERS } from './llm';
+import type { AwsCredentials } from './llm/sigv4';
 import { parseList } from './globs';
 import { EFFORTS, isEffort, PASSES, stepDown, type Effort } from './passes';
 
@@ -180,6 +181,7 @@ export interface PassConfig {
 const CHEAP_MODEL: Record<string, string> = {
   ollama: 'deepseek-v4-flash:cloud',
   deepseek: 'deepseek-v4-flash',
+  aws: 'zai.glm-4.7-flash',
 };
 
 /**
@@ -203,13 +205,22 @@ const CHEAP_MODEL: Record<string, string> = {
  * qu'une fois les quatre-vingt-dix kilo-octets de contexte commun. Les séparer
  * annulerait ce levier.
  */
+/** Niveau de la fusion sous un mix : elle trie des puces sans avoir le code. */
+const MIX_MERGE_THINKING = 'low';
+
 export function mixFor(provider: string): Partial<Record<PassId, PassConfig>> {
   const model = CHEAP_MODEL[provider];
   if (!model) return {};
+  if (provider === 'aws') {
+    // Seule « données » bouge ici : le cache de préfixe qui justifiait aussi
+    // doctrine n'existe pas sur Bedrock (mesuré), et l'affaiblir aggraverait
+    // son budget de raisonnement déjà tendu (4 runs sur 9, commit a6d6846).
+    return { data: { provider, model, thinking: 'high' } };
+  }
   return {
     doctrine: { provider, model, thinking: 'high' },
     data: { provider, model, thinking: 'high' },
-    merge: { provider, model, thinking: 'low' },
+    merge: { provider, model, thinking: MIX_MERGE_THINKING },
   };
 }
 
@@ -228,6 +239,9 @@ export function mixFor(provider: string): Partial<Record<PassId, PassConfig>> {
  * Ollama, qui sert le même modèle et suffit à descendre d'un niveau d'usage.
  */
 export function mixRoute(provider: string, hasDeepSeekKey: boolean): string | null {
+  // Un mix qui reste chez `aws` ne déplace rien vers un autre provider : la
+  // garde qui suit ne protège que d'un déplacement dans le dos du dépôt.
+  if (provider === 'aws') return 'aws';
   if (provider !== DEFAULTS.provider) return null;
   return hasDeepSeekKey ? 'deepseek' : 'ollama';
 }
@@ -261,6 +275,10 @@ export interface Config {
    * de cache.
    */
   openaiPrefixCache: boolean;
+  /** Région Bedrock. Vide : le provider `aws` est inutilisable. */
+  awsRegion: string;
+  /** Credentials AWS résolues, ou `null`. Remplies tard, cf. `main`. */
+  aws: { region: string; credentials: AwsCredentials } | null;
   temperature: number;
   /** `undefined` : pas de graine, le modèle varie d'une exécution à l'autre. */
   seed: number | undefined;
@@ -572,6 +590,10 @@ export function resolvePassConfigs(
     // nombre de crans que leur table leur assigne.
     const steps = PASSES.find((pass) => pass.id === id)?.thinkingSteps[options.effort] ?? 0;
     const written = id === 'merge' ? options.mergeThinking : options.thinking;
+    // Un mix actif ramène la fusion à `low` même s'il ne la déplace pas : elle
+    // trie des puces sans avoir le code, et ce niveau ne dépend pas du modèle.
+    // Sinon une route qui la laisse sur le flagship la ferait raisonner pour rien.
+    const mixed = Object.keys(options.mix).length > 0;
     configs[id] = resolvePass(
       env,
       id,
@@ -581,7 +603,11 @@ export function resolvePassConfigs(
         model: options.model,
         thinkingWritten: written ? stepDown(written, steps) : '',
         thinkingDefault:
-          id === 'merge' ? DEFAULTS.mergeThinking : stepDown(DEFAULTS.thinking, steps),
+          id === 'merge'
+            ? mixed
+              ? MIX_MERGE_THINKING
+              : DEFAULTS.mergeThinking
+            : stepDown(DEFAULTS.thinking, steps),
       },
       warn,
     );
@@ -654,7 +680,19 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     openai: readInput(env, 'openai-api-key') || env.OPENAI_API_KEY?.trim() || '',
   };
 
-  const provider = readProvider(env, 'provider', DEFAULTS.provider, warn);
+  const vendorAlias = (env.VENDOR ?? '').trim().toLowerCase();
+  if (vendorAlias !== '' && !isProvider(vendorAlias)) {
+    warn(`VENDOR « ${vendorAlias} » n'est pas un provider connu (${PROVIDER_IDS.join(', ')}) : ignoré.`);
+  }
+  // VENDOR est un alias d'entrée pour « provider », sur le motif exact
+  // d'OLLAMA_REVIEW_MODEL : un second axe parallèle divergerait au premier
+  // réglage fin, le dépôt ayant déjà un provider par passe.
+  const provider = readProvider(
+    env,
+    'provider',
+    isProvider(vendorAlias) ? vendorAlias : DEFAULTS.provider,
+    warn,
+  );
   // Le modèle par défaut suit le provider, et n'est plus un nom Ollama envoyé à
   // qui n'en sert pas : c'était un 404 sur les quatre appels, avec un journal
   // qui accusait le modèle plutôt que la configuration. Le provider générique
@@ -670,6 +708,32 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   // lui laissant le modèle d'un autre provider produirait un 404, pas un
   // compromis. L'écrire garde donc le comportement d'avant, pour les quatre.
   const route = model === '' ? mixRoute(provider, keys.deepseek !== '') : null;
+
+  const awsRegion =
+    readInput(env, 'aws-region') || env.AWS_REGION?.trim() || env.AWS_DEFAULT_REGION?.trim() || '';
+  if (provider === 'aws' && awsRegion === '') {
+    warn(
+      'provider « aws » sans région : renseigne « aws-region » (ou AWS_REGION), sinon\n' +
+        "  l'appel visera une base vide et sera écarté avant d'être tenté.",
+    );
+  }
+  const awsAccessKeyId = env.AWS_ACCESS_KEY_ID?.trim() || '';
+  const awsSecretAccessKey = env.AWS_SECRET_ACCESS_KEY?.trim() || '';
+  const awsSessionToken = env.AWS_SESSION_TOKEN?.trim() || '';
+  // `null` et non un couple vide : `endpointFor` s'en sert pour distinguer
+  // « pas de credentials » de « credentials résolues », posées par `main` avant
+  // cette lecture, purement, dans l'environnement.
+  const aws =
+    awsAccessKeyId && awsSecretAccessKey
+      ? {
+          region: awsRegion,
+          credentials: {
+            accessKeyId: awsAccessKeyId,
+            secretAccessKey: awsSecretAccessKey,
+            ...(awsSessionToken ? { sessionToken: awsSessionToken } : {}),
+          },
+        }
+      : null;
 
   return {
     pr,
@@ -693,6 +757,8 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     keys,
     openaiBaseUrl: readInput(env, 'openai-base-url').replace(/\/$/, ''),
     openaiPrefixCache: readBoolean(env, 'openai-prefix-cache'),
+    awsRegion,
+    aws,
     temperature: readTemperature(env, warn),
     seed: readSeed(env, warn),
     maxFindings: readNumber(env, 'max-findings', DEFAULTS.maxFindings, warn),

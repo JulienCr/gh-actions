@@ -233,8 +233,9 @@ Seul `pr` est obligatoire.
 | `openai-api-key` | `''` | Clé du provider `openai` générique. Inutile sans `openai-base-url`. |
 | `openai-base-url` | `''` | Base d'un endpoint OpenAI-compatible quelconque (Fireworks, Z.ai, OpenRouter…). |
 | `openai-prefix-cache` | `false` | `true` si cet endpoint cache les préfixes. Sinon ses passes ne sont jamais séquencées. |
+| `aws-region` | `''` | Région Bedrock du provider `aws`, par exemple `eu-north-1`. Sans elle, ce provider est inutilisable et l'action le dit. |
 | `github-token` | `${{ github.token }}` | Jeton du CLI `gh`. Le jeton du job suffit, avec `pull-requests: write`. |
-| `provider` | `ollama` | Provider des passes qui n'en désignent pas d'autre : `ollama`, `deepseek`, `openai`. |
+| `provider` | `ollama` | Provider des passes qui n'en désignent pas d'autre : `ollama`, `deepseek`, `openai`, `aws`. |
 | `model` | `glm-5.2:cloud` | Modèle du provider global, et de la seule passe « régression ». ⚠️ L'écrire **remet les quatre appels dessus** : voir ci-dessous. |
 | `<passe>-provider` | `''` | Provider d'une passe : `regression`, `doctrine`, `data`, `merge`. |
 | `<passe>-model` | `''` | Modèle d'une passe. |
@@ -434,6 +435,56 @@ Mesuré sur la PR #7 de ce dépôt, ~140 000 tokens d'entrée par passe : la sec
 donc lancées à la suite pour que la seconde rejoue le préfixe de la première en cache.
 préfixe commun : 487 202 caractères, ~139 201 tokens réutilisables.
 ```
+
+#### AWS Bedrock, quand le runner porte un rôle
+
+`provider: aws` vise l'endpoint OpenAI-compatible de Bedrock,
+`bedrock-runtime.<région>.amazonaws.com/openai/v1`, signé en SigV4. Aucune clé à poser : les
+credentials viennent de l'environnement, dans cet ordre. `AWS_ACCESS_KEY_ID` et
+`AWS_SECRET_ACCESS_KEY` s'ils y sont ; sinon le couple `AWS_WEB_IDENTITY_TOKEN_FILE` +
+`AWS_ROLE_ARN`, qu'un runner Kubernetes monte tout seul ; sinon `aws configure export-credentials`,
+qui couvre `AWS_PROFILE` et le SSO en local.
+
+`aws-region` n'a pas de défaut, et il faut la choisir : `eu-west-3` ne sert ni GLM ni DeepSeek,
+`eu-north-1` sert les deux. Sans région, l'action prévient et n'appelle rien.
+
+| Appel | Modèle | `thinking` |
+| --- | --- | --- |
+| régression fonctionnelle | `zai.glm-5` | `max` |
+| doctrine du dépôt | `zai.glm-5` | `high` |
+| données et accès | `zai.glm-4.7-flash` | `high` |
+| fusion | `zai.glm-5` | `low` |
+
+Une seule passe descend, contre trois chez Ollama, pour deux raisons mesurées. Bedrock ne rend
+aucun compteur de cache sur ces modèles : le couple « doctrine » + « données », qui ne visait le
+même modèle que pour partager un préfixe, n'achète plus rien ici. Et « doctrine » est la passe qui
+brûlait tout son budget de raisonnement dans quatre runs sur neuf ; l'affaiblir aggraverait ce
+qu'on vient de corriger.
+
+⚠️ **Pose `max-output-tokens` sur cette route.** Sans lui l'action n'envoie aucun plafond, et
+l'endpoint applique le sien : **8 192 tokens**. Mesuré sur la passe de régression, 147 000 tokens
+d'entrée : elle a brûlé ces 8 192 en raisonnement sans conclure, et le repli l'a rejouée sans
+raisonnement du tout : 103 tokens de sortie, là où la passe la plus utile du lot en demande des
+milliers. L'endpoint accepte tout jusqu'à 200 000 ; `max-output-tokens: 32000` laisse la marge.
+
+⚠️ **Deux particularités de Bedrock, absorbées par l'action.** Le niveau `max` n'existe sur aucun
+des modèles : les trois rendent `400 'reasoning_effort' value 'max' is not supported by this model`.
+L'action le ramène donc à `high`, qui est le maximum disponible là. Et à ce niveau, ces modèles
+n'utilisent pas le champ `reasoning_content` : ils inlinent leur raisonnement dans la réponse, entre
+des balises `<reasoning>` ouvertes et refermées au fil des fragments. Mesuré sur une passe : 33 664
+caractères de chaîne de pensée rendus à la place des trouvailles. L'action les retire du contenu et
+les compte comme raisonnement. Conséquence à connaître : une review qui parlerait littéralement de
+`<reasoning>` verrait sa phrase amputée.
+
+⚠️ **Un modèle en arrière, sur les deux familles.** `glm-5.2` et `deepseek-v4` n'existent sur Bedrock
+dans aucune région : le catalogue s'arrête à `zai.glm-5` et `deepseek.v3.2`. La passe de régression
+est celle qui en souffrira le plus, et c'est la seule dont le README dise que la valeur du flagship
+est observée sur de vraies PR.
+
+⚠️ **Le silence promis aux forks tombe.** Une clé n'est pas exposée à une PR venue d'un fork, donc
+aucune review n'y partait. Un credential de rôle, lui, est ambiant sur le runner. Garde donc le job
+derrière `if: github.event.pull_request.head.repo.full_name == github.repository`, sinon le code
+d'un fork part chez Bedrock et son rapport se poste.
 
 #### Régler autrement
 
@@ -708,6 +759,9 @@ Chaque clé se prend dans `<PROVIDER>_API_KEY`, sinon dans 1Password à la réf�
 | --- | --- | --- |
 | `ollama` | `OLLAMA_API_KEY` | `op://Personal/Ollama/add more/api_key` |
 | `deepseek` | `DEEPSEEK_API_KEY` | `op://Personal/DeepSeek/api_key` |
+
+`aws` n'a pas de clé : il prend le profil de `AWS_PROFILE` par l'intermédiaire du CLI `aws`, SSO
+compris, et `AWS_REGION` tient lieu d'`aws-region`.
 
 Seuls les providers que la review va réellement solliciter sont cherchés : faire clignoter
 1Password pour une clé dont aucune passe n'a besoin serait du bruit.

@@ -111,12 +111,24 @@ inputs:
 
   provider:
     description: >-
-      Provider des passes qui n'en désignent pas d'autre : ollama, deepseek ou
-      openai. Un identifiant inconnu est signalé et ignoré. ⚠️ En désigner un
-      autre qu'ollama écarte le mix : le dépôt a pris la main, on ne renvoie pas
-      ses passes ailleurs dans son dos.
+      Provider des passes qui n'en désignent pas d'autre : ollama, deepseek,
+      openai ou aws. Un identifiant inconnu est signalé et ignoré. ⚠️ En
+      désigner un autre qu'ollama écarte le mix : le dépôt a pris la main, on ne
+      renvoie pas ses passes ailleurs dans son dos.
     required: false
     default: 'ollama'
+
+  aws-region:
+    description: >-
+      Région Bedrock, par exemple eu-north-1, pour le provider « aws ». Vide :
+      ce provider est inutilisable, comme « openai » sans « openai-base-url ».
+      Attention, tous les modèles ne sont pas dans toutes les régions.
+      Les credentials ne se posent pas ici : l'action prend AWS_ACCESS_KEY_ID et
+      AWS_SECRET_ACCESS_KEY s'ils sont là, sinon le token web identity qu'un
+      runner Kubernetes monte (AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN),
+      sinon le CLI aws, qui couvre AWS_PROFILE et le SSO en local.
+    required: false
+    default: ''
 
   github-token:
     description: "Jeton utilisé par le CLI gh. Le jeton du job suffit, avec pull-requests: write."

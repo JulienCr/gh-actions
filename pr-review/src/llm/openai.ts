@@ -48,6 +48,33 @@ export interface OpenAiDialect {
    * « couper le raisonnement » revient alors à ne rien demander.
    */
   thinkingOff?: Record<string, unknown>;
+  /**
+   * Ce qu'on met en en-têtes. Défaut : `Authorization: Bearer <apiKey>`.
+   *
+   * Le corps est passé parce qu'une signature AWS le hache : il doit être
+   * l'octet pour octet de celui envoyé.
+   */
+  authorize?: (request: ChatRequest, body: string) => Record<string, string>;
+  /**
+   * Des tokens de sortie sans un caractère de texte valent-ils « tout est
+   * parti dans le raisonnement » ?
+   *
+   * `stripsReasoningTags` est le chemin principal pour ce cas chez Bedrock ;
+   * ce champ reste une ceinture pour un vide que rien d'autre n'explique.
+   */
+  emptyMeansReasoning?: boolean;
+  /**
+   * Fuite du raisonnement dans `content`, entre balises `<reasoning>` :
+   * mesurée chez Bedrock à `reasoning_effort: high` seulement. Opt-in, pour
+   * ne pas amputer un dépôt dont la review parle vraiment de `<reasoning>`.
+   */
+  stripsReasoningTags?: boolean;
+  /**
+   * Niveaux que ce dialecte ne rend pas sous leur nom générique, traduits
+   * avant l'envoi. Mesuré chez Bedrock : `max` rend un 400, `high` est son
+   * vrai plafond — un fait de dialecte, pas une liste par modèle à deviner.
+   */
+  levelAliases?: Record<string, string>;
 }
 
 interface Delta {
@@ -93,9 +120,9 @@ function readUsage(raw: RawUsage | null | undefined): Usage {
  * Ce qu'on envoie pour régler le raisonnement.
  *
  * On transmet le niveau tel quel plutôt que de le valider : ce que chaque
- * modèle accepte lui appartient (DeepSeek prend `low`, `high`, `max` et ramène
- * `medium` sur `high`), et une liste écrite ici serait périmée au prochain
- * modèle. Un niveau refusé est rattrapé par le repli de `withRetries`.
+ * modèle accepte lui appartient, et une liste écrite ici serait périmée au
+ * prochain modèle. Exception mesurée, `levelAliases`, sur le principe de
+ * `thinkingOff` : un niveau refusé est rattrapé par `withRetries`.
  */
 function reasoningBody(think: string | undefined, dialect: OpenAiDialect): Record<string, unknown> {
   const value = (think ?? '').trim();
@@ -104,7 +131,31 @@ function reasoningBody(think: string | undefined, dialect: OpenAiDialect): Recor
   // Un booléen vrai demande « raisonne », pas « raisonne à tel point » : ne rien
   // envoyer laisse au modèle son réglage par défaut, qui est exactement ça.
   if (/^(true|yes|on)$/i.test(value)) return {};
-  return { reasoning_effort: value.toLowerCase() };
+  const level = value.toLowerCase();
+  return { reasoning_effort: dialect.levelAliases?.[level] ?? level };
+}
+
+/**
+ * Retire les segments `<reasoning>…</reasoning>` d'un texte accumulé.
+ *
+ * Un `<reasoning>` jamais refermé — flux coupé au plafond de sortie en plein
+ * raisonnement — bascule tout ce qui suit dans `thinking` : le laisser dans
+ * `content` posterait une pensée à moitié écrite comme si c'était la review.
+ */
+function stripReasoningTags(text: string): { content: string; thinking: string } {
+  let content = '';
+  let thinking = '';
+  let rest = text;
+  for (;;) {
+    const open = rest.indexOf('<reasoning>');
+    if (open === -1) return { content: content + rest, thinking };
+    content += rest.slice(0, open);
+    const afterOpen = rest.slice(open + '<reasoning>'.length);
+    const close = afterOpen.indexOf('</reasoning>');
+    if (close === -1) return { content, thinking: thinking + afterOpen };
+    thinking += afterOpen.slice(0, close);
+    rest = afterOpen.slice(close + '</reasoning>'.length);
+  }
 }
 
 /**
@@ -131,30 +182,32 @@ type Collected = Omit<Attempt, 'durationMs'>;
 async function send(request: ChatRequest, dialect: OpenAiDialect): Promise<Collected> {
   const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
+  const body = JSON.stringify({
+    model: request.model,
+    stream: true,
+    // Sans ceci, aucun compteur n'arrive en streaming. Voir l'en-tête.
+    stream_options: { include_usage: true },
+    // `seed` n'est volontairement pas envoyé : il n'est documenté chez aucun
+    // des dialectes visés, et un paramètre inconnu se paie d'un 400 sur les
+    // serveurs stricts. La stabilité y repose sur la température seule.
+    temperature: request.temperature ?? 1,
+    // `max_tokens` et non `max_completion_tokens` : c'est le champ que
+    // DeepSeek documente et que les endpoints OpenAI-compatibles acceptent.
+    // Un champ par dialecte le jour où l'un des deux le refuse, pas avant.
+    ...(request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {}),
+    ...reasoningBody(request.think, dialect),
+    messages: request.messages,
+  });
+
   let response: Response;
   try {
     response = await fetch(`${request.baseUrl}/chat/completions`, {
       method: 'POST',
-      headers: {
+      headers: dialect.authorize?.(request, body) ?? {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${request.apiKey}`,
       },
-      body: JSON.stringify({
-        model: request.model,
-        stream: true,
-        // Sans ceci, aucun compteur n'arrive en streaming. Voir l'en-tête.
-        stream_options: { include_usage: true },
-        // `seed` n'est volontairement pas envoyé : il n'est documenté chez aucun
-        // des dialectes visés, et un paramètre inconnu se paie d'un 400 sur les
-        // serveurs stricts. La stabilité y repose sur la température seule.
-        temperature: request.temperature ?? 1,
-        // `max_tokens` et non `max_completion_tokens` : c'est le champ que
-        // DeepSeek documente et que les endpoints OpenAI-compatibles acceptent.
-        // Un champ par dialecte le jour où l'un des deux le refuse, pas avant.
-        ...(request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {}),
-        ...reasoningBody(request.think, dialect),
-        messages: request.messages,
-      }),
+      body,
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
@@ -244,22 +297,29 @@ async function collect(
   if (!complete) {
     throw new LlmError(`le flux de ${dialect.name} s'est interrompu avant la fin de la réponse`, true);
   }
+
+  // Sur le texte ACCUMULÉ, pas fragment par fragment : une balise peut être
+  // coupée en deux entre deux `data:` du flux SSE.
+  if (dialect.stripsReasoningTags) {
+    const stripped = stripReasoningTags(content);
+    content = stripped.content;
+    thinking += stripped.thinking;
+  }
+
   if (!content.trim()) {
-    // Un contenu vide arrive quand tout est parti dans le raisonnement : le
-    // dire vaut mieux que poster un commentaire vide.
-    //
-    // AVANT la garde de troncature, et l'ordre compte : un vide coupé au
-    // plafond est le cas même qui doit déclencher un repli du raisonnement.
-    // Testé d'abord comme une troncature, il partait en erreur sèche, sans
-    // rejeu, alors que la passe était encore récupérable. Le client Ollama
-    // range ses gardes dans le même ordre.
+    // AVANT la garde de troncature : un vide coupé au plafond doit d'abord
+    // passer par le repli du raisonnement, pas par une erreur sèche (mesuré
+    // sur avolo-shorts#99). Le dépouillage ci-dessus l'a déjà isolé du texte.
+    const reasoningExhausted =
+      thinking.trim().length > 0 ||
+      (dialect.emptyMeansReasoning === true && (usage?.outputTokens ?? 0) > 0);
     throw new LlmError(
-      `${dialect.name} a rendu une réponse vide (${usage?.outputTokens ?? 0} tokens de sortie, ` +
-        `dont ${thinking.length} caractères de raisonnement` +
+      `${dialect.name} a rendu une réponse vide (${usage?.outputTokens ?? 0} tokens de sortie` +
+        (thinking.length > 0 ? `, dont ${thinking.length} caractères de raisonnement` : '') +
         `${truncated ? ', plafond de sortie atteint' : ''})`,
       false,
       false,
-      thinking.trim().length > 0,
+      reasoningExhausted,
     );
   }
   if (truncated) {
