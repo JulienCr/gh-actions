@@ -107,7 +107,7 @@ export interface ChatRequest {
    * eu lieu. Il en a déjà écrit un faux (cf. `describeDowngrade`).
    */
   onDowngrade?: (event: Downgrade) => void;
-  /** Signature AWS. Renseigné pour le seul provider `aws`, ignoré ailleurs. */
+  /** AWS signature. Set for the `aws` provider only, ignored elsewhere. */
   aws?: { region: string; credentials: AwsCredentials };
 }
 

@@ -49,30 +49,30 @@ export interface OpenAiDialect {
    */
   thinkingOff?: Record<string, unknown>;
   /**
-   * Ce qu'on met en en-têtes. Défaut : `Authorization: Bearer <apiKey>`.
+   * What to put in the headers. Default: `Authorization: Bearer <apiKey>`.
    *
-   * Le corps est passé parce qu'une signature AWS le hache : il doit être
-   * l'octet pour octet de celui envoyé.
+   * The body is passed because an AWS signature hashes it: it must be the
+   * exact bytes of what gets sent.
    */
   authorize?: (request: ChatRequest, body: string) => Record<string, string>;
   /**
-   * Des tokens de sortie sans un caractère de texte valent-ils « tout est
-   * parti dans le raisonnement » ?
+   * Do output tokens with no text character mean "it all went into
+   * reasoning"?
    *
-   * `stripsReasoningTags` est le chemin principal pour ce cas chez Bedrock ;
-   * ce champ reste une ceinture pour un vide que rien d'autre n'explique.
+   * `stripsReasoningTags` is the main path for this case on Bedrock; this
+   * field remains a belt for an emptiness nothing else explains.
    */
   emptyMeansReasoning?: boolean;
   /**
-   * Fuite du raisonnement dans `content`, entre balises `<reasoning>` :
-   * mesurée chez Bedrock à `reasoning_effort: high` seulement. Opt-in, pour
-   * ne pas amputer un dépôt dont la review parle vraiment de `<reasoning>`.
+   * Reasoning leaking into `content` between `<reasoning>` tags: measured
+   * on Bedrock at `reasoning_effort: high` only. Opt-in, so as not to
+   * amputate a repo whose review genuinely talks about `<reasoning>`.
    */
   stripsReasoningTags?: boolean;
   /**
-   * Niveaux que ce dialecte ne rend pas sous leur nom générique, traduits
-   * avant l'envoi. Mesuré chez Bedrock : `max` rend un 400, `high` est son
-   * vrai plafond — un fait de dialecte, pas une liste par modèle à deviner.
+   * Levels this dialect doesn't return under their generic name, translated
+   * before sending. Measured on Bedrock: `max` returns a 400, `high` is its
+   * real ceiling — a dialect fact, not a per-model list to guess.
    */
   levelAliases?: Record<string, string>;
 }
@@ -117,12 +117,12 @@ function readUsage(raw: RawUsage | null | undefined): Usage {
 }
 
 /**
- * Ce qu'on envoie pour régler le raisonnement.
+ * What we send to set the reasoning level.
  *
- * On transmet le niveau tel quel plutôt que de le valider : ce que chaque
- * modèle accepte lui appartient, et une liste écrite ici serait périmée au
- * prochain modèle. Exception mesurée, `levelAliases`, sur le principe de
- * `thinkingOff` : un niveau refusé est rattrapé par `withRetries`.
+ * The level is passed through as-is rather than validated: what each model
+ * accepts is its own business, and a list written here would go stale at
+ * the next model. Measured exception, `levelAliases`, on the same principle
+ * as `thinkingOff`: a rejected level is caught by `withRetries`.
  */
 function reasoningBody(think: string | undefined, dialect: OpenAiDialect): Record<string, unknown> {
   const value = (think ?? '').trim();
@@ -136,11 +136,11 @@ function reasoningBody(think: string | undefined, dialect: OpenAiDialect): Recor
 }
 
 /**
- * Retire les segments `<reasoning>…</reasoning>` d'un texte accumulé.
+ * Strips `<reasoning>…</reasoning>` segments from an accumulated text.
  *
- * Un `<reasoning>` jamais refermé — flux coupé au plafond de sortie en plein
- * raisonnement — bascule tout ce qui suit dans `thinking` : le laisser dans
- * `content` posterait une pensée à moitié écrite comme si c'était la review.
+ * A `<reasoning>` never closed — stream cut at the output ceiling
+ * mid-thought — moves everything that follows into `thinking`: leaving it
+ * in `content` would post a half-written thought as if it were the review.
  */
 function stripReasoningTags(text: string): { content: string; thinking: string } {
   let content = '';
@@ -298,8 +298,8 @@ async function collect(
     throw new LlmError(`le flux de ${dialect.name} s'est interrompu avant la fin de la réponse`, true);
   }
 
-  // Sur le texte ACCUMULÉ, pas fragment par fragment : une balise peut être
-  // coupée en deux entre deux `data:` du flux SSE.
+  // On the ACCUMULATED text, not fragment by fragment: a tag can be split
+  // in two between two `data:` frames of the SSE stream.
   if (dialect.stripsReasoningTags) {
     const stripped = stripReasoningTags(content);
     content = stripped.content;
@@ -307,9 +307,9 @@ async function collect(
   }
 
   if (!content.trim()) {
-    // AVANT la garde de troncature : un vide coupé au plafond doit d'abord
-    // passer par le repli du raisonnement, pas par une erreur sèche (mesuré
-    // sur avolo-shorts#99). Le dépouillage ci-dessus l'a déjà isolé du texte.
+    // BEFORE the truncation guard: emptiness cut at the ceiling must go
+    // through the reasoning fallback first, not a hard error (measured on
+    // avolo-shorts#99). The stripping above already isolated it from the text.
     const reasoningExhausted =
       thinking.trim().length > 0 ||
       (dialect.emptyMeansReasoning === true && (usage?.outputTokens ?? 0) > 0);

@@ -10,14 +10,14 @@ import {
 } from '../../src/llm';
 
 describe('les providers connus', () => {
-  it('couvre Ollama, DeepSeek, AWS Bedrock et un endpoint OpenAI-compatible générique', () => {
+  it('covers Ollama, DeepSeek, AWS Bedrock and a generic OpenAI-compatible endpoint', () => {
     expect(Object.keys(PROVIDERS).sort()).toEqual(['aws', 'deepseek', 'ollama', 'openai']);
     expect(isProvider('deepseek')).toBe(true);
     expect(isProvider('nawak')).toBe(false);
   });
 
-  /** `aws-sigv4` n'a pas de clé à exiger : `endpointFor` s'appuie sur ce champ. */
-  it('sait quels providers s’authentifient par clé plutôt que par signature', () => {
+  /** `aws-sigv4` has no key to require: `endpointFor` relies on this field. */
+  it('knows which providers authenticate by key rather than by signature', () => {
     expect(PROVIDERS.ollama!.auth).toBe('api-key');
     expect(PROVIDERS.deepseek!.auth).toBe('api-key');
     expect(PROVIDERS.openai!.auth).toBe('api-key');
@@ -123,11 +123,11 @@ describe('le régime horaire', () => {
   });
 
   /**
-   * Le tarif horaire n'existe que chez DeepSeek : latent tant qu'aws n'avait
-   * pas de tarif, l'ajout de sa table l'aurait sinon rendu réel, en divisant
-   * son coût par deux hors heures pleines sans aucune base.
+   * The off-peak rate only exists at DeepSeek: latent while aws had no
+   * price, adding its table would otherwise have made it real, halving its
+   * cost off-peak with no basis at all.
    */
-  it('ne facture pas Bedrock à moitié prix hors heures pleines', () => {
+  it('does not bill Bedrock at half price off-peak', () => {
     const usage = {
       inputTokens: 1_000_000,
       cachedInputTokens: 0,

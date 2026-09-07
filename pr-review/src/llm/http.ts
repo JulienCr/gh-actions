@@ -97,8 +97,8 @@ export function detail(body: string, apiKey: string): string {
 export function scrub(text: string, apiKey: string): string {
   const withoutBearer = text
     .replace(/\bBearer\s+\S+/gi, 'Bearer ***')
-    // Un jeton de session AWS vaut plus qu'une clé API, et un message d'undici
-    // est libre de citer ce qu'il veut.
+    // An AWS session token is worth more than an API key, and an undici
+    // message is free to quote whatever it wants.
     .replace(/AWS4-HMAC-SHA256 \S+/g, 'AWS4-HMAC-SHA256 ***');
   if (!apiKey) return withoutBearer;
   // Échappement : une clé peut contenir des caractères qui font sens en regex.
@@ -164,13 +164,13 @@ function describeCause(error: unknown): string {
 export const redact = (text: string) => text.replace(/\/\/[^/\s@]+@/g, '//***@');
 
 /**
- * Refus de la **valeur** de `think`, pas de la fonctionnalité.
+ * Rejection of the `think` **value**, not of the feature.
  *
- * Mesuré chez Ollama : « invalid think value: … (must be "high", "medium",
- * "low", "max", true, or false) ». Mesuré chez Bedrock : « 'reasoning_effort'
- * value 'max' is not supported by this model ». Dans les deux cas le modèle
- * sait raisonner, seul le niveau est mauvais : retomber sur `true` garde le
- * raisonnement à son défaut, là où retirer le paramètre le supprimerait.
+ * Measured on Ollama: "invalid think value: … (must be "high", "medium",
+ * "low", "max", true, or false)". Measured on Bedrock: "'reasoning_effort'
+ * value 'max' is not supported by this model". In both cases the model can
+ * reason, only the level is bad: falling back to `true` keeps reasoning at
+ * its default, where dropping the parameter would remove it.
  */
 const rejectsThinkingValue = (body: string) =>
   /invalid (think|reasoning_effort) value/i.test(body) ||
