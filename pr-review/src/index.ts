@@ -21,6 +21,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { resolveAwsCredentials } from './aws';
 import { assembleContext, contextFor, type AssembledContext, type WindowOptions } from './context';
 import { run } from './exec';
 import {
@@ -37,6 +38,7 @@ import {
 import { compileMatcher } from './globs';
 import {
   isEnabled,
+  PASS_IDS,
   readInput,
   resolveConfig,
   UsageError,
@@ -54,6 +56,7 @@ import {
   type ChatMessage,
   type ChatResult,
 } from './llm';
+import type { AwsCredentials } from './llm/sigv4';
 import { type DoctrineFile, type PromptOptions } from './prompt';
 import {
   buildMergeSystemPrompt,
@@ -207,9 +210,23 @@ interface Run {
  * `openai-base-url`, il viserait api.openai.com par accident. Mieux vaut le
  * déclarer inutilisable et le dire.
  */
-function endpointFor(config: Config, target: PassConfig): { baseUrl: string; apiKey: string } | null {
+function endpointFor(
+  config: Config,
+  target: PassConfig,
+): { baseUrl: string; apiKey: string; aws?: { region: string; credentials: AwsCredentials } } | null {
   const spec = PROVIDERS[target.provider];
   if (!spec) return null;
+
+  if (target.provider === 'aws') {
+    // Branché ici plutôt que dans `ProviderSpec` : `llm/` ne connaît pas `Config`.
+    if (!config.awsRegion || !config.aws) return null;
+    return {
+      baseUrl: `https://bedrock-runtime.${config.awsRegion}.amazonaws.com/openai/v1`,
+      apiKey: '',
+      aws: config.aws,
+    };
+  }
+
   const baseUrl =
     target.provider === 'openai'
       ? // Le provider générique n'existe que pour viser l'adresse qu'on lui
@@ -224,8 +241,9 @@ function endpointFor(config: Config, target: PassConfig): { baseUrl: string; api
           /\/$/,
           '',
         );
+  if (!baseUrl) return null;
   const apiKey = config.keys[target.provider] ?? '';
-  if (!baseUrl || !apiKey) return null;
+  if (spec.auth === 'api-key' && !apiKey) return null;
   return { baseUrl, apiKey };
 }
 
@@ -321,6 +339,7 @@ async function callModel(
       seed: config.seed,
       timeoutMs: config.timeoutMs,
       maxOutputTokens: config.maxOutputTokens,
+      aws: endpoint.aws,
       onRetry: (reason) => console.warn(`⚠ [${args.label}] ${reason} — nouvelle tentative dans 20 s.`),
       onDowngrade: (event) => console.warn(`⚠ [${args.label}] ${describeDowngrade(event, target.model)}`),
     });
@@ -1041,6 +1060,36 @@ async function loadLocalKeys(env: NodeJS.ProcessEnv): Promise<Env> {
   return enriched;
 }
 
+/**
+ * Injecte les credentials AWS dans l'environnement, avant `resolveConfig`.
+ *
+ * À l'inverse de `keyFrom1Password`, tourne SURTOUT en CI : un credential de
+ * runner n'existe que là. Les cibles sont lues sommairement, sans rejouer la
+ * résolution de `resolveConfig`, pour ne lancer aucun sous-processus `aws`
+ * quand la review part ailleurs. Une passe seule suffit à en avoir besoin.
+ */
+async function loadAwsCredentials(env: Env): Promise<Env> {
+  const wanted = [
+    readInput(env, 'provider') || env.VENDOR?.trim() || '',
+    ...PASS_IDS.map((id) => readInput(env, `${id}-provider`)),
+  ];
+  if (!wanted.some((value) => value.trim().toLowerCase() === 'aws')) return env;
+
+  const region =
+    readInput(env, 'aws-region') || env.AWS_REGION?.trim() || env.AWS_DEFAULT_REGION?.trim() || '';
+  const credentials = await resolveAwsCredentials(env, region, (message) =>
+    console.warn(`⚠ ${message}`),
+  );
+  if (!credentials) return env;
+
+  return {
+    ...env,
+    AWS_ACCESS_KEY_ID: credentials.accessKeyId,
+    AWS_SECRET_ACCESS_KEY: credentials.secretAccessKey,
+    ...(credentials.sessionToken ? { AWS_SESSION_TOKEN: credentials.sessionToken } : {}),
+  };
+}
+
 async function main(): Promise<void> {
   // Avant tout le reste : ni PR lue, ni clé cherchée, ni token dépensé. Le job
   // reste vert, et le log dit pourquoi il n'y aura pas de commentaire.
@@ -1056,7 +1105,7 @@ async function main(): Promise<void> {
 
   const config = resolveConfig({
     argv: process.argv.slice(2),
-    env: countOnly ? process.env : await loadLocalKeys(process.env),
+    env: countOnly ? process.env : await loadAwsCredentials(await loadLocalKeys(process.env)),
     warn: (message) => console.warn(`⚠ ${message}`),
   });
 
@@ -1076,18 +1125,19 @@ async function main(): Promise<void> {
   // `--count-only` n'appelle rien : exiger une clé pour compter des caractères
   // interdirait de mesurer depuis un poste sans 1Password, ou depuis la CI.
   if (!config.countOnly) {
-    // SEULEMENT les providers que cette review va solliciter. Une clé qui
-    // traîne dans l'environnement pour un tout autre usage — un
-    // `OPENAI_API_KEY` posé pour un autre outil — ne doit pas empêcher le
-    // silence promis à une PR venue d'un fork, qui poserait alors un
-    // commentaire d'échec là où rien n'était attendu.
-    const wanted = new Set(Object.values(config.passConfigs).map((target) => target.provider));
-    wanted.add(config.provider);
+    // SEULEMENT les destinations sollicitées, plus le provider global.
+    // `endpointFor` et non un test de clé : un provider adossé à un rôle
+    // (`aws-sigv4`) n'en a pas, et l'ancien test le déclarait à tort inutilisable.
+    const targets: PassConfig[] = [
+      ...Object.values(config.passConfigs),
+      { provider: config.provider, model: config.model, thinking: '' },
+    ];
 
-    if ([...wanted].every((provider) => !config.keys[provider])) {
+    if (targets.every((target) => endpointFor(config, target) === null)) {
       // Cas nominal d'une PR venue d'un fork : GitHub n'y expose pas les
-      // secrets. Rien à commenter, rien à faire échouer.
-      console.log('Aucune clé de provider : review ignorée.');
+      // secrets. ⚠️ Ne vaut plus sous `provider: aws`, dont le credential est
+      // ambiant sur le runner : voir le README, section AWS Bedrock.
+      console.log('Aucun provider utilisable : review ignorée.');
       return;
     }
   }

@@ -1,18 +1,19 @@
 /**
  * Les providers connus, et ce que leurs tokens coûtent. Module **pur**.
  *
- * Trois entrées seulement, et deux clients dessous : `ollama` parle le dialecte
- * d'Ollama, `deepseek` et `openai` parlent celui d'OpenAI. Ajouter Fireworks,
- * Z.ai ou OpenRouter demain revient à ajouter une ligne ici, pas une couche.
+ * Quatre entrées, et deux clients dessous : `ollama` parle le dialecte
+ * d'Ollama, `deepseek`, `openai` et `aws` parlent celui d'OpenAI. Ajouter
+ * Fireworks ou OpenRouter demain revient à ajouter une ligne ici, pas une couche.
  *
  * C'est aussi le seul endroit qui sait qu'un provider ignore la graine ou ne
  * rend aucun compteur de cache : le reste du programme n'a pas à connaître le
  * provider qu'il appelle.
  */
 
+import { signRequest } from './sigv4';
 import { ollamaClient } from './ollama';
 import { createOpenAiClient } from './openai';
-import type { LlmClient, Usage } from './types';
+import { LlmError, type ChatRequest, type LlmClient, type Usage } from './types';
 
 export * from './types';
 // La phrase d'un repli se formule là où la décision se prend, pas au point
@@ -54,6 +55,38 @@ export interface ProviderSpec {
    * plutôt que de laisser croire à une review reproductible.
    */
   supportsSeed: boolean;
+  /**
+   * Comment le provider s'authentifie.
+   *
+   * `aws-sigv4` n'a pas de clé à exiger : c'est ce champ qui permet à
+   * `endpointFor` de le déclarer utilisable sans relâcher la garde des autres.
+   */
+  auth: 'api-key' | 'aws-sigv4';
+}
+
+/**
+ * Signe une requête Bedrock et y ajoute l'en-tête JSON.
+ *
+ * `signRequest` couvre déjà `content-type`, en minuscules, dans les en-têtes
+ * signées : lui en ajouter un second sous une autre casse ferait diverger la
+ * requête envoyée de celle qui a été signée.
+ */
+function bedrockHeaders(request: ChatRequest, body: string): Record<string, string> {
+  if (!request.aws) {
+    // Ne devrait pas arriver : `endpointFor` ne construit cette destination
+    // qu'avec des credentials. Le test reste, faute de quoi un appel non signé
+    // partirait en 403 après avoir envoyé quatre-vingt-dix kilo-octets.
+    throw new LlmError('appel Bedrock sans credentials AWS résolues');
+  }
+  return signRequest({
+    method: 'POST',
+    url: `${request.baseUrl}/chat/completions`,
+    body,
+    region: request.aws.region,
+    service: 'bedrock',
+    credentials: request.aws.credentials,
+    now: new Date(),
+  });
 }
 
 export const PROVIDERS: Record<string, ProviderSpec> = {
@@ -64,6 +97,7 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
     defaultModel: 'glm-5.2:cloud',
     prefixCache: false,
     supportsSeed: true,
+    auth: 'api-key',
   },
   deepseek: {
     label: 'DeepSeek',
@@ -76,6 +110,7 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
     defaultModel: 'deepseek-v4-flash',
     prefixCache: true,
     supportsSeed: false,
+    auth: 'api-key',
   },
   openai: {
     label: 'endpoint OpenAI-compatible',
@@ -88,6 +123,28 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
     // l'active pour qui sait que son endpoint le fait.
     prefixCache: false,
     supportsSeed: false,
+    auth: 'api-key',
+  },
+  aws: {
+    label: 'AWS Bedrock',
+    client: createOpenAiClient({
+      name: 'Bedrock',
+      authorize: bedrockHeaders,
+      emptyMeansReasoning: true,
+      // Mesuré sur les trois modèles : le raisonnement fuit dans `content`
+      // entre balises `<reasoning>` à `high` (jamais à `low` ni sans réglage),
+      // et `max` y rend un 400 alors que `high` est le vrai plafond.
+      stripsReasoningTags: true,
+      levelAliases: { max: 'high' },
+    }),
+    // La base dépend de la région, que ce module ne connaît pas : c'est
+    // `endpointFor` qui la compose.
+    defaultBaseUrl: '',
+    defaultModel: 'zai.glm-5',
+    // Aucun compteur de cache n'est rendu par cet endpoint : mesuré.
+    prefixCache: false,
+    supportsSeed: false,
+    auth: 'aws-sigv4',
   },
 };
 
@@ -114,10 +171,24 @@ export interface Price {
   output: number;
 }
 
+/**
+ * Tarif on-demand standard de Bedrock en `eu-north-1`, relevé le 2026-09-07 via
+ * `aws pricing get-products --service-code AmazonBedrock --filters
+ * Type=TERM_MATCH,Field=regionCode,Value=eu-north-1` (usagetypes
+ * `EUN1-zai.glm5-{input,output}-tokens` et
+ * `EUN1-zai.glm-4.7-flash-{input,output}-tokens`, hors variantes batch/flex/
+ * priority/mantle). `cachedInput` vaut le tarif d'entrée : aucun compteur de
+ * cache n'existe pour ces modèles sur Bedrock, ce champ ne sera donc jamais
+ * multiplié que par zéro.
+ */
+const bedrockPrice = (input: number, output: number): Price => ({ input, cachedInput: input, output });
+
 /** Tarif d'heure pleine. L'heure creuse vaut la moitié, cf. `priceFor`. */
 export const PRICES: Record<string, Price> = {
   'deepseek/deepseek-v4-flash': { input: 0.44, cachedInput: 0.014, output: 1.32 },
   'deepseek/deepseek-v4-pro': { input: 1.32, cachedInput: 0.044, output: 3.96 },
+  'aws/zai.glm-5': bedrockPrice(1.2, 3.84),
+  'aws/zai.glm-4.7-flash': bedrockPrice(0.08, 0.48),
 };
 
 /**
@@ -147,7 +218,10 @@ export function estimateCost(
 ): number | null {
   const price = PRICES[`${provider}/${model}`];
   if (!price) return null;
-  const ratio = peak ? 1 : OFF_PEAK_RATIO;
+  // Le tarif horaire n'existe que chez DeepSeek : l'appliquer à un autre
+  // provider diviserait son coût par deux hors heures pleines sans aucune base
+  // réelle. Latent tant qu'aws n'avait pas de tarif, ce test l'a rendu réel.
+  const ratio = !peak && provider === 'deepseek' ? OFF_PEAK_RATIO : 1;
   // `inputTokens` inclut la part servie par le cache : la facturer au plein
   // tarif la compterait deux fois et effacerait précisément l'économie qu'on
   // cherche à mesurer.

@@ -95,7 +95,11 @@ export function detail(body: string, apiKey: string): string {
  * citerait, dont nous ne connaissons pas la valeur.
  */
 export function scrub(text: string, apiKey: string): string {
-  const withoutBearer = text.replace(/\bBearer\s+\S+/gi, 'Bearer ***');
+  const withoutBearer = text
+    .replace(/\bBearer\s+\S+/gi, 'Bearer ***')
+    // Un jeton de session AWS vaut plus qu'une clé API, et un message d'undici
+    // est libre de citer ce qu'il veut.
+    .replace(/AWS4-HMAC-SHA256 \S+/g, 'AWS4-HMAC-SHA256 ***');
   if (!apiKey) return withoutBearer;
   // Échappement : une clé peut contenir des caractères qui font sens en regex.
   const pattern = apiKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -162,14 +166,15 @@ export const redact = (text: string) => text.replace(/\/\/[^/\s@]+@/g, '//***@')
 /**
  * Refus de la **valeur** de `think`, pas de la fonctionnalité.
  *
- * Mesuré chez Ollama : une valeur inconnue rend « invalid think value: … (must
- * be "high", "medium", "low", "max", true, or false) ». Le modèle sait donc
- * raisonner, seul le niveau est mauvais : retomber sur `true` garde le
- * raisonnement à son niveau par défaut, là où retirer le paramètre le
- * supprimerait. Une coquille dans un input ne doit pas coûter la profondeur de
- * la review.
+ * Mesuré chez Ollama : « invalid think value: … (must be "high", "medium",
+ * "low", "max", true, or false) ». Mesuré chez Bedrock : « 'reasoning_effort'
+ * value 'max' is not supported by this model ». Dans les deux cas le modèle
+ * sait raisonner, seul le niveau est mauvais : retomber sur `true` garde le
+ * raisonnement à son défaut, là où retirer le paramètre le supprimerait.
  */
-const rejectsThinkingValue = (body: string) => /invalid (think|reasoning_effort) value/i.test(body);
+const rejectsThinkingValue = (body: string) =>
+  /invalid (think|reasoning_effort) value/i.test(body) ||
+  /'(?:think|reasoning_effort)' value '[^']*' is not supported/i.test(body);
 
 /**
  * La reprise et les replis, communs aux providers.

@@ -12,6 +12,8 @@
  * provider, ce que toute l'abstraction sert précisément à éviter.
  */
 
+import type { AwsCredentials } from './sigv4';
+
 export interface ChatMessage {
   role: 'system' | 'user';
   content: string;
@@ -105,6 +107,8 @@ export interface ChatRequest {
    * eu lieu. Il en a déjà écrit un faux (cf. `describeDowngrade`).
    */
   onDowngrade?: (event: Downgrade) => void;
+  /** Signature AWS. Renseigné pour le seul provider `aws`, ignoré ailleurs. */
+  aws?: { region: string; credentials: AwsCredentials };
 }
 
 /**
