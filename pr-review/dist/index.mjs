@@ -51,7 +51,7 @@ async function resolveAwsCredentials(env, region, warn) {
   const fromCli = await fromAwsCli(warn);
   if (fromCli) return fromCli;
   warn(
-    "aucune credential AWS trouv\xE9e (ni AWS_ACCESS_KEY_ID, ni web identity, ni `aws configure export-credentials`)"
+    "no AWS credentials found (neither AWS_ACCESS_KEY_ID, nor web identity, nor `aws configure export-credentials`)"
   );
   return null;
 }
@@ -67,14 +67,14 @@ async function fromWebIdentityToken(env, region, warn) {
   const roleArn = env.AWS_ROLE_ARN;
   if (!tokenFile || !roleArn) return null;
   if (!region) {
-    warn("AWS_WEB_IDENTITY_TOKEN_FILE pr\xE9sent mais r\xE9gion vide : STS a besoin d'un endpoint r\xE9gional, barreau saut\xE9");
+    warn("AWS_WEB_IDENTITY_TOKEN_FILE present but region empty: STS needs a regional endpoint, rung skipped");
     return null;
   }
   let token;
   try {
     token = readFileSync(tokenFile, "utf-8").trim();
   } catch (error) {
-    warn(`lecture de AWS_WEB_IDENTITY_TOKEN_FILE impossible (${errorMessage(error)})`);
+    warn(`cannot read AWS_WEB_IDENTITY_TOKEN_FILE (${errorMessage(error)})`);
     return null;
   }
   const body = [
@@ -93,19 +93,19 @@ async function fromWebIdentityToken(env, region, warn) {
     });
     const text = await response.text();
     if (!response.ok) {
-      warn(`AssumeRoleWithWebIdentity a \xE9chou\xE9 (HTTP ${response.status})`);
+      warn(`AssumeRoleWithWebIdentity failed (HTTP ${response.status})`);
       return null;
     }
     const accessKeyId = extractTag(text, "AccessKeyId");
     const secretAccessKey = extractTag(text, "SecretAccessKey");
     const sessionToken = extractTag(text, "SessionToken");
     if (!accessKeyId || !secretAccessKey || !sessionToken) {
-      warn("AssumeRoleWithWebIdentity a r\xE9pondu sans un des trois champs attendus");
+      warn("AssumeRoleWithWebIdentity responded without one of the three expected fields");
       return null;
     }
     return { accessKeyId, secretAccessKey, sessionToken };
   } catch (error) {
-    warn(`appel \xE0 AssumeRoleWithWebIdentity impossible (${errorMessage(error)})`);
+    warn(`AssumeRoleWithWebIdentity call failed (${errorMessage(error)})`);
     return null;
   }
 }
@@ -122,12 +122,12 @@ async function fromAwsCli(warn) {
     const output = await run("aws", ["configure", "export-credentials", "--format", "process"]);
     const parsed = JSON.parse(output);
     if (!parsed.AccessKeyId || !parsed.SecretAccessKey) {
-      warn("`aws configure export-credentials` a r\xE9pondu sans AccessKeyId/SecretAccessKey");
+      warn("`aws configure export-credentials` responded without AccessKeyId/SecretAccessKey");
       return null;
     }
     return parsed.SessionToken ? { accessKeyId: parsed.AccessKeyId, secretAccessKey: parsed.SecretAccessKey, sessionToken: parsed.SessionToken } : { accessKeyId: parsed.AccessKeyId, secretAccessKey: parsed.SecretAccessKey };
   } catch (error) {
-    warn(`\`aws configure export-credentials\` indisponible (${errorMessage(error)})`);
+    warn(`\`aws configure export-credentials\` unavailable (${errorMessage(error)})`);
     return null;
   }
 }
@@ -1099,17 +1099,17 @@ var PROVIDERS = {
       name: "Bedrock",
       authorize: bedrockHeaders,
       emptyMeansReasoning: true,
-      // Mesuré sur les trois modèles : le raisonnement fuit dans `content`
-      // entre balises `<reasoning>` à `high` (jamais à `low` ni sans réglage),
-      // et `max` y rend un 400 alors que `high` est le vrai plafond.
+      // Measured on all three models: reasoning leaks into `content`
+      // between `<reasoning>` tags at `high` (never at `low` nor unset),
+      // and `max` returns a 400 there while `high` is the real ceiling.
       stripsReasoningTags: true,
       levelAliases: { max: "high" }
     }),
-    // La base dépend de la région, que ce module ne connaît pas : c'est
-    // `endpointFor` qui la compose.
+    // The base depends on the region, which this module doesn't know: it's
+    // `endpointFor` that builds it.
     defaultBaseUrl: "",
     defaultModel: "zai.glm-5",
-    // Aucun compteur de cache n'est rendu par cet endpoint : mesuré.
+    // No cache counter is returned by this endpoint: measured.
     prefixCache: false,
     supportsSeed: false,
     auth: "aws-sigv4"
@@ -1865,7 +1865,7 @@ function resolveConfig({ argv, env, warn = () => {
   };
   const vendorAlias = (env.VENDOR ?? "").trim().toLowerCase();
   if (vendorAlias !== "" && !isProvider(vendorAlias)) {
-    warn(`VENDOR \xAB ${vendorAlias} \xBB n'est pas un provider connu (${PROVIDER_IDS.join(", ")}) : ignor\xE9.`);
+    warn(`VENDOR "${vendorAlias}" is not a known provider (${PROVIDER_IDS.join(", ")}): ignored.`);
   }
   const provider = readProvider(
     env,
@@ -1884,7 +1884,7 @@ function resolveConfig({ argv, env, warn = () => {
   const awsRegion = readInput(env, "aws-region") || env.AWS_REGION?.trim() || env.AWS_DEFAULT_REGION?.trim() || "";
   if (provider === "aws" && awsRegion === "") {
     warn(
-      "provider \xAB aws \xBB sans r\xE9gion : renseigne \xAB aws-region \xBB (ou AWS_REGION), sinon\n  l'appel visera une base vide et sera \xE9cart\xE9 avant d'\xEAtre tent\xE9."
+      'provider "aws" without a region: set "aws-region" (or AWS_REGION), or\n  the call will target an empty base and be dropped before it is tried.'
     );
   }
   const awsAccessKeyId = env.AWS_ACCESS_KEY_ID?.trim() || "";
@@ -2837,7 +2837,7 @@ async function main() {
       { provider: config.provider, model: config.model, thinking: "" }
     ];
     if (targets.every((target) => endpointFor(config, target) === null)) {
-      console.log("Aucun provider utilisable : review ignor\xE9e.");
+      console.log("No usable provider: review skipped.");
       return;
     }
   }

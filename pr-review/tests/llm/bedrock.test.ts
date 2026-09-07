@@ -1,7 +1,7 @@
 // @vitest-environment node
 //
-// Comme pour Ollama et le client OpenAI-compatible : ce module ne parle que
-// HTTP, et un environnement DOM substituerait son propre `fetch`.
+// Same as for Ollama and the OpenAI-compatible client: this module only
+// speaks HTTP, and a DOM environment would substitute its own `fetch`.
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -10,9 +10,9 @@ import { PROVIDERS } from '../../src/llm';
 import type { Downgrade } from '../../src/llm/types';
 
 /**
- * Ce qui est propre à Bedrock et n'a pas d'équivalent chez DeepSeek : la
- * signature SigV4 en en-têtes plutôt qu'un `Bearer`, et un endpoint qui ne
- * rend jamais son raisonnement à part (`emptyMeansReasoning`).
+ * What's specific to Bedrock and has no DeepSeek equivalent: the SigV4
+ * signature in headers rather than a `Bearer`, and an endpoint that never
+ * returns its reasoning apart (`emptyMeansReasoning`).
  */
 
 interface Scripted {
@@ -37,7 +37,7 @@ beforeAll(async () => {
       lastBody = JSON.parse(raw) as Record<string, unknown>;
       lastPath = req.url ?? '';
       lastAuthorization = req.headers.authorization ?? '';
-      const next = queue.shift() ?? { status: 500, body: 'aucune réponse programmée' };
+      const next = queue.shift() ?? { status: 500, body: 'no scripted response' };
       res.statusCode = next.status;
       res.setHeader('content-type', next.status === 200 ? 'text/event-stream' : 'application/json');
       res.end(next.body);
@@ -86,8 +86,8 @@ const call = (over: Partial<Parameters<(typeof PROVIDERS)['aws']['client']>[0]> 
     ...over,
   });
 
-describe('la signature de la requête', () => {
-  it('signe avec AWS4-HMAC-SHA256 et vise /chat/completions', async () => {
+describe('the request signature', () => {
+  it('signs with AWS4-HMAC-SHA256 and targets /chat/completions', async () => {
     queue.push({ status: 200, body: ok() });
     await call();
     expect(lastAuthorization).toMatch(/^AWS4-HMAC-SHA256 /);
@@ -95,8 +95,8 @@ describe('la signature de la requête', () => {
   });
 });
 
-describe('la lecture du flux', () => {
-  it('agrège le contenu et l’usage d’un flux SSE valide', async () => {
+describe('reading the stream', () => {
+  it('aggregates the content and usage of a valid SSE stream', async () => {
     queue.push({ status: 200, body: ok('## Trouvailles\n- rien à signaler') });
     const result = await call();
     expect(result.content).toBe('## Trouvailles\n- rien à signaler');
@@ -106,14 +106,14 @@ describe('la lecture du flux', () => {
 });
 
 /**
- * Le point qui compte le plus : cet endpoint ne rend JAMAIS son raisonnement à
- * part, même à `reasoning_effort: high` (mesuré). Sans `emptyMeansReasoning`,
- * un vide qui a bel et bien consommé des tokens de sortie ne se distinguerait
- * pas d'un vide sans aucune cause, et le repli de `withRetries` ne se
- * déclencherait jamais chez ce provider.
+ * The point that matters most: this endpoint NEVER returns its reasoning
+ * apart, even at `reasoning_effort: high` (measured). Without
+ * `emptyMeansReasoning`, an emptiness that did consume output tokens would
+ * be indistinguishable from one with no cause at all, and `withRetries`'s
+ * fallback would never fire for this provider.
  */
-describe('un raisonnement qui ne rend jamais son texte', () => {
-  it('marque reasoningExhausted sans `reasoning_content`, dès que la sortie n’est pas vide', async () => {
+describe('reasoning that never returns its text', () => {
+  it('flags reasoningExhausted without `reasoning_content`, as soon as output isn\'t empty', async () => {
     queue.push({
       status: 200,
       body: sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }, usage({ completion_tokens: 4_096 })),
@@ -126,7 +126,7 @@ describe('un raisonnement qui ne rend jamais son texte', () => {
     expect(downgrades[0]?.cause).toBe('reasoning-exhausted');
   });
 
-  it('ne rejoue pas un vide qui n’a produit aucun token de sortie', async () => {
+  it('does not replay an emptiness that produced no output tokens', async () => {
     queue.push({
       status: 200,
       body: sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }, usage({ completion_tokens: 0 })),
@@ -136,9 +136,9 @@ describe('un raisonnement qui ne rend jamais son texte', () => {
   });
 });
 
-/** Mesuré sur les trois modèles : une valeur refusée rend ce message exact. */
-describe('un niveau de raisonnement refusé', () => {
-  it('reconnaît « <param> value <x> is not supported », pas seulement le tour d’Ollama', async () => {
+/** Measured on all three models: a rejected value returns this exact message. */
+describe('a rejected reasoning level', () => {
+  it('recognizes "<param> value <x> is not supported", not just Ollama\'s wording', async () => {
     queue.push({
       status: 400,
       body: `{"error":"'reasoning_effort' value 'max' is not supported by this model"}`,
@@ -148,21 +148,21 @@ describe('un niveau de raisonnement refusé', () => {
     const result = await call({ think: 'nawak', onDowngrade: (event) => downgrades.push(event) });
     expect(result.content).toBe('trouvailles');
     expect(calls).toBe(2);
-    // Mal classé, c'était « thinking-unsupported » : le journal aurait affirmé
-    // que le modèle ne sait pas raisonner, alors que seul le niveau est mauvais.
+    // Misclassified, this was 'thinking-unsupported': the log would have
+    // claimed the model can't reason, when only the level is wrong.
     expect(downgrades[0]?.cause).toBe('level-rejected');
     expect(lastBody.reasoning_effort).toBeUndefined();
   });
 });
 
 /**
- * Mesuré sur les trois modèles à `reasoning_effort: high` (jamais à `low` ni
- * sans le paramètre) : la chaîne de pensée fuit dans `content`, entre balises
- * `<reasoning>` ouvertes et refermées au milieu des phrases. Sur un run réel,
- * 33 664 caractères de raisonnement anglais sont partis comme review.
+ * Measured on all three models at `reasoning_effort: high` (never at `low`
+ * nor without the parameter): the chain of thought leaks into `content`,
+ * between `<reasoning>` tags opened and closed mid-sentence. On one real
+ * run, 33,664 characters of English reasoning went out as the review.
  */
-describe('les balises <reasoning> dans le contenu', () => {
-  it('les retire même coupées entre deux fragments SSE, et compte le raisonnement', async () => {
+describe('<reasoning> tags in the content', () => {
+  it('strips them even when split across two SSE fragments, and counts the reasoning', async () => {
     queue.push({
       status: 200,
       body: sse(
@@ -177,7 +177,7 @@ describe('les balises <reasoning> dans le contenu', () => {
     expect(result.thinkingChars).toBe('je réfléchis'.length);
   });
 
-  it('bascule un <reasoning> jamais refermé dans thinking, et replie plutôt que de le poster', async () => {
+  it('moves a never-closed <reasoning> into thinking, and falls back rather than posting it', async () => {
     queue.push({
       status: 200,
       body: sse(
@@ -195,9 +195,9 @@ describe('les balises <reasoning> dans le contenu', () => {
   });
 });
 
-/** Mesuré sur les trois modèles : `max` seul rend ce 400, `high` non. */
-describe('un niveau que ce dialecte ne connaît pas sous son nom générique', () => {
-  it('traduit « max » en « high », le vrai plafond disponible', async () => {
+/** Measured on all three models: `max` alone returns this 400, `high` doesn't. */
+describe("a level this dialect doesn't recognize under its generic name", () => {
+  it('translates "max" to "high", the real available ceiling', async () => {
     queue.push({ status: 200, body: ok() });
     await call({ think: 'max' });
     expect(lastBody.reasoning_effort).toBe('high');

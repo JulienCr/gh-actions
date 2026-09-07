@@ -1,8 +1,8 @@
 // @vitest-environment node
 //
-// Une signature fausse rend un 403 côté Bedrock, jamais un test rouge : la
-// seule protection est un vecteur à réponse connue, ancré sur un tiers
-// indépendant plutôt que sur ce que ce module croit produire.
+// A wrong signature returns a 403 from Bedrock, never a red test: the only
+// protection is a known-answer vector, anchored on an independent third
+// party rather than on what this module believes it produces.
 import { describe, it, expect } from 'vitest';
 import { createHash } from 'node:crypto';
 import { signingKey, signRequest } from '../../src/llm/sigv4';
@@ -19,17 +19,17 @@ const sign = (over: Partial<Parameters<typeof signRequest>[0]> = {}) =>
   signRequest({ method: 'POST', url, body, region: 'eu-north-1', service: 'bedrock', credentials, now, ...over });
 
 describe('signingKey', () => {
-  it("retrouve l'exemple travaillé de la doc AWS SigV4 (us-east-1/iam/20150830)", () => {
-    // Ancre externe, publiée par AWS et calculée hors de ce module : sans
-    // elle, une chaîne d'HMAC inversée ou mal enchaînée passerait tous les
-    // autres tests, qui ne font que comparer à leur propre sortie.
+  it('reproduces the worked example from the AWS SigV4 docs (us-east-1/iam/20150830)', () => {
+    // External anchor, published by AWS and computed outside this module:
+    // without it, a reversed or misordered HMAC chain would pass every
+    // other test, which only compare against their own output.
     const key = signingKey('wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY', '20150830', 'us-east-1', 'iam');
     expect(key.toString('hex')).toBe('c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9');
   });
 });
 
 describe('signRequest', () => {
-  it('signe une requête sans jeton de session', () => {
+  it('signs a request without a session token', () => {
     const headers = sign();
     expect(headers['x-amz-security-token']).toBeUndefined();
     expect(headers.authorization).toBe(
@@ -39,7 +39,7 @@ describe('signRequest', () => {
     );
   });
 
-  it('ajoute x-amz-security-token à signedHeaders quand un jeton est fourni, et change la signature', () => {
+  it('adds x-amz-security-token to signedHeaders when a token is given, and changes the signature', () => {
     const withToken = sign({ credentials: { ...credentials, sessionToken: 'FQoGZXIvYXdzEXAMPLETOKEN' } });
     const withoutToken = sign();
     expect(withToken['x-amz-security-token']).toBe('FQoGZXIvYXdzEXAMPLETOKEN');
@@ -50,23 +50,23 @@ describe('signRequest', () => {
     expect(withToken.authorization).not.toBe(withoutToken.authorization);
   });
 
-  it('un jeton vide compte comme absent', () => {
+  it('an empty token counts as absent', () => {
     const headers = sign({ credentials: { ...credentials, sessionToken: '' } });
     expect(headers['x-amz-security-token']).toBeUndefined();
     expect(headers.authorization).not.toContain('x-amz-security-token');
   });
 
-  it('hache le corps en UTF-8, accents compris', () => {
+  it('hashes the body as UTF-8, accents included', () => {
     const accented = JSON.stringify({ text: '« régression »' });
     const headers = sign({ body: accented });
     expect(headers['x-amz-content-sha256']).toBe(createHash('sha256').update(accented, 'utf8').digest('hex'));
   });
 
-  it('deux appels avec le même now rendent la même signature', () => {
+  it('two calls with the same now produce the same signature', () => {
     expect(sign().authorization).toBe(sign().authorization);
   });
 
-  it('un now différent rend une signature différente', () => {
+  it('a different now produces a different signature', () => {
     const later = sign({ now: new Date('2015-08-30T12:37:00Z') });
     expect(later.authorization).not.toBe(sign().authorization);
   });

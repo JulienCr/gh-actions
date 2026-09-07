@@ -1,8 +1,8 @@
 /**
- * Résolution des identifiants AWS, quatre barreaux du plus explicite au plus
- * ambiant : env statique, web identity (runners Kubernetes), CLI `aws`
- * (profils locaux, SSO compris). Aucun SDK AWS : builtins Node et `fetch`
- * global seulement.
+ * AWS credential resolution, four rungs from most explicit to most ambient:
+ * static env, web identity (Kubernetes runners), the `aws` CLI (local
+ * profiles, SSO included). No AWS SDK: Node builtins and global `fetch`
+ * only.
  */
 
 import { readFileSync } from 'node:fs';
@@ -12,7 +12,7 @@ import { run } from './exec';
 const STS_TIMEOUT_MS = 10_000;
 
 /**
- * Résout des credentials AWS, ou `null` quand l'environnement n'en offre aucune.
+ * Resolves AWS credentials, or `null` when the environment offers none.
  */
 export async function resolveAwsCredentials(
   env: NodeJS.ProcessEnv,
@@ -29,7 +29,7 @@ export async function resolveAwsCredentials(
   if (fromCli) return fromCli;
 
   warn(
-    'aucune credential AWS trouvée (ni AWS_ACCESS_KEY_ID, ni web identity, ni `aws configure export-credentials`)',
+    'no AWS credentials found (neither AWS_ACCESS_KEY_ID, nor web identity, nor `aws configure export-credentials`)',
   );
   return null;
 }
@@ -51,7 +51,7 @@ async function fromWebIdentityToken(
   const roleArn = env.AWS_ROLE_ARN;
   if (!tokenFile || !roleArn) return null;
   if (!region) {
-    warn("AWS_WEB_IDENTITY_TOKEN_FILE présent mais région vide : STS a besoin d'un endpoint régional, barreau sauté");
+    warn('AWS_WEB_IDENTITY_TOKEN_FILE present but region empty: STS needs a regional endpoint, rung skipped');
     return null;
   }
 
@@ -59,7 +59,7 @@ async function fromWebIdentityToken(
   try {
     token = readFileSync(tokenFile, 'utf-8').trim();
   } catch (error) {
-    warn(`lecture de AWS_WEB_IDENTITY_TOKEN_FILE impossible (${errorMessage(error)})`);
+    warn(`cannot read AWS_WEB_IDENTITY_TOKEN_FILE (${errorMessage(error)})`);
     return null;
   }
 
@@ -72,8 +72,8 @@ async function fromWebIdentityToken(
   ].join('&');
 
   try {
-    // Le seul appel STS non signé : c'est justement celui qui fournit la
-    // credential dont tous les autres appels ont besoin.
+    // The only unsigned STS call: it's precisely the one that supplies the
+    // credential every other call needs.
     const response = await fetch(`https://sts.${region}.amazonaws.com/`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -82,24 +82,24 @@ async function fromWebIdentityToken(
     });
     const text = await response.text();
     if (!response.ok) {
-      warn(`AssumeRoleWithWebIdentity a échoué (HTTP ${response.status})`);
+      warn(`AssumeRoleWithWebIdentity failed (HTTP ${response.status})`);
       return null;
     }
     const accessKeyId = extractTag(text, 'AccessKeyId');
     const secretAccessKey = extractTag(text, 'SecretAccessKey');
     const sessionToken = extractTag(text, 'SessionToken');
     if (!accessKeyId || !secretAccessKey || !sessionToken) {
-      warn('AssumeRoleWithWebIdentity a répondu sans un des trois champs attendus');
+      warn('AssumeRoleWithWebIdentity responded without one of the three expected fields');
       return null;
     }
     return { accessKeyId, secretAccessKey, sessionToken };
   } catch (error) {
-    warn(`appel à AssumeRoleWithWebIdentity impossible (${errorMessage(error)})`);
+    warn(`AssumeRoleWithWebIdentity call failed (${errorMessage(error)})`);
     return null;
   }
 }
 
-/** 64 caractères max, alphanumérique et `[\w+=,.@-]` seulement (contrainte AWS sur `RoleSessionName`). */
+/** 64 chars max, alphanumeric and `[\w+=,.@-]` only (AWS constraint on `RoleSessionName`). */
 function roleSessionName(env: NodeJS.ProcessEnv): string {
   const raw = `pr-review-${env.GITHUB_RUN_ID ?? Date.now()}`;
   return raw.replace(/[^\w+=,.@-]/g, '').slice(0, 64);
@@ -119,14 +119,14 @@ async function fromAwsCli(warn: (message: string) => void): Promise<AwsCredentia
       SessionToken?: string;
     };
     if (!parsed.AccessKeyId || !parsed.SecretAccessKey) {
-      warn('`aws configure export-credentials` a répondu sans AccessKeyId/SecretAccessKey');
+      warn('`aws configure export-credentials` responded without AccessKeyId/SecretAccessKey');
       return null;
     }
     return parsed.SessionToken
       ? { accessKeyId: parsed.AccessKeyId, secretAccessKey: parsed.SecretAccessKey, sessionToken: parsed.SessionToken }
       : { accessKeyId: parsed.AccessKeyId, secretAccessKey: parsed.SecretAccessKey };
   } catch (error) {
-    warn(`\`aws configure export-credentials\` indisponible (${errorMessage(error)})`);
+    warn(`\`aws configure export-credentials\` unavailable (${errorMessage(error)})`);
     return null;
   }
 }

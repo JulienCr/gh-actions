@@ -218,7 +218,7 @@ function endpointFor(
   if (!spec) return null;
 
   if (target.provider === 'aws') {
-    // Branché ici plutôt que dans `ProviderSpec` : `llm/` ne connaît pas `Config`.
+    // Wired here rather than in `ProviderSpec`: `llm/` doesn't know `Config`.
     if (!config.awsRegion || !config.aws) return null;
     return {
       baseUrl: `https://bedrock-runtime.${config.awsRegion}.amazonaws.com/openai/v1`,
@@ -1061,12 +1061,12 @@ async function loadLocalKeys(env: NodeJS.ProcessEnv): Promise<Env> {
 }
 
 /**
- * Injecte les credentials AWS dans l'environnement, avant `resolveConfig`.
+ * Injects AWS credentials into the environment, before `resolveConfig`.
  *
- * À l'inverse de `keyFrom1Password`, tourne SURTOUT en CI : un credential de
- * runner n'existe que là. Les cibles sont lues sommairement, sans rejouer la
- * résolution de `resolveConfig`, pour ne lancer aucun sous-processus `aws`
- * quand la review part ailleurs. Une passe seule suffit à en avoir besoin.
+ * Unlike `keyFrom1Password`, this runs MOSTLY in CI: a runner credential
+ * only exists there. Targets are read loosely, without replaying
+ * `resolveConfig`'s resolution, so no `aws` subprocess launches when the
+ * review goes elsewhere. A single pass is enough to need it.
  */
 async function loadAwsCredentials(env: Env): Promise<Env> {
   const wanted = [
@@ -1125,19 +1125,19 @@ async function main(): Promise<void> {
   // `--count-only` n'appelle rien : exiger une clé pour compter des caractères
   // interdirait de mesurer depuis un poste sans 1Password, ou depuis la CI.
   if (!config.countOnly) {
-    // SEULEMENT les destinations sollicitées, plus le provider global.
-    // `endpointFor` et non un test de clé : un provider adossé à un rôle
-    // (`aws-sigv4`) n'en a pas, et l'ancien test le déclarait à tort inutilisable.
+    // ONLY the requested destinations, plus the global provider.
+    // `endpointFor` rather than a key check: a provider backed by a role
+    // (`aws-sigv4`) has none, and the old check wrongly declared it unusable.
     const targets: PassConfig[] = [
       ...Object.values(config.passConfigs),
       { provider: config.provider, model: config.model, thinking: '' },
     ];
 
     if (targets.every((target) => endpointFor(config, target) === null)) {
-      // Cas nominal d'une PR venue d'un fork : GitHub n'y expose pas les
-      // secrets. ⚠️ Ne vaut plus sous `provider: aws`, dont le credential est
-      // ambiant sur le runner : voir le README, section AWS Bedrock.
-      console.log('Aucun provider utilisable : review ignorée.');
+      // The nominal case of a PR from a fork: GitHub doesn't expose secrets
+      // there. ⚠️ No longer holds under `provider: aws`, whose credential is
+      // ambient on the runner: see the README, AWS Bedrock section.
+      console.log('No usable provider: review skipped.');
       return;
     }
   }

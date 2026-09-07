@@ -205,16 +205,16 @@ const CHEAP_MODEL: Record<string, string> = {
  * qu'une fois les quatre-vingt-dix kilo-octets de contexte commun. Les séparer
  * annulerait ce levier.
  */
-/** Niveau de la fusion sous un mix : elle trie des puces sans avoir le code. */
+/** Merge's level under a mix: it sorts bullets without having the code. */
 const MIX_MERGE_THINKING = 'low';
 
 export function mixFor(provider: string): Partial<Record<PassId, PassConfig>> {
   const model = CHEAP_MODEL[provider];
   if (!model) return {};
   if (provider === 'aws') {
-    // Seule « données » bouge ici : le cache de préfixe qui justifiait aussi
-    // doctrine n'existe pas sur Bedrock (mesuré), et l'affaiblir aggraverait
-    // son budget de raisonnement déjà tendu (4 runs sur 9, commit a6d6846).
+    // Only "data" moves here: the prefix cache that also justified doctrine
+    // doesn't exist on Bedrock (measured), and weakening it would worsen its
+    // already tight reasoning budget (4 runs out of 9, commit a6d6846).
     return { data: { provider, model, thinking: 'high' } };
   }
   return {
@@ -239,8 +239,8 @@ export function mixFor(provider: string): Partial<Record<PassId, PassConfig>> {
  * Ollama, qui sert le même modèle et suffit à descendre d'un niveau d'usage.
  */
 export function mixRoute(provider: string, hasDeepSeekKey: boolean): string | null {
-  // Un mix qui reste chez `aws` ne déplace rien vers un autre provider : la
-  // garde qui suit ne protège que d'un déplacement dans le dos du dépôt.
+  // A mix that stays on `aws` moves nothing to another provider: the guard
+  // below only protects against a move behind the repo's back.
   if (provider === 'aws') return 'aws';
   if (provider !== DEFAULTS.provider) return null;
   return hasDeepSeekKey ? 'deepseek' : 'ollama';
@@ -275,9 +275,9 @@ export interface Config {
    * de cache.
    */
   openaiPrefixCache: boolean;
-  /** Région Bedrock. Vide : le provider `aws` est inutilisable. */
+  /** Bedrock region. Empty: the `aws` provider is unusable. */
   awsRegion: string;
-  /** Credentials AWS résolues, ou `null`. Remplies tard, cf. `main`. */
+  /** Resolved AWS credentials, or `null`. Filled in later, see `main`. */
   aws: { region: string; credentials: AwsCredentials } | null;
   temperature: number;
   /** `undefined` : pas de graine, le modèle varie d'une exécution à l'autre. */
@@ -590,9 +590,9 @@ export function resolvePassConfigs(
     // nombre de crans que leur table leur assigne.
     const steps = PASSES.find((pass) => pass.id === id)?.thinkingSteps[options.effort] ?? 0;
     const written = id === 'merge' ? options.mergeThinking : options.thinking;
-    // Un mix actif ramène la fusion à `low` même s'il ne la déplace pas : elle
-    // trie des puces sans avoir le code, et ce niveau ne dépend pas du modèle.
-    // Sinon une route qui la laisse sur le flagship la ferait raisonner pour rien.
+    // An active mix drops merge to `low` even without moving it: it sorts
+    // bullets without seeing the code, and the level doesn't track the model.
+    // Otherwise a route that leaves it on the flagship reasons for nothing.
     const mixed = Object.keys(options.mix).length > 0;
     configs[id] = resolvePass(
       env,
@@ -682,11 +682,11 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
 
   const vendorAlias = (env.VENDOR ?? '').trim().toLowerCase();
   if (vendorAlias !== '' && !isProvider(vendorAlias)) {
-    warn(`VENDOR « ${vendorAlias} » n'est pas un provider connu (${PROVIDER_IDS.join(', ')}) : ignoré.`);
+    warn(`VENDOR "${vendorAlias}" is not a known provider (${PROVIDER_IDS.join(', ')}): ignored.`);
   }
-  // VENDOR est un alias d'entrée pour « provider », sur le motif exact
-  // d'OLLAMA_REVIEW_MODEL : un second axe parallèle divergerait au premier
-  // réglage fin, le dépôt ayant déjà un provider par passe.
+  // VENDOR is an input alias for "provider", on the exact pattern of
+  // OLLAMA_REVIEW_MODEL: a second parallel axis would diverge at the first
+  // fine-tuning, the repo already having a provider per pass.
   const provider = readProvider(
     env,
     'provider',
@@ -713,16 +713,16 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     readInput(env, 'aws-region') || env.AWS_REGION?.trim() || env.AWS_DEFAULT_REGION?.trim() || '';
   if (provider === 'aws' && awsRegion === '') {
     warn(
-      'provider « aws » sans région : renseigne « aws-region » (ou AWS_REGION), sinon\n' +
-        "  l'appel visera une base vide et sera écarté avant d'être tenté.",
+      'provider "aws" without a region: set "aws-region" (or AWS_REGION), or\n' +
+        '  the call will target an empty base and be dropped before it is tried.',
     );
   }
   const awsAccessKeyId = env.AWS_ACCESS_KEY_ID?.trim() || '';
   const awsSecretAccessKey = env.AWS_SECRET_ACCESS_KEY?.trim() || '';
   const awsSessionToken = env.AWS_SESSION_TOKEN?.trim() || '';
-  // `null` et non un couple vide : `endpointFor` s'en sert pour distinguer
-  // « pas de credentials » de « credentials résolues », posées par `main` avant
-  // cette lecture, purement, dans l'environnement.
+  // `null` rather than an empty pair: `endpointFor` uses it to distinguish
+  // "no credentials" from "resolved credentials", set by `main` before this
+  // read, purely, into the environment.
   const aws =
     awsAccessKeyId && awsSecretAccessKey
       ? {
