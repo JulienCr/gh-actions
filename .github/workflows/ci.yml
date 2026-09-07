@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Typecheck + tests + bundle à jour
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm typecheck
+
+      - run: pnpm test
+
+      # La garde du dépôt. Le runner exécute `dist/` sans jamais le construire :
+      # une modification de `src/` publiée sans rebuild ferait distribuer
+      # l'ancien bundle par le tag `v1`, en silence et à tous les dépôts.
+      - name: Le bundle correspond-il aux sources
+        run: |
+          set -euo pipefail
+          pnpm build
+          # `git diff` ignore les fichiers non suivis : sans ce `add -N`, le
+          # bundle d'une action NOUVELLE, jamais committé, passerait la garde.
+          git add --intent-to-add --all
+          if ! git diff --exit-code; then
+            echo '::error::dist/ est en retard sur src/. Lance « pnpm build » et commite le résultat.'
+            exit 1
+          fi

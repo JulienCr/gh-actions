@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.DS_Store
+
+# `pr-review/dist/` n'est PAS ignoré : le runner exécute le bundle tel quel,
+# sans installer ni builder quoi que ce soit. C'est le livrable.

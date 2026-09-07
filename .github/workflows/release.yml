@@ -1,0 +1,52 @@
+name: Release
+
+# Les dépôts consommateurs épinglent le tag majeur (`@v1`) : c'est lui qui leur
+# apporte les corrections sans qu'ils touchent à leur workflow. Ce job le
+# déplace sur chaque version publiée, après avoir vérifié que le bundle livré
+# correspond bien aux sources de ce commit.
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  move-major-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Refait la garde de la CI ici : rien n'empêche de poser un tag sur un
+      # commit qui n'est jamais passé par une PR, et c'est précisément le commit
+      # que tous les dépôts vont exécuter.
+      - name: Le bundle correspond-il aux sources
+        run: |
+          set -euo pipefail
+          pnpm test
+          pnpm build
+          git add --intent-to-add --all
+          git diff --exit-code
+
+      - name: Déplacer le tag majeur
+        run: |
+          set -euo pipefail
+          MAJOR="${GITHUB_REF_NAME%%.*}"
+          echo "Publication de ${GITHUB_REF_NAME} ; ${MAJOR} pointera sur ${GITHUB_SHA}."
+          git tag --force "$MAJOR" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$MAJOR"

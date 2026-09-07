@@ -1,0 +1,366 @@
+name: 'Review IA de PR'
+description: >-
+  Relit une pull request en trois passes (régression, doctrine du dépôt, données
+  et accès), et poste un commentaire de synthèse. Chaque passe choisit son
+  provider et son modèle. Ne fait jamais échouer le job.
+author: 'Julien Cruau'
+
+branding:
+  icon: 'eye'
+  color: 'purple'
+
+inputs:
+  pr:
+    description: "Numéro de la PR à relire."
+    required: true
+
+  enable:
+    description: >-
+      false : l'action sort tout de suite, sans lire la PR ni appeler le modèle.
+      Interrupteur pour couper la review — quota épuisé, refonte en cours — sans
+      démonter le workflow du dépôt. Le job reste vert.
+    required: false
+    default: 'true'
+
+  announce:
+    description: >-
+      Poster un commentaire « review en cours » avant le premier appel au
+      modèle, que le rapport final vient remplacer en place. Deux PR ont été
+      mergées sans relecture parce qu'une PR sans commentaire ne distinguait pas
+      « encore en cours » de « jamais déclenché » : l'annonce lève le premier
+      cas. Effet de bord voulu, une PR relue plusieurs fois ne porte plus qu'un
+      seul commentaire, le dernier.
+    required: false
+    default: 'true'
+
+  status-check:
+    description: >-
+      Poser un statut de commit (voir « status-context ») sur la tête de la PR :
+      pending au démarrage, success quand la review est rendue, failure quand
+      elle n'a pas pu l'être. C'est le SEUL mécanisme qui fait attendre la
+      review : un commentaire ne gate rien, et un auto-merge armé part par-dessus
+      une review encore en cours. Le statut se déclare ensuite requis dans la
+      protection de branche — et un statut requis mais absent bloque aussi, ce
+      qui rattrape l'événement « ready_for_review » que GitHub n'a pas émis.
+      Demande « statuses: write » dans les permissions du job.
+      ⚠️ Ne l'activer que sur un dépôt où la clé du provider est posée : sans
+      clé, l'action sort avant de rien poser, donc le check reste absent et le
+      merge reste bloqué. Une PR venue d'un fork, qui n'a pas les secrets, est
+      dans ce cas.
+    required: false
+    default: 'false'
+
+  status-context:
+    description: >-
+      Nom du statut de commit. C'est cette chaîne exacte qu'il faut écrire dans
+      la protection de branche pour rendre la review bloquante.
+    required: false
+    default: 'aristarque/review'
+
+  mode:
+    description: >-
+      « review » : le travail normal. « abort » : ne lire ni PR ni modèle, et
+      seulement conclure ce qu'un run tué a laissé en suspens — l'annonce repasse
+      en « review interrompue », le statut en error. À brancher dans une étape
+      « if: always() && (cancelled() || failure()) », sinon un run annulé par
+      cancel-in-progress laisse un pending qui bloque le merge pour toujours.
+    required: false
+    default: 'review'
+
+  ollama-api-key:
+    description: >-
+      Clé Ollama Cloud. Vide (PR venue d'un fork, secret non configuré) : la
+      review est ignorée sans bruit et le job reste vert.
+    required: false
+    default: ''
+
+  deepseek-api-key:
+    description: >-
+      Clé DeepSeek. Fait passer les trois appels bon marché du mix par l'API
+      directe au lieu d'Ollama, ce qui ajoute un cache de préfixe automatique :
+      « doctrine » et « données » partagent le même gros contexte, et la seconde
+      le rejoue trente et une fois moins cher. Vide : le même modèle, servi par
+      Ollama, sans cache.
+    required: false
+    default: ''
+
+  openai-api-key:
+    description: >-
+      Clé du provider « openai » générique, pour un endpoint OpenAI-compatible
+      quelconque (Fireworks, Z.ai, OpenRouter…). Inutile sans « openai-base-url ».
+    required: false
+    default: ''
+
+  openai-base-url:
+    description: >-
+      Base du provider « openai » générique, par exemple
+      https://api.fireworks.ai/inference/v1. Sans elle, ce provider est déclaré
+      inutilisable plutôt que de viser api.openai.com par accident. Nomme aussi
+      un « model » : cet endpoint n'a pas de catalogue connu, donc pas de défaut.
+    required: false
+    default: ''
+
+  openai-prefix-cache:
+    description: >-
+      true : l'endpoint « openai » générique cache les préfixes. N'change PAS
+      le séquencement, qui vaut pour tout provider ; ne change que le coût qu'on
+      annonce et le relevé de préfixe partagé. Faux par défaut, parce
+      qu'« OpenAI-compatible » décrit un protocole et pas une garantie de cache.
+    required: false
+    default: 'false'
+
+  provider:
+    description: >-
+      Provider des passes qui n'en désignent pas d'autre : ollama, deepseek ou
+      openai. Un identifiant inconnu est signalé et ignoré. ⚠️ En désigner un
+      autre qu'ollama écarte le mix : le dépôt a pris la main, on ne renvoie pas
+      ses passes ailleurs dans son dos.
+    required: false
+    default: 'ollama'
+
+  github-token:
+    description: "Jeton utilisé par le CLI gh. Le jeton du job suffit, avec pull-requests: write."
+    required: false
+    default: ${{ github.token }}
+
+  model:
+    description: >-
+      Modèle du provider global, et donc de la seule passe « régression » quand
+      le mix s'applique. Laissé vide : glm-5.2:cloud. ⚠️ L'écrire remet les
+      QUATRE appels dessus : envoyer un modèle à un provider qui ne le sert pas
+      produirait un 404, pas un compromis, donc un modèle nommé à la main écarte
+      le mix entier. Pour n'en changer qu'une passe, « <passe>-model ».
+    required: false
+    default: ''
+
+  regression-provider:
+    description: "Provider de la passe « régression fonctionnelle ». Vide : celui du mix, sinon « provider »."
+    required: false
+    default: ''
+
+  regression-model:
+    description: "Modèle de la passe « régression fonctionnelle »."
+    required: false
+    default: ''
+
+  regression-thinking:
+    description: >-
+      Raisonnement de la passe « régression fonctionnelle ». Écrit ici, il
+      échappe au cran d'« effort ».
+    required: false
+    default: ''
+
+  doctrine-provider:
+    description: "Provider de la passe « doctrine du dépôt »."
+    required: false
+    default: ''
+
+  doctrine-model:
+    description: "Modèle de la passe « doctrine du dépôt »."
+    required: false
+    default: ''
+
+  doctrine-thinking:
+    description: "Raisonnement de la passe « doctrine du dépôt ». Échappe au cran d'« effort »."
+    required: false
+    default: ''
+
+  data-provider:
+    description: "Provider de la passe « données et accès »."
+    required: false
+    default: ''
+
+  data-model:
+    description: >-
+      Modèle de la passe « données et accès ». Première escalade prévue si le
+      recall y baisse sur de vraies PR : deepseek-v4-pro. ⚠️ Le changer sépare
+      cette passe de « doctrine », qui perd alors leur cache commun.
+    required: false
+    default: ''
+
+  data-thinking:
+    description: "Raisonnement de la passe « données et accès ». Échappe au cran d'« effort »."
+    required: false
+    default: ''
+
+  merge-provider:
+    description: "Provider de la fusion."
+    required: false
+    default: ''
+
+  merge-model:
+    description: "Modèle de la fusion, qui trie sans avoir le code sous les yeux."
+    required: false
+    default: ''
+
+  effort:
+    description: >-
+      Ampleur des coupes dans ce qui est envoyé au modèle : full, balanced ou
+      lean. « full » envoie tout à toutes les passes ; la seule qu'il puisse
+      sauter est « doctrine », sur un dépôt qui n'en fournit aucune, son prompt
+      lui dictant alors sa sortie mot pour mot. « balanced » n'envoie les
+      fichiers importés qu'aux passes qui s'en servent et ne lance pas une passe
+      qu'une PR ne peut pas déclencher. « lean » resserre encore le contexte et
+      baisse le raisonnement de deux crans sur « doctrine » et d'un cran sur
+      « données et accès ». Aucun cran ne supprime la passe « données et
+      accès », et tout ce qu'un cran retire est déclaré dans le commentaire.
+      Nommé full/balanced/lean et non high/balanced/low pour ne pas se confondre
+      avec « thinking », qui a déjà un « high » et un « low ».
+    required: false
+    default: 'balanced'
+
+  passes:
+    description: >-
+      Passes à lancer, un identifiant par ligne parmi regression, doctrine et
+      data. Vide : la règle d'« effort » décide. Une liste explicite court-circuite
+      toutes les règles, y compris celles qui sauteraient une passe : utile sur un
+      dépôt de contenu dont les .md SONT le produit, ou pour régler un prompt.
+    required: false
+    default: ''
+
+  thinking:
+    description: >-
+      Effort de raisonnement des trois passes de lecture : low, medium, high,
+      max, ou off. Laissé vide : max. Ce que chaque modèle accepte lui
+      appartient : un niveau refusé retombe sur le raisonnement par défaut, un
+      modèle qui n'en fait pas est relancé sans. Dans les deux cas la review
+      continue, et le log le dit.
+    required: false
+    default: ''
+
+  merge-thinking:
+    description: >-
+      Effort de raisonnement de la fusion, qui trie les trouvailles des trois
+      passes sans avoir le code sous les yeux. Laissé vide : low quand le mix
+      s'applique, high sinon. Plus bas que « thinking » à dessein : c'est la
+      fusion qui s'ajoute au mur du job.
+    required: false
+    default: ''
+
+  temperature:
+    description: >-
+      Ne pas mettre 0 : sur un modèle de raisonnement, le décodage glouton rend
+      des reviews courtes et superficielles. Pour de la stabilité, garder cette
+      valeur et fixer « seed ».
+    required: false
+    default: '1'
+
+  seed:
+    description: >-
+      Graine d'échantillonnage, pour que deux lectures du même diff se
+      ressemblent. « off » rend sa variance au modèle, utile pour relire une PR
+      sous un autre angle.
+    required: false
+    default: '1'
+
+  doctrine:
+    description: >-
+      Fichiers de conventions injectés dans le prompt système, un chemin par
+      ligne, relatifs à la racine du dépôt. Ceux qui n'existent pas sont ignorés.
+      Défaut : .github/copilot-instructions.md, CLAUDE.md, AGENTS.md.
+    required: false
+    default: ''
+
+  skip:
+    description: >-
+      Motifs de fichiers à ne pas relire, un par ligne, syntaxe .gitignore
+      (`src/generated/**`, `*.snap`, `deploy/`). S'AJOUTENT au socle intégré
+      (lockfiles, binaires, node_modules), qui n'est pas désactivable.
+    required: false
+    default: ''
+
+  project-summary:
+    description: >-
+      Deux ou trois lignes situant le projet, si le fichier de doctrine ne le
+      fait pas déjà. Le plus souvent inutile.
+    required: false
+    default: ''
+
+  soft-sections:
+    description: >-
+      Poster les rubriques « Suggestions » et « À vérifier », qui ne bloquent
+      rien. Défaut « false » : le rapport s'arrête à « Bloquant » et « À
+      corriger ». Mesuré sur les vingt dernières PR d'avolo-shorts, 40 des 55
+      trouvailles tombaient dans ces deux rubriques pour 15 actionnables ; leur
+      tri est payé par qui relit, à chaque passe. Les passes de lecture, elles,
+      continuent de produire suggestions et doutes : la fusion en a besoin pour
+      arbitrer une sévérité, elle cesse seulement de les publier.
+    required: false
+    default: 'false'
+
+  max-findings:
+    description: >-
+      Nombre maximum de puces pour Bloquant, À corriger et Suggestions. La
+      section « À vérifier » a son propre plafond de cinq.
+    required: false
+    default: '20'
+
+  budget-chars:
+    description: >-
+      Plafond du contenu intégral des fichiers TOUCHÉS, en caractères. Les
+      fichiers importés ont le leur, ci-dessous : ce n'est pas le total envoyé
+      au modèle.
+    required: false
+    default: '500000'
+
+  per-file-chars:
+    description: "Plafond par fichier, pour qu'un gros fichier ne mange pas tout le budget."
+    required: false
+    default: '80000'
+
+  window-min-lines:
+    description: >-
+      Taille en lignes à partir de laquelle un fichier touché part par extraits
+      autour de ses changements, au lieu d'être envoyé en entier. Les numéros de
+      ligne restent ceux du fichier, donc un chemin:ligne cité reste juste, et
+      chaque trou est déclaré au modèle comme au lecteur. 0 désactive. Laissé
+      vide, il vaut 0 au cran « full », 250 en « balanced » et 120 en « lean ».
+    required: false
+    default: ''
+
+  imports-budget-chars:
+    description: >-
+      Plafond des fichiers que les fichiers touchés importent, joints en
+      contexte pour que le modèle tranche un doute au lieu de le signaler. Budget
+      distinct de « budget-chars » : les fichiers de la PR gardent le leur quoi
+      qu'il arrive. 0 désactive le contexte importé. Laissé vide, il vaut 300000,
+      ou 120000 au cran « lean » ; renseigné, il l'emporte sur le cran.
+    required: false
+    default: ''
+
+  timeout-minutes:
+    description: >-
+      Délai maximum d'UNE requête au modèle. La review en fait quatre. Les
+      passes tournent en parallèle, sauf celles qui partagent un provider ET un
+      modèle : celles-là s'enchaînent toujours, pour que la seconde rejoue le
+      préfixe de la première quand le provider cache, et parce qu'un même modèle
+      ne sert pas deux gros contextes à la fois quand il ne cache pas. Le mur du
+      job vaut
+      donc « (taille du plus gros groupe + 1) × cette valeur » : trois fois avec
+      le mix, où doctrine et données s'enchaînent, et QUATRE fois si un « model »
+      écrit à la main remet les trois passes sur un seul modèle. Le
+      timeout-minutes du job doit rester au-dessus, sinon le commentaire d'échec
+      n'a pas le temps d'être posté.
+    required: false
+    default: '15'
+
+  max-output-tokens:
+    description: >-
+      Plafond de tokens de SORTIE d'une requête. Ne pas confondre avec
+      « budget-chars », qui borne l'entrée. Laissé vide, rien n'est envoyé et le
+      modèle garde son propre plafond. Le poser borne ce que coûte un appel qui
+      déraille : mesuré sur un modèle parti en boucle de raisonnement, chaque
+      tentative perdue a brûlé 65 536 tokens sans rendre un caractère, soit
+      quatre minutes de job à chaque fois. Trop bas, il tronque une review
+      légitime sur un gros diff, ce que l'action refuse de poster.
+    required: false
+    default: ''
+
+  dry-run:
+    description: "true : la review est écrite dans les logs et rien n'est posté."
+    required: false
+    default: 'false'
+
+runs:
+  using: 'node24'
+  main: 'dist/index.mjs'
