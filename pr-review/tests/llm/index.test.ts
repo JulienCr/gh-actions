@@ -10,10 +10,18 @@ import {
 } from '../../src/llm';
 
 describe('les providers connus', () => {
-  it('couvre Ollama, DeepSeek et un endpoint OpenAI-compatible générique', () => {
-    expect(Object.keys(PROVIDERS).sort()).toEqual(['deepseek', 'ollama', 'openai']);
+  it('couvre Ollama, DeepSeek, AWS Bedrock et un endpoint OpenAI-compatible générique', () => {
+    expect(Object.keys(PROVIDERS).sort()).toEqual(['aws', 'deepseek', 'ollama', 'openai']);
     expect(isProvider('deepseek')).toBe(true);
     expect(isProvider('nawak')).toBe(false);
+  });
+
+  /** `aws-sigv4` n'a pas de clé à exiger : `endpointFor` s'appuie sur ce champ. */
+  it('sait quels providers s’authentifient par clé plutôt que par signature', () => {
+    expect(PROVIDERS.ollama!.auth).toBe('api-key');
+    expect(PROVIDERS.deepseek!.auth).toBe('api-key');
+    expect(PROVIDERS.openai!.auth).toBe('api-key');
+    expect(PROVIDERS.aws!.auth).toBe('aws-sigv4');
   });
 
   /**
@@ -112,6 +120,23 @@ describe('le régime horaire', () => {
     const plein = estimateCost('deepseek', 'deepseek-v4-flash', usage, true)!;
     const creux = estimateCost('deepseek', 'deepseek-v4-flash', usage, false)!;
     expect(creux).toBeCloseTo(plein / 2, 6);
+  });
+
+  /**
+   * Le tarif horaire n'existe que chez DeepSeek : latent tant qu'aws n'avait
+   * pas de tarif, l'ajout de sa table l'aurait sinon rendu réel, en divisant
+   * son coût par deux hors heures pleines sans aucune base.
+   */
+  it('ne facture pas Bedrock à moitié prix hors heures pleines', () => {
+    const usage = {
+      inputTokens: 1_000_000,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+    };
+    const plein = estimateCost('aws', 'zai.glm-5', usage, true);
+    const creux = estimateCost('aws', 'zai.glm-5', usage, false);
+    expect(creux).toBe(plein);
   });
 });
 

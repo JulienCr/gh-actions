@@ -1,8 +1,139 @@
 #!/usr/bin/env node
 
 // pr-review/src/index.ts
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync as readFileSync2, statSync } from "node:fs";
 import { join } from "node:path";
+
+// pr-review/src/aws.ts
+import { readFileSync } from "node:fs";
+
+// pr-review/src/exec.ts
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
+var execFileAsync = promisify(execFile);
+var MAX_BUFFER = 32 * 1024 * 1024;
+async function run(command, args) {
+  try {
+    const { stdout } = await execFileAsync(command, args, { maxBuffer: MAX_BUFFER });
+    return stdout;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`\xAB ${command} ${args.slice(0, 3).join(" ")} \u2026 \xBB a \xE9chou\xE9 : ${message}`);
+  }
+}
+function runWithStdin(command, args, input) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf-8");
+    child.stderr.setEncoding("utf-8");
+    child.stdout.on("data", (chunk) => stdout += chunk);
+    child.stderr.on("data", (chunk) => stderr += chunk);
+    child.on("error", (error) => reject(new Error(`impossible de lancer \xAB ${command} \xBB : ${error.message}`)));
+    child.on("close", (code) => {
+      if (code === 0) resolve(stdout);
+      else
+        reject(new Error(`\xAB ${command} ${args.slice(0, 3).join(" ")} \u2026 \xBB a quitt\xE9 avec ${code}
+${stderr.slice(-2e3)}`));
+    });
+    child.stdin.end(input);
+  });
+}
+
+// pr-review/src/aws.ts
+var STS_TIMEOUT_MS = 1e4;
+async function resolveAwsCredentials(env, region, warn) {
+  const fromEnv = fromStaticEnv(env);
+  if (fromEnv) return fromEnv;
+  const fromWebIdentity = await fromWebIdentityToken(env, region, warn);
+  if (fromWebIdentity) return fromWebIdentity;
+  const fromCli = await fromAwsCli(warn);
+  if (fromCli) return fromCli;
+  warn(
+    "aucune credential AWS trouv\xE9e (ni AWS_ACCESS_KEY_ID, ni web identity, ni `aws configure export-credentials`)"
+  );
+  return null;
+}
+function fromStaticEnv(env) {
+  const accessKeyId = env.AWS_ACCESS_KEY_ID;
+  const secretAccessKey = env.AWS_SECRET_ACCESS_KEY;
+  if (!accessKeyId || !secretAccessKey) return null;
+  const sessionToken = env.AWS_SESSION_TOKEN;
+  return sessionToken ? { accessKeyId, secretAccessKey, sessionToken } : { accessKeyId, secretAccessKey };
+}
+async function fromWebIdentityToken(env, region, warn) {
+  const tokenFile = env.AWS_WEB_IDENTITY_TOKEN_FILE;
+  const roleArn = env.AWS_ROLE_ARN;
+  if (!tokenFile || !roleArn) return null;
+  if (!region) {
+    warn("AWS_WEB_IDENTITY_TOKEN_FILE pr\xE9sent mais r\xE9gion vide : STS a besoin d'un endpoint r\xE9gional, barreau saut\xE9");
+    return null;
+  }
+  let token;
+  try {
+    token = readFileSync(tokenFile, "utf-8").trim();
+  } catch (error) {
+    warn(`lecture de AWS_WEB_IDENTITY_TOKEN_FILE impossible (${errorMessage(error)})`);
+    return null;
+  }
+  const body = [
+    "Action=AssumeRoleWithWebIdentity",
+    "Version=2011-06-15",
+    `RoleArn=${encodeURIComponent(roleArn)}`,
+    `RoleSessionName=${encodeURIComponent(roleSessionName(env))}`,
+    `WebIdentityToken=${encodeURIComponent(token)}`
+  ].join("&");
+  try {
+    const response = await fetch(`https://sts.${region}.amazonaws.com/`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+      signal: AbortSignal.timeout(STS_TIMEOUT_MS)
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      warn(`AssumeRoleWithWebIdentity a \xE9chou\xE9 (HTTP ${response.status})`);
+      return null;
+    }
+    const accessKeyId = extractTag(text, "AccessKeyId");
+    const secretAccessKey = extractTag(text, "SecretAccessKey");
+    const sessionToken = extractTag(text, "SessionToken");
+    if (!accessKeyId || !secretAccessKey || !sessionToken) {
+      warn("AssumeRoleWithWebIdentity a r\xE9pondu sans un des trois champs attendus");
+      return null;
+    }
+    return { accessKeyId, secretAccessKey, sessionToken };
+  } catch (error) {
+    warn(`appel \xE0 AssumeRoleWithWebIdentity impossible (${errorMessage(error)})`);
+    return null;
+  }
+}
+function roleSessionName(env) {
+  const raw = `pr-review-${env.GITHUB_RUN_ID ?? Date.now()}`;
+  return raw.replace(/[^\w+=,.@-]/g, "").slice(0, 64);
+}
+function extractTag(xml, tag) {
+  const match = new RegExp(`<${tag}>([^<]*)</${tag}>`).exec(xml);
+  return match?.[1] ?? null;
+}
+async function fromAwsCli(warn) {
+  try {
+    const output = await run("aws", ["configure", "export-credentials", "--format", "process"]);
+    const parsed = JSON.parse(output);
+    if (!parsed.AccessKeyId || !parsed.SecretAccessKey) {
+      warn("`aws configure export-credentials` a r\xE9pondu sans AccessKeyId/SecretAccessKey");
+      return null;
+    }
+    return parsed.SessionToken ? { accessKeyId: parsed.AccessKeyId, secretAccessKey: parsed.SecretAccessKey, sessionToken: parsed.SessionToken } : { accessKeyId: parsed.AccessKeyId, secretAccessKey: parsed.SecretAccessKey };
+  } catch (error) {
+    warn(`\`aws configure export-credentials\` indisponible (${errorMessage(error)})`);
+    return null;
+  }
+}
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
 
 // pr-review/src/imports.ts
 var EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue", ".svelte"];
@@ -287,40 +418,6 @@ function readImported({ sources, readFile, exists, isSkipped, budget }) {
   return paths.filter((path) => kept.has(path)).map((path) => ({ path, numbered: numberLines(contents.get(path)) }));
 }
 
-// pr-review/src/exec.ts
-import { execFile, spawn } from "node:child_process";
-import { promisify } from "node:util";
-var execFileAsync = promisify(execFile);
-var MAX_BUFFER = 32 * 1024 * 1024;
-async function run(command, args) {
-  try {
-    const { stdout } = await execFileAsync(command, args, { maxBuffer: MAX_BUFFER });
-    return stdout;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`\xAB ${command} ${args.slice(0, 3).join(" ")} \u2026 \xBB a \xE9chou\xE9 : ${message}`);
-  }
-}
-function runWithStdin(command, args, input) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf-8");
-    child.stderr.setEncoding("utf-8");
-    child.stdout.on("data", (chunk) => stdout += chunk);
-    child.stderr.on("data", (chunk) => stderr += chunk);
-    child.on("error", (error) => reject(new Error(`impossible de lancer \xAB ${command} \xBB : ${error.message}`)));
-    child.on("close", (code) => {
-      if (code === 0) resolve(stdout);
-      else
-        reject(new Error(`\xAB ${command} ${args.slice(0, 3).join(" ")} \u2026 \xBB a quitt\xE9 avec ${code}
-${stderr.slice(-2e3)}`));
-    });
-    child.stdin.end(input);
-  });
-}
-
 // pr-review/src/gh.ts
 function statusOf(changeType) {
   switch (changeType?.toUpperCase()) {
@@ -479,6 +576,43 @@ function parseList(value) {
   return value.split("\n").map((line) => line.trim()).filter((line) => line !== "" && !line.startsWith("#"));
 }
 
+// pr-review/src/llm/sigv4.ts
+import { createHash, createHmac } from "node:crypto";
+var sha256Hex = (input) => createHash("sha256").update(input, "utf8").digest("hex");
+var hmac = (key, data) => createHmac("sha256", key).update(data, "utf8").digest();
+function signingKey(secretAccessKey, dateStamp, region, service) {
+  const kDate = hmac(`AWS4${secretAccessKey}`, dateStamp);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, service);
+  return hmac(kService, "aws4_request");
+}
+function signRequest(args) {
+  const { method, url, body, region, service, credentials, now } = args;
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const dateStamp = amzDate.slice(0, 8);
+  const { hostname, pathname } = new URL(url);
+  const payloadHash = sha256Hex(body);
+  const headers = {
+    "content-type": "application/json",
+    host: hostname,
+    "x-amz-content-sha256": payloadHash,
+    "x-amz-date": amzDate
+  };
+  if (credentials.sessionToken) headers["x-amz-security-token"] = credentials.sessionToken;
+  const entries = Object.entries(headers).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  const signedHeaders = entries.map(([name]) => name).join(";");
+  const canonicalHeaders = entries.map(([name, value]) => `${name}:${value.trim()}
+`).join("");
+  const canonicalRequest = [method, pathname, "", canonicalHeaders, signedHeaders, payloadHash].join("\n");
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const stringToSign = ["AWS4-HMAC-SHA256", amzDate, credentialScope, sha256Hex(canonicalRequest)].join("\n");
+  const signature = createHmac("sha256", signingKey(credentials.secretAccessKey, dateStamp, region, service)).update(stringToSign, "utf8").digest("hex");
+  return {
+    ...headers,
+    authorization: `AWS4-HMAC-SHA256 Credential=${credentials.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+  };
+}
+
 // pr-review/src/llm/types.ts
 var LlmError = class extends Error {
   /** Une seconde tentative a-t-elle une chance d'aboutir ? */
@@ -537,7 +671,7 @@ function detail(body, apiKey) {
   return trimmed ? ` : ${redact(scrub(trimmed.slice(0, 300), apiKey))}` : "";
 }
 function scrub(text, apiKey) {
-  const withoutBearer = text.replace(/\bBearer\s+\S+/gi, "Bearer ***");
+  const withoutBearer = text.replace(/\bBearer\s+\S+/gi, "Bearer ***").replace(/AWS4-HMAC-SHA256 \S+/g, "AWS4-HMAC-SHA256 ***");
   if (!apiKey) return withoutBearer;
   const pattern = apiKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return withoutBearer.replace(new RegExp(pattern, "g"), "***");
@@ -561,7 +695,7 @@ function describeCause(error) {
   return redact(chain.length > 0 ? chain.join(" \u2190 ") : String(error));
 }
 var redact = (text) => text.replace(/\/\/[^/\s@]+@/g, "//***@");
-var rejectsThinkingValue = (body) => /invalid (think|reasoning_effort) value/i.test(body);
+var rejectsThinkingValue = (body) => /invalid (think|reasoning_effort) value/i.test(body) || /'(?:think|reasoning_effort)' value '[^']*' is not supported/i.test(body);
 async function withRetries(attempt2, request) {
   try {
     return await played(attempt2, request);
@@ -762,7 +896,23 @@ function reasoningBody(think, dialect) {
   if (value === "") return {};
   if (wantsNoThinking(value)) return dialect.thinkingOff ?? {};
   if (/^(true|yes|on)$/i.test(value)) return {};
-  return { reasoning_effort: value.toLowerCase() };
+  const level = value.toLowerCase();
+  return { reasoning_effort: dialect.levelAliases?.[level] ?? level };
+}
+function stripReasoningTags(text) {
+  let content = "";
+  let thinking = "";
+  let rest = text;
+  for (; ; ) {
+    const open = rest.indexOf("<reasoning>");
+    if (open === -1) return { content: content + rest, thinking };
+    content += rest.slice(0, open);
+    const afterOpen = rest.slice(open + "<reasoning>".length);
+    const close = afterOpen.indexOf("</reasoning>");
+    if (close === -1) return { content, thinking: thinking + afterOpen };
+    thinking += afterOpen.slice(0, close);
+    rest = afterOpen.slice(close + "</reasoning>".length);
+  }
 }
 var rejectsThinking2 = (status, body) => status === 400 && /reasoning|thinking/i.test(body);
 function createOpenAiClient(dialect) {
@@ -775,30 +925,31 @@ function createOpenAiClient(dialect) {
 }
 async function send2(request, dialect) {
   const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const body = JSON.stringify({
+    model: request.model,
+    stream: true,
+    // Sans ceci, aucun compteur n'arrive en streaming. Voir l'en-tête.
+    stream_options: { include_usage: true },
+    // `seed` n'est volontairement pas envoyé : il n'est documenté chez aucun
+    // des dialectes visés, et un paramètre inconnu se paie d'un 400 sur les
+    // serveurs stricts. La stabilité y repose sur la température seule.
+    temperature: request.temperature ?? 1,
+    // `max_tokens` et non `max_completion_tokens` : c'est le champ que
+    // DeepSeek documente et que les endpoints OpenAI-compatibles acceptent.
+    // Un champ par dialecte le jour où l'un des deux le refuse, pas avant.
+    ...request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {},
+    ...reasoningBody(request.think, dialect),
+    messages: request.messages
+  });
   let response;
   try {
     response = await fetch(`${request.baseUrl}/chat/completions`, {
       method: "POST",
-      headers: {
+      headers: dialect.authorize?.(request, body) ?? {
         "Content-Type": "application/json",
         Authorization: `Bearer ${request.apiKey}`
       },
-      body: JSON.stringify({
-        model: request.model,
-        stream: true,
-        // Sans ceci, aucun compteur n'arrive en streaming. Voir l'en-tête.
-        stream_options: { include_usage: true },
-        // `seed` n'est volontairement pas envoyé : il n'est documenté chez aucun
-        // des dialectes visés, et un paramètre inconnu se paie d'un 400 sur les
-        // serveurs stricts. La stabilité y repose sur la température seule.
-        temperature: request.temperature ?? 1,
-        // `max_tokens` et non `max_completion_tokens` : c'est le champ que
-        // DeepSeek documente et que les endpoints OpenAI-compatibles acceptent.
-        // Un champ par dialecte le jour où l'un des deux le refuse, pas avant.
-        ...request.maxOutputTokens ? { max_tokens: request.maxOutputTokens } : {},
-        ...reasoningBody(request.think, dialect),
-        messages: request.messages
-      }),
+      body,
       signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (error) {
@@ -864,12 +1015,18 @@ async function collect2(response, dialect, apiKey) {
   if (!complete) {
     throw new LlmError(`le flux de ${dialect.name} s'est interrompu avant la fin de la r\xE9ponse`, true);
   }
+  if (dialect.stripsReasoningTags) {
+    const stripped = stripReasoningTags(content);
+    content = stripped.content;
+    thinking += stripped.thinking;
+  }
   if (!content.trim()) {
+    const reasoningExhausted = thinking.trim().length > 0 || dialect.emptyMeansReasoning === true && (usage?.outputTokens ?? 0) > 0;
     throw new LlmError(
-      `${dialect.name} a rendu une r\xE9ponse vide (${usage?.outputTokens ?? 0} tokens de sortie, dont ${thinking.length} caract\xE8res de raisonnement${truncated ? ", plafond de sortie atteint" : ""})`,
+      `${dialect.name} a rendu une r\xE9ponse vide (${usage?.outputTokens ?? 0} tokens de sortie` + (thinking.length > 0 ? `, dont ${thinking.length} caract\xE8res de raisonnement` : "") + `${truncated ? ", plafond de sortie atteint" : ""})`,
       false,
       false,
-      thinking.trim().length > 0
+      reasoningExhausted
     );
   }
   if (truncated) {
@@ -886,6 +1043,20 @@ async function collect2(response, dialect, apiKey) {
 }
 
 // pr-review/src/llm/index.ts
+function bedrockHeaders(request, body) {
+  if (!request.aws) {
+    throw new LlmError("appel Bedrock sans credentials AWS r\xE9solues");
+  }
+  return signRequest({
+    method: "POST",
+    url: `${request.baseUrl}/chat/completions`,
+    body,
+    region: request.aws.region,
+    service: "bedrock",
+    credentials: request.aws.credentials,
+    now: /* @__PURE__ */ new Date()
+  });
+}
 var PROVIDERS = {
   ollama: {
     label: "Ollama Cloud",
@@ -893,7 +1064,8 @@ var PROVIDERS = {
     defaultBaseUrl: "https://ollama.com",
     defaultModel: "glm-5.2:cloud",
     prefixCache: false,
-    supportsSeed: true
+    supportsSeed: true,
+    auth: "api-key"
   },
   deepseek: {
     label: "DeepSeek",
@@ -905,7 +1077,8 @@ var PROVIDERS = {
     defaultBaseUrl: "https://api.deepseek.com",
     defaultModel: "deepseek-v4-flash",
     prefixCache: true,
-    supportsSeed: false
+    supportsSeed: false,
+    auth: "api-key"
   },
   openai: {
     label: "endpoint OpenAI-compatible",
@@ -917,14 +1090,39 @@ var PROVIDERS = {
     // cache pas coûte du temps contre rien. L'input « openai-prefix-cache »
     // l'active pour qui sait que son endpoint le fait.
     prefixCache: false,
-    supportsSeed: false
+    supportsSeed: false,
+    auth: "api-key"
+  },
+  aws: {
+    label: "AWS Bedrock",
+    client: createOpenAiClient({
+      name: "Bedrock",
+      authorize: bedrockHeaders,
+      emptyMeansReasoning: true,
+      // Mesuré sur les trois modèles : le raisonnement fuit dans `content`
+      // entre balises `<reasoning>` à `high` (jamais à `low` ni sans réglage),
+      // et `max` y rend un 400 alors que `high` est le vrai plafond.
+      stripsReasoningTags: true,
+      levelAliases: { max: "high" }
+    }),
+    // La base dépend de la région, que ce module ne connaît pas : c'est
+    // `endpointFor` qui la compose.
+    defaultBaseUrl: "",
+    defaultModel: "zai.glm-5",
+    // Aucun compteur de cache n'est rendu par cet endpoint : mesuré.
+    prefixCache: false,
+    supportsSeed: false,
+    auth: "aws-sigv4"
   }
 };
 var PROVIDER_IDS = Object.keys(PROVIDERS);
 var isProvider = (value) => value in PROVIDERS;
+var bedrockPrice = (input, output) => ({ input, cachedInput: input, output });
 var PRICES = {
   "deepseek/deepseek-v4-flash": { input: 0.44, cachedInput: 0.014, output: 1.32 },
-  "deepseek/deepseek-v4-pro": { input: 1.32, cachedInput: 0.044, output: 3.96 }
+  "deepseek/deepseek-v4-pro": { input: 1.32, cachedInput: 0.044, output: 3.96 },
+  "aws/zai.glm-5": bedrockPrice(1.2, 3.84),
+  "aws/zai.glm-4.7-flash": bedrockPrice(0.08, 0.48)
 };
 function isPeakHour(now) {
   const hour = now.getUTCHours();
@@ -934,7 +1132,7 @@ var OFF_PEAK_RATIO = 0.5;
 function estimateCost(provider, model, usage, peak = true) {
   const price = PRICES[`${provider}/${model}`];
   if (!price) return null;
-  const ratio = peak ? 1 : OFF_PEAK_RATIO;
+  const ratio = !peak && provider === "deepseek" ? OFF_PEAK_RATIO : 1;
   const fresh = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
   return ratio * (fresh * price.input + usage.cachedInputTokens * price.cachedInput + usage.outputTokens * price.output) / 1e6;
 }
@@ -1492,18 +1690,24 @@ var DEFAULTS = {
 var PASS_IDS = ["regression", "doctrine", "data", "merge"];
 var CHEAP_MODEL = {
   ollama: "deepseek-v4-flash:cloud",
-  deepseek: "deepseek-v4-flash"
+  deepseek: "deepseek-v4-flash",
+  aws: "zai.glm-4.7-flash"
 };
+var MIX_MERGE_THINKING = "low";
 function mixFor(provider) {
   const model = CHEAP_MODEL[provider];
   if (!model) return {};
+  if (provider === "aws") {
+    return { data: { provider, model, thinking: "high" } };
+  }
   return {
     doctrine: { provider, model, thinking: "high" },
     data: { provider, model, thinking: "high" },
-    merge: { provider, model, thinking: "low" }
+    merge: { provider, model, thinking: MIX_MERGE_THINKING }
   };
 }
 function mixRoute(provider, hasDeepSeekKey) {
+  if (provider === "aws") return "aws";
   if (provider !== DEFAULTS.provider) return null;
   return hasDeepSeekKey ? "deepseek" : "ollama";
 }
@@ -1599,6 +1803,7 @@ function resolvePassConfigs(env, options, warn = () => {
   for (const id of PASS_IDS) {
     const steps = PASSES.find((pass) => pass.id === id)?.thinkingSteps[options.effort] ?? 0;
     const written = id === "merge" ? options.mergeThinking : options.thinking;
+    const mixed = Object.keys(options.mix).length > 0;
     configs[id] = resolvePass(
       env,
       id,
@@ -1607,7 +1812,7 @@ function resolvePassConfigs(env, options, warn = () => {
         provider: options.provider,
         model: options.model,
         thinkingWritten: written ? stepDown(written, steps) : "",
-        thinkingDefault: id === "merge" ? DEFAULTS.mergeThinking : stepDown(DEFAULTS.thinking, steps)
+        thinkingDefault: id === "merge" ? mixed ? MIX_MERGE_THINKING : DEFAULTS.mergeThinking : stepDown(DEFAULTS.thinking, steps)
       },
       warn
     );
@@ -1658,7 +1863,16 @@ function resolveConfig({ argv, env, warn = () => {
     deepseek: readInput(env, "deepseek-api-key") || env.DEEPSEEK_API_KEY?.trim() || "",
     openai: readInput(env, "openai-api-key") || env.OPENAI_API_KEY?.trim() || ""
   };
-  const provider = readProvider(env, "provider", DEFAULTS.provider, warn);
+  const vendorAlias = (env.VENDOR ?? "").trim().toLowerCase();
+  if (vendorAlias !== "" && !isProvider(vendorAlias)) {
+    warn(`VENDOR \xAB ${vendorAlias} \xBB n'est pas un provider connu (${PROVIDER_IDS.join(", ")}) : ignor\xE9.`);
+  }
+  const provider = readProvider(
+    env,
+    "provider",
+    isProvider(vendorAlias) ? vendorAlias : DEFAULTS.provider,
+    warn
+  );
   const providerDefault = PROVIDERS[provider]?.defaultModel || "";
   if (model === "" && providerDefault === "") {
     warn(
@@ -1667,6 +1881,23 @@ function resolveConfig({ argv, env, warn = () => {
     );
   }
   const route = model === "" ? mixRoute(provider, keys.deepseek !== "") : null;
+  const awsRegion = readInput(env, "aws-region") || env.AWS_REGION?.trim() || env.AWS_DEFAULT_REGION?.trim() || "";
+  if (provider === "aws" && awsRegion === "") {
+    warn(
+      "provider \xAB aws \xBB sans r\xE9gion : renseigne \xAB aws-region \xBB (ou AWS_REGION), sinon\n  l'appel visera une base vide et sera \xE9cart\xE9 avant d'\xEAtre tent\xE9."
+    );
+  }
+  const awsAccessKeyId = env.AWS_ACCESS_KEY_ID?.trim() || "";
+  const awsSecretAccessKey = env.AWS_SECRET_ACCESS_KEY?.trim() || "";
+  const awsSessionToken = env.AWS_SESSION_TOKEN?.trim() || "";
+  const aws = awsAccessKeyId && awsSecretAccessKey ? {
+    region: awsRegion,
+    credentials: {
+      accessKeyId: awsAccessKeyId,
+      secretAccessKey: awsSecretAccessKey,
+      ...awsSessionToken ? { sessionToken: awsSessionToken } : {}
+    }
+  } : null;
   return {
     pr,
     dryRun,
@@ -1689,6 +1920,8 @@ function resolveConfig({ argv, env, warn = () => {
     keys,
     openaiBaseUrl: readInput(env, "openai-base-url").replace(/\/$/, ""),
     openaiPrefixCache: readBoolean(env, "openai-prefix-cache"),
+    awsRegion,
+    aws,
     temperature: readTemperature(env, warn),
     seed: readSeed(env, warn),
     maxFindings: readNumber(env, "max-findings", DEFAULTS.maxFindings, warn),
@@ -1985,7 +2218,7 @@ function readDoctrine(root, paths) {
   const files = [];
   for (const path of paths) {
     try {
-      files.push({ path, content: readFileSync(join(root, path), "utf-8") });
+      files.push({ path, content: readFileSync2(join(root, path), "utf-8") });
     } catch {
       console.log(`\xB7 ${path} : absent, ignor\xE9.`);
     }
@@ -2023,6 +2256,14 @@ async function keyFrom1Password(provider) {
 function endpointFor(config, target) {
   const spec = PROVIDERS[target.provider];
   if (!spec) return null;
+  if (target.provider === "aws") {
+    if (!config.awsRegion || !config.aws) return null;
+    return {
+      baseUrl: `https://bedrock-runtime.${config.awsRegion}.amazonaws.com/openai/v1`,
+      apiKey: "",
+      aws: config.aws
+    };
+  }
   const baseUrl = target.provider === "openai" ? (
     // Le provider générique n'existe que pour viser l'adresse qu'on lui
     // donne. `openai-base-url` ne vaut QUE pour lui : appliquée à DeepSeek,
@@ -2038,8 +2279,9 @@ function endpointFor(config, target) {
       ""
     )
   );
+  if (!baseUrl) return null;
   const apiKey = config.keys[target.provider] ?? "";
-  if (!baseUrl || !apiKey) return null;
+  if (spec.auth === "api-key" && !apiKey) return null;
   return { baseUrl, apiKey };
 }
 function warnOnClearTextKey(config, targets) {
@@ -2097,6 +2339,7 @@ async function callModel(config, run2, args) {
       seed: config.seed,
       timeoutMs: config.timeoutMs,
       maxOutputTokens: config.maxOutputTokens,
+      aws: endpoint.aws,
       onRetry: (reason) => console.warn(`\u26A0 [${args.label}] ${reason} \u2014 nouvelle tentative dans 20 s.`),
       onDowngrade: (event) => console.warn(`\u26A0 [${args.label}] ${describeDowngrade(event, target.model)}`)
     });
@@ -2365,7 +2608,7 @@ async function review(config) {
     },
     readFile: (path) => {
       try {
-        return readFileSync(join(root, path), "utf-8");
+        return readFileSync2(join(root, path), "utf-8");
       } catch {
         return null;
       }
@@ -2552,6 +2795,26 @@ async function loadLocalKeys(env) {
   }
   return enriched;
 }
+async function loadAwsCredentials(env) {
+  const wanted = [
+    readInput(env, "provider") || env.VENDOR?.trim() || "",
+    ...PASS_IDS.map((id) => readInput(env, `${id}-provider`))
+  ];
+  if (!wanted.some((value) => value.trim().toLowerCase() === "aws")) return env;
+  const region = readInput(env, "aws-region") || env.AWS_REGION?.trim() || env.AWS_DEFAULT_REGION?.trim() || "";
+  const credentials = await resolveAwsCredentials(
+    env,
+    region,
+    (message) => console.warn(`\u26A0 ${message}`)
+  );
+  if (!credentials) return env;
+  return {
+    ...env,
+    AWS_ACCESS_KEY_ID: credentials.accessKeyId,
+    AWS_SECRET_ACCESS_KEY: credentials.secretAccessKey,
+    ...credentials.sessionToken ? { AWS_SESSION_TOKEN: credentials.sessionToken } : {}
+  };
+}
 async function main() {
   if (!isEnabled(process.env)) {
     console.log("Review d\xE9sactiv\xE9e (input \xAB enable \xBB).");
@@ -2560,7 +2823,7 @@ async function main() {
   const countOnly2 = process.argv.slice(2).includes("--count-only");
   const config = resolveConfig({
     argv: process.argv.slice(2),
-    env: countOnly2 ? process.env : await loadLocalKeys(process.env),
+    env: countOnly2 ? process.env : await loadAwsCredentials(await loadLocalKeys(process.env)),
     warn: (message) => console.warn(`\u26A0 ${message}`)
   });
   if (config.githubToken) process.env.GH_TOKEN = config.githubToken;
@@ -2569,10 +2832,12 @@ async function main() {
     return;
   }
   if (!config.countOnly) {
-    const wanted = new Set(Object.values(config.passConfigs).map((target) => target.provider));
-    wanted.add(config.provider);
-    if ([...wanted].every((provider) => !config.keys[provider])) {
-      console.log("Aucune cl\xE9 de provider : review ignor\xE9e.");
+    const targets = [
+      ...Object.values(config.passConfigs),
+      { provider: config.provider, model: config.model, thinking: "" }
+    ];
+    if (targets.every((target) => endpointFor(config, target) === null)) {
+      console.log("Aucun provider utilisable : review ignor\xE9e.");
       return;
     }
   }
