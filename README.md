@@ -322,18 +322,23 @@ sur de vraies PR. « Doctrine du dépôt » applique des règles écrites qu'ell
 fusion trie une trentaine de puces **sans avoir le code**. Payer les quatre au même tarif revient à
 payer trois fois pour une profondeur dont une seule se sert.
 
-Trois appels sur quatre partent donc sur `deepseek-v4-flash`, **sans rien configurer** :
+Trois appels sur quatre partent donc sur `deepseek-v4.1-flash:cloud`, **sans rien configurer** :
 
 | Appel | Modèle | `thinking` |
 | --- | --- | --- |
 | régression fonctionnelle | `glm-5.2:cloud` | `max` |
-| doctrine du dépôt | `deepseek-v4-flash:cloud` | `high` |
-| données et accès | `deepseek-v4-flash:cloud` | `high` |
-| fusion | `deepseek-v4-flash:cloud` | `low` |
+| doctrine du dépôt | `deepseek-v4.1-flash:cloud` | `false` |
+| données et accès | `deepseek-v4.1-flash:cloud` | `high` |
+| fusion | `deepseek-v4.1-flash:cloud` | `low` |
 
-Ollama Cloud ne facture pas au token mais au **temps GPU**, par niveau d'usage. `glm-5.2:cloud` y
-est classé **usage élevé**, `deepseek-v4-flash:cloud` **usage moyen** : déplacer trois appels sur
-quatre les fait descendre d'un niveau, avec la seule clé Ollama et sans compte à ouvrir.
+Doctrine tourne sans raisonnement : en `high`, elle épuisait ses 65 536 tokens de sortie sans
+répondre dans 9 reviews sur 10 mesurées sur avolo-shorts (et `medium` aussi, sur #99), là où le repli
+en `false` aboutissait.
+
+Ollama Cloud facture désormais **au token**, comme DeepSeek, et non plus au temps GPU par niveau
+d'usage. Relevé le 15 septembre 2026 sur ollama.com/pricing, prix par million de tokens : `glm-5.2`
+entrée 1,40 $ / sortie 4,40 $, contre `deepseek-v4.1-flash` entrée 0,15 $ / sortie 0,60 $. Déplacer
+trois appels sur quatre reste largement payant, avec la seule clé Ollama et sans compte à ouvrir.
 
 Deux façons de ne pas prendre ce mix : écrire `model:` à la main, ce qui remet les quatre appels
 sur le modèle nommé, ou désigner un `provider:` autre qu'`ollama`, auquel cas le dépôt a pris la
@@ -358,15 +363,16 @@ rendu 41 681 tokens de sortie, dont 98 % de raisonnement.
 
 #### Une clé DeepSeek achète le cache de préfixe
 
-Le même modèle, servi en direct par `api.deepseek.com`, ajoute ce qu'Ollama n'a pas : un cache de
-préfixe automatique, facturé **trente et une fois moins cher** que l'entrée fraîche (0,014 $/M
-contre 0,44 $/M en heure pleine). Poser `deepseek-api-key` suffit à basculer les trois appels sur
-cette route.
+Le même modèle, servi en direct par `api.deepseek.com`, facture le cache de préfixe **cinquante
+fois moins cher** que l'entrée fraîche (0,006 $/M contre 0,30 $/M en heure pleine). Ollama Cloud
+affiche lui aussi un tarif pour l'entrée en cache, mais l'action n'enchaîne pas les appels pour en
+profiter : ce cache-là ne joue que sur la route DeepSeek directe. Poser `deepseek-api-key` suffit
+à basculer les trois appels sur cette route.
 
 ⚠️ DeepSeek est passé le **16 août 2026** d'un tarif plat à un tarif horaire : heures pleines de
-01:00 à 04:00 et de 06:00 à 10:00 UTC, moitié prix le reste du temps. `estimateCost` applique le
-régime de l'heure de l'appel. Toute table de prix antérieure à cette date est fausse d'un facteur
-trois.
+01:00 à 04:00 et de 06:00 à 10:00 UTC, du lundi au vendredi, moitié prix le reste du temps.
+`estimateCost` applique le régime de l'heure de l'appel. Toute table de prix antérieure à cette
+date est fausse d'un facteur trois.
 
 « Doctrine » et « données » visent volontairement le **même couple provider + modèle**, ce qui leur
 permet de partager ce cache. Deux conditions, que l'action tient toutes les deux :
@@ -529,8 +535,9 @@ sont estimés à partir des caractères ; les caractères, eux, sont exacts.
 
 « consignes » regroupe le préambule commun **et** l'objectif de la passe, où que le message les
 porte. Une colonne « ≈ entrée » apparaît en plus quand le tarif du modèle est connu, ce qui n'est
-pas le cas d'Ollama Cloud, vendu au temps GPU et non au token ; elle ne chiffre alors que l'entrée,
-au tarif plein et sans cache, la sortie n'étant pas devinable avant l'appel.
+pas encore le cas d'Ollama Cloud : il facture au token, mais ses prix ne sont pas dans `PRICES`.
+Elle ne chiffre que l'entrée, au tarif plein et sans cache, la sortie n'étant pas devinable avant
+l'appel.
 
 Une review dont au moins une passe aboutit imprime aussi une ligne `::stats::{…}` en JSON,
 greppable dans un journal de CI, qui porte les compteurs. `--count-only`, qui n'appelle rien, n'en

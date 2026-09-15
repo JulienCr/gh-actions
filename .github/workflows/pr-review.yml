@@ -51,7 +51,7 @@ jobs:
           pr: ${{ github.event.pull_request.number || inputs.pr }}
           ollama-api-key: ${{ secrets.OLLAMA_API_KEY }}
           # Facultative, et absente aujourd'hui : sans elle, les trois appels
-          # bon marché partent quand même, sur le deepseek-v4-flash d'Ollama.
+          # bon marché partent quand même, sur le deepseek-v4.1-flash d'Ollama.
           # La poser ajouterait le cache de préfixe de l'API directe.
           deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
           skip: |

@@ -935,7 +935,7 @@ var PROVIDERS = {
       thinkingOff: { thinking: { type: "disabled" } }
     }),
     defaultBaseUrl: "https://api.deepseek.com",
-    defaultModel: "deepseek-v4-flash",
+    defaultModel: "deepseek-flash",
     prefixCache: true,
     supportsSeed: false
   },
@@ -955,12 +955,15 @@ var PROVIDERS = {
 var PROVIDER_IDS = Object.keys(PROVIDERS);
 var isProvider = (value) => value in PROVIDERS;
 var PRICES = {
-  "deepseek/deepseek-v4-flash": { input: 0.44, cachedInput: 0.014, output: 1.32 },
+  "deepseek/deepseek-flash": { input: 0.3, cachedInput: 6e-3, output: 1.2 },
+  "deepseek/deepseek-v4-flash": { input: 0.3, cachedInput: 6e-3, output: 1.2 },
   "deepseek/deepseek-v4-pro": { input: 1.32, cachedInput: 0.044, output: 3.96 }
 };
 function isPeakHour(now) {
   const hour = now.getUTCHours();
-  return hour >= 1 && hour < 4 || hour >= 6 && hour < 10;
+  const day = now.getUTCDay();
+  const isWeekday = day >= 1 && day <= 5;
+  return isWeekday && (hour >= 1 && hour < 4 || hour >= 6 && hour < 10);
 }
 var OFF_PEAK_RATIO = 0.5;
 function estimateCost(provider, model, usage, peak = true) {
@@ -1523,14 +1526,14 @@ var DEFAULTS = {
 };
 var PASS_IDS = ["regression", "doctrine", "data", "merge"];
 var CHEAP_MODEL = {
-  ollama: "deepseek-v4-flash:cloud",
-  deepseek: "deepseek-v4-flash"
+  ollama: "deepseek-v4.1-flash:cloud",
+  deepseek: "deepseek-flash"
 };
 function mixFor(provider) {
   const model = CHEAP_MODEL[provider];
   if (!model) return {};
   return {
-    doctrine: { provider, model, thinking: "high" },
+    doctrine: { provider, model, thinking: "false" },
     data: { provider, model, thinking: "high" },
     merge: { provider, model, thinking: "low" }
   };

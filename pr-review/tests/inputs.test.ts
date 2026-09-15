@@ -283,9 +283,9 @@ describe('les drapeaux de mesure', () => {
  */
 describe('resolveConfig · la destination de chaque appel', () => {
   /**
-   * Sans clé DeepSeek, le mix passe quand même : Ollama sert le même modèle, à
-   * un niveau d'usage moyen là où glm-5.2 est à un niveau élevé. La clé
-   * n'achète pas le modèle bon marché, elle achète son cache de préfixe.
+   * Without a DeepSeek key, the mix still applies: Ollama serves the same
+   * model outside the flagship. The key does not buy the cheap model, it
+   * buys its prefix cache.
    */
   it('passe par Ollama pour le modèle bon marché quand aucune clé DeepSeek n’existe', () => {
     const config = resolve();
@@ -293,9 +293,9 @@ describe('resolveConfig · la destination de chaque appel', () => {
       expect(target.provider).toBe('ollama');
     }
     expect(config.passConfigs.regression.model).toBe(DEFAULTS.model);
-    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4-flash:cloud');
-    expect(config.passConfigs.data.model).toBe('deepseek-v4-flash:cloud');
-    expect(config.passConfigs.merge.model).toBe('deepseek-v4-flash:cloud');
+    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4.1-flash:cloud');
+    expect(config.passConfigs.data.model).toBe('deepseek-v4.1-flash:cloud');
+    expect(config.passConfigs.merge.model).toBe('deepseek-v4.1-flash:cloud');
   });
 
   /** Un dépôt qui a désigné son provider a pris la main : pas de renvoi ailleurs. */
@@ -311,10 +311,11 @@ describe('resolveConfig · la destination de chaque appel', () => {
     const config = resolve({ 'INPUT_DEEPSEEK-API-KEY': 'ds' });
     expect(config.passConfigs.doctrine).toEqual({
       provider: 'deepseek',
-      model: 'deepseek-v4-flash',
-      thinking: 'high',
+      model: 'deepseek-flash',
+      thinking: 'false',
     });
     expect(config.passConfigs.data.provider).toBe('deepseek');
+    expect(config.passConfigs.data.thinking).toBe('high');
     expect(config.passConfigs.merge.thinking).toBe('low');
   });
 
@@ -354,7 +355,7 @@ describe('resolveConfig · la destination de chaque appel', () => {
       'INPUT_DATA-MODEL': 'deepseek-v4-pro',
     });
     expect(config.passConfigs.data.model).toBe('deepseek-v4-pro');
-    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4-flash');
+    expect(config.passConfigs.doctrine.model).toBe('deepseek-flash');
   });
 
   /**
@@ -425,14 +426,14 @@ describe('resolveConfig · ce que la review a trouvé', () => {
   /** Un nom Ollama envoyé à DeepSeek, c'était un 404 sur les quatre appels. */
   it('donne à chaque provider connu son propre modèle par défaut', () => {
     expect(resolve({ INPUT_PROVIDER: 'deepseek' }).passConfigs.regression.model).toBe(
-      'deepseek-v4-flash',
+      'deepseek-flash',
     );
     expect(resolve().passConfigs.regression.model).toBe(DEFAULTS.model);
   });
 
   it('donne son modèle au provider d’une passe redirigée seule', () => {
     const config = resolve({ 'INPUT_DOCTRINE-PROVIDER': 'deepseek' });
-    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4-flash');
+    expect(config.passConfigs.doctrine.model).toBe('deepseek-flash');
     expect(config.passConfigs.regression.model).toBe(DEFAULTS.model);
   });
 

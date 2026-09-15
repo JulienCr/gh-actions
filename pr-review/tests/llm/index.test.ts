@@ -48,6 +48,13 @@ describe('l’estimation de coût', () => {
     );
   });
 
+  it('facture le mix DeepSeek V4.1 Flash au tarif de son entrée dans PRICES', () => {
+    expect(estimateCost('deepseek', 'deepseek-flash', usage())).toBeCloseTo(
+      PRICES['deepseek/deepseek-flash']!.input,
+      6,
+    );
+  });
+
   /**
    * `inputTokens` inclut la part servie par le cache : la facturer au plein
    * tarif la compterait deux fois et effacerait précisément l'économie qu'on
@@ -102,6 +109,12 @@ describe('le régime horaire', () => {
     expect(isPeakHour(new Date('2026-08-18T06:00:00Z'))).toBe(true);
   });
 
+  it("ne compte pas les heures pleines le week-end", () => {
+    expect(isPeakHour(new Date('2026-08-15T07:00:00Z'))).toBe(false); // samedi
+    expect(isPeakHour(new Date('2026-08-16T02:00:00Z'))).toBe(false); // dimanche
+    expect(isPeakHour(new Date('2026-08-21T07:00:00Z'))).toBe(true); // vendredi
+  });
+
   it('facture l’heure creuse à moitié prix', () => {
     const usage = {
       inputTokens: 1_000_000,
@@ -119,7 +132,7 @@ describe('les défauts par provider', () => {
   /** Un nom Ollama envoyé à DeepSeek, c'était un 404 sur les quatre appels. */
   it('donne un modèle par défaut aux providers qui ont un catalogue connu', () => {
     expect(PROVIDERS.ollama!.defaultModel).toBe('glm-5.2:cloud');
-    expect(PROVIDERS.deepseek!.defaultModel).toBe('deepseek-v4-flash');
+    expect(PROVIDERS.deepseek!.defaultModel).toBe('deepseek-flash');
   });
 
   /** Deviner le catalogue d'un endpoint inconnu serait pire que de le dire. */
