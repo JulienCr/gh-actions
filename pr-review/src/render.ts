@@ -8,6 +8,21 @@ import { formatCost } from './stats';
 export const MARKER = '<!-- aristarque -->';
 
 /**
+ * Tags one run's comment among the several Aristarque now posts on a PR.
+ *
+ * Appended at the END of the body, never on the first line: `detectHouseReviewer`
+ * (check-reviews skill) matches the first line against `/^<!--\s*(.+?)\s*-->$/`,
+ * so a second HTML comment there would break that external consumer.
+ */
+export function runTag(key: string): string {
+  return `<!-- aristarque-run: ${key} -->`;
+}
+
+export function withRunTag(body: string, key: string): string {
+  return `${body}\n\n${runTag(key)}`;
+}
+
+/**
  * Le titre que porte tout commentaire posté, review réussie ou non.
  *
  * Écrit une fois : les trois rendus ci-dessous en portaient chacun leur copie
@@ -303,16 +318,14 @@ La review n'a pas pu être produite : ${reason}
 }
 
 /**
- * Commentaire posté AVANT les appels au modèle.
+ * Comment posted BEFORE the model calls.
  *
- * Il répond à une ambiguïté qui a coûté deux PR non relues : « pas de
- * commentaire » ne distinguait pas *pas déclenché*, *encore en cours*, *clé
- * absente* et *rien à dire*. Une annonce lève le deuxième cas, et le rapport
- * final vient la remplacer en place (cf. `upsertComment` dans `gh.ts`) : la PR
- * ne porte jamais deux commentaires d'Aristarque.
- *
- * Elle dit aussi ce qu'on attend, parce qu'une review de huit minutes qu'on
- * croit instantanée se fait doubler par un auto-merge armé.
+ * It answers an ambiguity that cost two unreviewed PRs: "no comment" did not
+ * distinguish *never triggered*, *still running*, *missing key* and *nothing
+ * to say*. This same run's final report replaces it in place, keyed on this
+ * run's tag (`upsertComment` in `gh.ts`); older runs get collapsed instead
+ * (`minimizeOtherReports`). It also states what to expect: an eight-minute
+ * review believed instant gets overtaken by an armed auto-merge.
  */
 const PENDING_HEADING = '⏳ **Review en cours.**';
 

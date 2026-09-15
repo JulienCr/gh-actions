@@ -113,13 +113,12 @@ export async function resolveRepo(): Promise<string> {
 }
 
 /**
- * Identifiant du commentaire d'Aristarque sur cette PR, s'il y en a un.
+ * Finds the comment ONE run left on this PR, if any.
  *
- * Le marqueur est en tête de corps depuis toujours (`MARKER` dans `render.ts`),
- * mais personne ne le relisait : chaque run posait un commentaire neuf, si bien
- * qu'une PR relue trois fois portait trois rapports dont deux périmés. On prend
- * le DERNIER trouvé : si un run ancien en a laissé un que le nettoyage a raté,
- * c'est le plus récent qui fait foi.
+ * `marker` alone (`MARKER` in `render.ts`) matches every Aristarque comment on
+ * the PR, across every run; `tag` (`runTag` in `render.ts`) narrows that down
+ * to this run's own. Returns the LAST match, in case cleanup ever left more
+ * than one behind.
  */
 export interface MarkedComment {
   id: number;
@@ -130,15 +129,16 @@ export async function findMarkedComment(
   repo: string,
   pr: number,
   marker: string,
+  tag: string,
 ): Promise<MarkedComment | null> {
   const stdout = await run('gh', [
     'api',
     `repos/${repo}/issues/${pr}/comments`,
     '--paginate',
     '--jq',
-    // Une ligne de JSON compact par commentaire : le corps porte des retours à
-    // la ligne, donc `\(.id) \(.body)` en collerait plusieurs sur une seule.
-    `.[] | select(.body | startswith(${JSON.stringify(marker)})) | {id, body} | tojson`,
+    // One compact JSON line per comment: bodies carry newlines, so
+    // `\(.id) \(.body)` would glue several of them onto one line.
+    `.[] | select((.body | startswith(${JSON.stringify(marker)})) and (.body | contains(${JSON.stringify(tag)}))) | {id, body} | tojson`,
   ]);
   const found = stdout
     .split('\n')
@@ -165,24 +165,23 @@ export async function updateComment(repo: string, id: number, body: string): Pro
 }
 
 /**
- * Pose le rapport là où il est déjà, ou le crée.
+ * Poses this run's report where its own announcement already is, or creates it.
  *
- * C'est ce qui rend l'annonce possible : le commentaire « review en cours »
- * posté au démarrage EST celui que le rapport final vient remplir. Un lecteur
- * n'a donc jamais à se demander si l'absence de rapport veut dire « pas encore »
- * ou « pas déclenché ».
+ * `tag` scopes the lookup to this run: the "review en cours" comment posted at
+ * the start of this same run IS the one the final report replaces in place —
+ * a concurrent or older run's comment is left alone.
  *
- * Une réécriture qui échoue (commentaire supprimé à la main entre-temps)
- * retombe sur un commentaire neuf : perdre le rapport vaudrait moins que perdre
- * l'unicité.
+ * A rewrite that fails (comment deleted by hand meanwhile) falls back to a
+ * fresh comment: losing the report would cost more than losing that place.
  */
 export async function upsertComment(
   repo: string,
   pr: number,
   marker: string,
+  tag: string,
   body: string,
 ): Promise<void> {
-  const existing = await findMarkedComment(repo, pr, marker).catch(() => null);
+  const existing = await findMarkedComment(repo, pr, marker, tag).catch(() => null);
   if (existing === null) {
     await postComment(pr, body);
     return;
@@ -192,6 +191,77 @@ export async function upsertComment(
   } catch {
     await postComment(pr, body);
   }
+}
+
+interface AristarqueComment {
+  id: string;
+  isMinimized: boolean;
+  createdAt: string;
+  own: boolean;
+}
+
+/**
+ * Collapses every OTHER run's report older than this run's own comment,
+ * keeping this run's own and anything newer.
+ *
+ * GraphQL, because REST does not expose `isMinimized`. Ordering on
+ * `createdAt`, not on run identity, is what keeps a slow run from collapsing a
+ * faster run's already-posted report. No own comment yet: minimize nothing.
+ *
+ * @returns how many comments were collapsed by this call.
+ */
+export async function minimizeOtherReports(
+  repo: string,
+  pr: number,
+  marker: string,
+  tag: string,
+): Promise<number> {
+  const [owner, name] = repo.split('/');
+  const query =
+    'query($owner:String!,$name:String!,$number:Int!,$endCursor:String){' +
+    'repository(owner:$owner,name:$name){pullRequest(number:$number){' +
+    'comments(first:100,after:$endCursor){nodes{id body isMinimized createdAt} pageInfo{hasNextPage endCursor}}}}}';
+  const stdout = await run('gh', [
+    'api',
+    'graphql',
+    '--paginate',
+    '-f',
+    `query=${query}`,
+    '-F',
+    `owner=${owner}`,
+    '-F',
+    `name=${name}`,
+    '-F',
+    `number=${pr}`,
+    '--jq',
+    `.data.repository.pullRequest.comments.nodes[] | select(.body | startswith(${JSON.stringify(marker)})) | {id, isMinimized, createdAt, own: (.body | contains(${JSON.stringify(tag)}))} | tojson`,
+  ]);
+  const comments = stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .map((line) => JSON.parse(line) as AristarqueComment);
+
+  const ownCreatedAt = comments
+    .filter((comment) => comment.own)
+    .map((comment) => comment.createdAt)
+    .sort()
+    .at(0);
+  if (ownCreatedAt === undefined) return 0;
+
+  const ids = comments
+    .filter((comment) => !comment.own && !comment.isMinimized && comment.createdAt < ownCreatedAt)
+    .map((comment) => comment.id);
+
+  for (const id of ids) {
+    const mutation = 'mutation($id:ID!){minimizeComment(input:{subjectId:$id, classifier:OUTDATED}){minimizedComment{isMinimized}}}';
+    await runWithStdin(
+      'gh',
+      ['api', 'graphql', '--input', '-'],
+      JSON.stringify({ query: mutation, variables: { id } }),
+    );
+  }
+  return ids.length;
 }
 
 /** Les états qu'accepte l'API des statuts de commit. */

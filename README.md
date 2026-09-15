@@ -301,16 +301,18 @@ extérieures, laisser `false`.
 
 `announce` est allumée par défaut. Avant le premier appel au modèle, Aristarque pose un commentaire
 « review en cours » qui nomme les passes qui partent et lie le run ; le rapport final **remplace ce
-commentaire en place**, par son marqueur `<!-- aristarque -->`.
+commentaire en place**, par le marqueur `<!-- aristarque -->` et un tag propre à ce run.
 
 Ça lève une ambiguïté qui coûtait cher. Une PR sans commentaire ne distinguait pas quatre choses :
 la review n'a pas été déclenchée, elle tourne encore, la clé est absente (l'action est alors
 *totalement silencieuse*), ou il n'y avait rien à relire. Une annonce répond du deuxième cas, et le
 statut ci-dessus des trois autres.
 
-Effet de bord voulu : une PR relue plusieurs fois — `@aristarque review` après corrections — ne
-porte plus qu'**un seul** commentaire, le dernier. Les rapports périmés ne s'empilent plus sous le
-courant.
+Chaque run pose désormais **son propre commentaire** : une PR relue plusieurs fois — `@aristarque
+review` après corrections — porte un rapport par run, chacun remplaçant sa propre annonce en place.
+Dès qu'un rapport aboutit, les rapports des runs précédents sont repliés (« minimized ») comme
+périmés, pour que le courant reste seul visible sans effacer l'historique. Aucune permission
+supplémentaire au-delà de `pull-requests: write`, déjà requise pour poster.
 
 ### Le mix par passe
 

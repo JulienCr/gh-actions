@@ -9,6 +9,8 @@ import {
   renderComment,
   renderFailureComment,
   renderPartialComment,
+  runTag,
+  withRunTag,
   type Footer,
 } from '../src/render';
 
@@ -309,9 +311,9 @@ describe('le pied de page rapporte le cache et le coût', () => {
 });
 
 /**
- * L'annonce et le rapport partagent le marqueur, et c'est tout l'intérêt : le
- * second remplace la première en place, si bien qu'une PR ne porte jamais deux
- * commentaires d'Aristarque.
+ * The announcement and its report share both the marker and this run's tag:
+ * the second replaces the first in place (`upsertComment` in `gh.ts`), while
+ * other runs' comments — tagged differently — are left for `minimizeOtherReports`.
  */
 describe('l’annonce et l’interruption', () => {
   it('porte le marqueur, les passes prévues et le lien du run', () => {
@@ -351,5 +353,23 @@ describe('reconnaître une annonce', () => {
     expect(isPendingComment(renderPendingComment({ passes: ['doctrine du dépôt'] }))).toBe(true);
     expect(isPendingComment(renderFailureComment('quota épuisé', 'glm-5.2:cloud'))).toBe(false);
     expect(isPendingComment(renderAbortedComment())).toBe(false);
+  });
+});
+
+/**
+ * The tag must sit at the very end of the body: `detectHouseReviewer` (in the
+ * check-reviews skill) matches only the FIRST line against `/^<!--\s*(.+?)\s*-->$/`,
+ * so a run tag there would break that external consumer.
+ */
+describe('le tag de run', () => {
+  it('rend un commentaire HTML distinct du marqueur', () => {
+    expect(runTag('99.1')).toBe('<!-- aristarque-run: 99.1 -->');
+  });
+
+  it('ajoute le tag à la fin du corps, sans toucher la première ligne', () => {
+    const body = `${MARKER}\n## Aristarque — review automatique\n\ncontenu`;
+    const tagged = withRunTag(body, '99.1');
+    expect(tagged.split('\n')[0]).toBe(MARKER);
+    expect(tagged.endsWith(runTag('99.1'))).toBe(true);
   });
 });

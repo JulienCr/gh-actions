@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { findMarkedComment, postStatus, statusOf, updateComment, upsertComment } from '../src/gh';
+import {
+  findMarkedComment,
+  minimizeOtherReports,
+  postStatus,
+  statusOf,
+  updateComment,
+  upsertComment,
+} from '../src/gh';
 import { run, runWithStdin } from '../src/exec';
 
 vi.mock('../src/exec', () => ({
@@ -17,6 +24,7 @@ beforeEach(() => {
 });
 
 const MARKER = '<!-- aristarque -->';
+const TAG = '<!-- aristarque-run: 42.1 -->';
 
 /**
  * `gh pr view --json files` rend « changeType », jamais « status ». Lire le
@@ -45,26 +53,28 @@ describe('le statut d’un fichier, lu sur changeType', () => {
 
 
 /**
- * Le marqueur est en tête de corps depuis toujours ; c'est sa relecture qui est
- * neuve. Une PR relue trois fois portait trois rapports dont deux périmés.
+ * `marker` finds every Aristarque comment across every run; `tag` narrows that
+ * to one run's own — the pair is what lets several runs coexist on a PR.
  */
 describe('retrouver le commentaire d’Aristarque', () => {
-  it('interroge l’API en filtrant sur le marqueur, et garde le dernier', async () => {
+  it('interroge l’API en filtrant sur le marqueur et le tag de run, et garde le dernier', async () => {
     runMock.mockResolvedValue('{"id":11,"body":"vieux"}\n{"id":42,"body":"récent"}\n');
-    expect(await findMarkedComment('o/r', 7, MARKER)).toEqual({ id: 42, body: 'récent' });
+    expect(await findMarkedComment('o/r', 7, MARKER, TAG)).toEqual({ id: 42, body: 'récent' });
 
     const [command, args] = runMock.mock.calls[0]!;
     expect(command).toBe('gh');
     expect(args).toContain('repos/o/r/issues/7/comments');
     expect(args).toContain('--paginate');
-    // Le marqueur part en littéral JSON : il contient des chevrons et des
-    // tirets, que jq lirait autrement s'il était collé tel quel.
-    expect(args.at(-1)).toBe(`.[] | select(.body | startswith("${MARKER}")) | {id, body} | tojson`);
+    // Marker and tag go as JSON literals: they carry angle brackets and
+    // dashes jq would read differently if pasted in raw.
+    expect(args.at(-1)).toBe(
+      `.[] | select((.body | startswith("${MARKER}")) and (.body | contains("${TAG}"))) | {id, body} | tojson`,
+    );
   });
 
   it('rend null quand la PR n’en porte aucun', async () => {
     runMock.mockResolvedValue('\n');
-    expect(await findMarkedComment('o/r', 7, MARKER)).toBeNull();
+    expect(await findMarkedComment('o/r', 7, MARKER, TAG)).toBeNull();
   });
 });
 
@@ -82,16 +92,16 @@ describe('réécrire un commentaire', () => {
   });
 });
 
-describe('poser le rapport là où il est déjà', () => {
-  it('réécrit quand le marqueur est trouvé', async () => {
+describe('poser le rapport là où est déjà l’annonce de ce run', () => {
+  it('réécrit quand le marqueur ET le tag de run sont trouvés', async () => {
     runMock.mockResolvedValue('{"id":42,"body":"annonce"}\n');
-    await upsertComment('o/r', 7, MARKER, 'rapport');
+    await upsertComment('o/r', 7, MARKER, TAG, 'rapport');
     expect(stdinMock.mock.calls.some(([, args]) => args.includes('PATCH'))).toBe(true);
   });
 
   it('crée un commentaire quand il n’y en a pas', async () => {
     runMock.mockResolvedValue('');
-    await upsertComment('o/r', 7, MARKER, 'rapport');
+    await upsertComment('o/r', 7, MARKER, TAG, 'rapport');
     const [, args] = stdinMock.mock.calls[0]!;
     expect(args).toEqual(['pr', 'comment', '7', '--body-file', '-']);
   });
@@ -100,9 +110,99 @@ describe('poser le rapport là où il est déjà', () => {
   it('retombe sur un commentaire neuf quand la réécriture échoue', async () => {
     runMock.mockResolvedValue('{"id":42,"body":"annonce"}\n');
     stdinMock.mockRejectedValueOnce(new Error('404'));
-    await upsertComment('o/r', 7, MARKER, 'rapport');
+    await upsertComment('o/r', 7, MARKER, TAG, 'rapport');
     const [, args] = stdinMock.mock.calls[1]!;
     expect(args).toEqual(['pr', 'comment', '7', '--body-file', '-']);
+  });
+});
+
+/**
+ * The listing goes through GraphQL (REST has no "does not contain" filter),
+ * then one `minimizeComment` mutation per stale id. Ordering is on
+ * `createdAt`, not on run identity: an older foreign report collapses, a
+ * newer one survives, whatever each run's start time was.
+ */
+describe('replier les anciens rapports', () => {
+  it('liste par GraphQL paginé, filtre sur marqueur, puis minimise ce qui est plus vieux que le commentaire propre', async () => {
+    runMock.mockResolvedValue(
+      [
+        { id: 'gid1', isMinimized: false, createdAt: '2024-01-01T00:00:00Z', own: false },
+        { id: 'gid2', isMinimized: false, createdAt: '2024-01-02T00:00:00Z', own: true },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    const collapsed = await minimizeOtherReports('o/r', 7, MARKER, TAG);
+
+    const [command, args] = runMock.mock.calls[0]!;
+    expect(command).toBe('gh');
+    expect(args).toEqual(
+      expect.arrayContaining([
+        'graphql',
+        '--paginate',
+        '-F',
+        'owner=o',
+        '-F',
+        'name=r',
+        '-F',
+        'number=7',
+      ]),
+    );
+    const query = args[args.indexOf('-f') + 1];
+    expect(query).toContain('query=query($owner:String!,$name:String!,$number:Int!,$endCursor:String)');
+    expect(query).toContain('$endCursor');
+    expect(query).toContain('createdAt');
+    const jqFilter = args.at(-1)!;
+    expect(jqFilter).toContain(`startswith("${MARKER}")`);
+    expect(jqFilter).toContain(`contains("${TAG}")`);
+
+    expect(stdinMock).toHaveBeenCalledTimes(1);
+    const [, mutationArgs, mutationInput] = stdinMock.mock.calls[0]!;
+    expect(mutationArgs).toEqual(['api', 'graphql', '--input', '-']);
+    const parsed = JSON.parse(mutationInput) as { query: string; variables: { id: string } };
+    expect(parsed.query).toContain('minimizeComment(input:{subjectId:$id, classifier:OUTDATED})');
+    expect(parsed.variables).toEqual({ id: 'gid1' });
+    expect(collapsed).toBe(1);
+  });
+
+  it('épargne un rapport étranger plus récent que le commentaire propre', async () => {
+    runMock.mockResolvedValue(
+      [
+        { id: 'gid1', isMinimized: false, createdAt: '2024-01-03T00:00:00Z', own: false },
+        { id: 'gid2', isMinimized: false, createdAt: '2024-01-01T00:00:00Z', own: true },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    expect(await minimizeOtherReports('o/r', 7, MARKER, TAG)).toBe(0);
+    expect(stdinMock).not.toHaveBeenCalled();
+  });
+
+  it('n’essaie pas de minimiser un rapport déjà replié', async () => {
+    runMock.mockResolvedValue(
+      [
+        { id: 'gid1', isMinimized: true, createdAt: '2024-01-01T00:00:00Z', own: false },
+        { id: 'gid2', isMinimized: false, createdAt: '2024-01-02T00:00:00Z', own: true },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    expect(await minimizeOtherReports('o/r', 7, MARKER, TAG)).toBe(0);
+    expect(stdinMock).not.toHaveBeenCalled();
+  });
+
+  it('ne minimise rien, et rend 0, sans commentaire propre', async () => {
+    runMock.mockResolvedValue(
+      JSON.stringify({ id: 'gid1', isMinimized: false, createdAt: '2024-01-01T00:00:00Z', own: false }) + '\n',
+    );
+    expect(await minimizeOtherReports('o/r', 7, MARKER, TAG)).toBe(0);
+    expect(stdinMock).not.toHaveBeenCalled();
+  });
+
+  it('ne minimise rien, et rend 0, quand la liste est vide', async () => {
+    runMock.mockResolvedValue('\n');
+    expect(await minimizeOtherReports('o/r', 7, MARKER, TAG)).toBe(0);
+    expect(stdinMock).not.toHaveBeenCalled();
   });
 });
 

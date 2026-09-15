@@ -28,8 +28,9 @@ inputs:
       modèle, que le rapport final vient remplacer en place. Deux PR ont été
       mergées sans relecture parce qu'une PR sans commentaire ne distinguait pas
       « encore en cours » de « jamais déclenché » : l'annonce lève le premier
-      cas. Effet de bord voulu, une PR relue plusieurs fois ne porte plus qu'un
-      seul commentaire, le dernier.
+      cas. Chaque run pose son propre commentaire, remplacé en place par son
+      propre rapport ; les rapports des runs précédents sont repliés comme
+      périmés dès qu'un nouveau aboutit.
     required: false
     default: 'true'
 
