@@ -305,10 +305,15 @@ export interface Config {
    * module free of `process.pid` / `Date.now()`.
    */
   runKey: string;
-  /** Imprimer ce qui partirait, et ne rien envoyer. Réglage local seulement. */
+  /** Print what would go out, and send nothing. Local setting only. */
   countOnly: boolean;
-  /** Nom libre du bras mesuré, repris dans la ligne « ::stats:: ». */
+  /** Free-form arm name, carried in the « ::stats:: » line. */
   variant: string;
+  /**
+   * Path of a `--dry-run` dump to replay on the merge call alone. Empty: no
+   * replay. Implies `dryRun`; see `--replay-merge` in `resolveConfig`.
+   */
+  replayMerge: string;
 }
 
 /**
@@ -613,12 +618,15 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   let model = readInput(env, 'model') || env.OLLAMA_REVIEW_MODEL?.trim() || '';
   let countOnly = false;
   let variant = readInput(env, 'variant') || DEFAULTS.variant;
+  let replayMerge = '';
+  let mergeModelFlag = '';
+  let mergeThinkingFlag = '';
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
     if (arg === '--dry-run') dryRun = true;
-    // Ne rien envoyer implique ne rien poster : sans ça, une faute de frappe sur
-    // un drapeau de mesure irait commenter une PR.
+    // Sending nothing implies posting nothing: without this, a typo on a
+    // measurement flag would go comment on a PR.
     else if (arg === '--count-only') {
       countOnly = true;
       dryRun = true;
@@ -630,6 +638,21 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
       const value = argv[++index];
       if (!value) throw new UsageError('« --variant » attend un nom.');
       variant = value;
+    } else if (arg === '--replay-merge') {
+      const value = argv[++index];
+      if (!value) throw new UsageError('« --replay-merge » attend le chemin d’un dump --dry-run.');
+      replayMerge = value;
+      // A replay never posts: it is a tuning gesture on findings already
+      // written down, not a review that just ran.
+      dryRun = true;
+    } else if (arg === '--merge-model') {
+      const value = argv[++index];
+      if (!value) throw new UsageError('« --merge-model » attend un nom de modèle.');
+      mergeModelFlag = value;
+    } else if (arg === '--merge-thinking') {
+      const value = argv[++index];
+      if (!value) throw new UsageError('« --merge-thinking » attend un niveau.');
+      mergeThinkingFlag = value;
     } else if (/^#?\d+$/.test(arg)) pr = Number(arg.replace('#', ''));
     else throw new UsageError(`argument inconnu : ${arg}`);
   }
@@ -673,21 +696,32 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
   // lui laissant le modèle d'un autre provider produirait un 404, pas un
   // compromis. L'écrire garde donc le comportement d'avant, pour les quatre.
   const route = model === '' ? mixRoute(provider, keys.deepseek !== '') : null;
+  // `--merge-model` / `--merge-thinking` take the exact spot of the
+  // `merge-model` / `merge-thinking` inputs, so they win the same precedence
+  // battle `resolvePass` already runs: written above the mix, above defaults.
+  const passConfigEnv: Env =
+    mergeModelFlag || mergeThinkingFlag
+      ? {
+          ...env,
+          ...(mergeModelFlag ? { 'INPUT_MERGE-MODEL': mergeModelFlag } : {}),
+          ...(mergeThinkingFlag ? { 'INPUT_MERGE-THINKING': mergeThinkingFlag } : {}),
+        }
+      : env;
 
   return {
     pr,
     dryRun,
     model: model || providerDefault || DEFAULTS.model,
     provider,
-    // Pas de validation contre une liste de niveaux : ils varient d'un modèle à
-    // l'autre, et un niveau refusé est rattrapé à l'appel.
+    // No validation against a list of levels: they vary from one model to
+    // another, and a refused level is caught at call time.
     passConfigs: resolvePassConfigs(
-      env,
+      passConfigEnv,
       {
         provider,
         model: model || providerDefault || DEFAULTS.model,
         thinking: readInput(env, 'thinking'),
-        mergeThinking: readInput(env, 'merge-thinking'),
+        mergeThinking: readInput(passConfigEnv, 'merge-thinking'),
         effort,
         mix: route === null ? {} : mixFor(route),
       },
@@ -735,5 +769,6 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     mode: readInput(env, 'mode').toLowerCase() === 'abort' ? 'abort' : 'review',
     runUrl: runUrlFrom(env),
     runKey: runKeyFrom(env),
+    replayMerge,
   };
 }

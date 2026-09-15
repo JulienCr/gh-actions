@@ -62,6 +62,7 @@ import {
   buildPassMessages,
   groupForCache,
   PASS_HEADING,
+  PASSES,
   selectPasses,
   type Pass,
 } from './passes';
@@ -81,6 +82,7 @@ import {
   describeCall,
   describeTargets,
   estimateTokens,
+  parseStatsLine,
   renderBreakdown,
   statsLine,
   totals,
@@ -755,6 +757,33 @@ async function abort(config: Config, reason = 'run annulé ou délai dépassé')
   console.log(`Review de la PR #${config.pr} déclarée interrompue.`);
 }
 
+/**
+ * The merge call's messages, from the passes that actually completed.
+ *
+ * Shared by `review()` and `replayMerge()` so a replay can never drift from
+ * production prompts: both build the exact same messages from the same
+ * outcomes.
+ */
+function mergeMessages(
+  config: Config,
+  repo: string,
+  meta: PrMeta,
+  outcomes: PassOutcome[],
+): ChatMessage[] {
+  return [
+    {
+      role: 'system',
+      content: buildMergeSystemPrompt({
+        repo,
+        maxFindings: config.maxFindings,
+        softSections: config.softSections,
+        passes: outcomes.map((outcome) => outcome.pass),
+      }),
+    },
+    { role: 'user', content: buildMergeUserPrompt(meta, outcomes) },
+  ];
+}
+
 async function review(config: Config): Promise<void> {
   const root = repoRoot();
 
@@ -921,21 +950,7 @@ async function review(config: Config): Promise<void> {
       : await callModel(config, run, {
           id: 'merge',
           target: mergeTarget,
-          messages: [
-            {
-              role: 'system',
-              // Les passes qui ont abouti, pas celles qui étaient prévues :
-              // annoncer un relecteur qui n'a rien rendu ferait chercher à la
-              // fusion un axe absent.
-              content: buildMergeSystemPrompt({
-                repo,
-                maxFindings: config.maxFindings,
-                softSections: config.softSections,
-                passes: outcomes.map((outcome) => outcome.pass),
-              }),
-            },
-            { role: 'user', content: buildMergeUserPrompt(meta, outcomes) },
-          ],
+          messages: mergeMessages(config, repo, meta, outcomes),
           label: 'fusion',
         });
 
@@ -989,6 +1004,7 @@ async function review(config: Config): Promise<void> {
   console.log(
     statsLine({
       pr: config.pr,
+      repo,
       model: config.model,
       variant: config.variant,
       calls: run.calls,
@@ -1011,6 +1027,117 @@ async function review(config: Config): Promise<void> {
     comment,
   );
   console.log(`Review postée sur la PR #${config.pr}.`);
+}
+
+/**
+ * Replays ONLY the merge call, on the findings of a local `--dry-run` dump.
+ *
+ * The three passes never re-run: validating a merge prompt or model change
+ * this way skips repaying three code reads per try. `mergeMessages` keeps
+ * the replayed prompt identical to what `review()` would have built.
+ *
+ * Every expected failure is printed and returns without throwing, like the
+ * rest of this program (see the file header).
+ */
+async function replayMerge(config: Config): Promise<void> {
+  let dump: string;
+  try {
+    dump = readFileSync(config.replayMerge, 'utf-8');
+  } catch (error) {
+    console.error(
+      `✗ rejeu de la fusion : lecture de « ${config.replayMerge} » impossible (${String(error)}).`,
+    );
+    return;
+  }
+
+  let payload: ReturnType<typeof parseStatsLine>;
+  try {
+    payload = parseStatsLine(dump);
+  } catch (error) {
+    console.error(`✗ rejeu de la fusion : ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (Object.keys(payload.findings).length === 0) {
+    console.error(
+      "✗ rejeu de la fusion : la ligne « ::stats:: » ne porte aucune trouvaille (dump produit sans « --dry-run » ?).",
+    );
+    return;
+  }
+  if (payload.pr !== config.pr) {
+    console.error(
+      `✗ rejeu de la fusion : le dump porte sur la PR #${payload.pr}, pas sur #${config.pr}.`,
+    );
+    return;
+  }
+
+  // A dump made before this field has no repo: fall back to cwd or an
+  // already-set GH_REPO, exactly as before this change.
+  if (payload.repo && !process.env.GH_REPO) process.env.GH_REPO = payload.repo;
+
+  const [repo, meta] = await Promise.all([resolveRepo(), fetchPrMeta(config.pr)]);
+
+  const byId = new Map(PASSES.map((pass) => [pass.id, pass]));
+  const outcomes: PassOutcome[] = [];
+  for (const pass of PASSES) {
+    const findings = payload.findings[pass.id];
+    if (findings !== undefined) outcomes.push({ pass, findings });
+  }
+  for (const id of Object.keys(payload.findings)) {
+    if (!byId.has(id)) console.warn(`⚠ passe « ${id} » inconnue dans ce dump : ignorée.`);
+  }
+
+  const run: Run = { calls: [], failures: [] };
+  const mergeTarget = resolveTarget(config, 'merge', 'fusion', (message) => console.warn(`⚠ ${message}`));
+  if (mergeTarget === null) {
+    console.error(`✗ rejeu de la fusion : aucune clé pour « ${config.passConfigs.merge.provider} ».`);
+    return;
+  }
+
+  const merged = await callModel(config, run, {
+    id: 'merge',
+    target: mergeTarget,
+    messages: mergeMessages(config, repo, meta, outcomes),
+    label: 'fusion (rejeu)',
+  });
+  if (merged === null) {
+    console.error(`✗ rejeu de la fusion : ${run.failures.at(-1) ?? 'raison inconnue'}.`);
+    return;
+  }
+
+  const server = (process.env.GITHUB_SERVER_URL ?? 'https://github.com').replace(/\/$/, '');
+  const comment = renderComment({
+    review: merged.content,
+    repoUrl: `${server}/${repo}`,
+    headSha: meta.headSha,
+    knownPaths: new Set(meta.files.map((file) => file.path)),
+    footer: {
+      models: describeTargets(run.calls.filter((call) => call.ok)),
+      durationMs: run.calls.at(-1)?.durationMs ?? 0,
+      ...totals(run.calls),
+      skipped: [],
+      omitted: [],
+      windowed: [],
+      imported: 0,
+      effort: config.effort,
+      importsWithheld: [],
+      failedPasses: [],
+      skippedPasses: [],
+    },
+  });
+
+  console.log('\n────────── fusion rejouée (dry-run, non postée) ──────────\n');
+  console.log(comment);
+  console.log(
+    statsLine({
+      pr: config.pr,
+      repo,
+      model: config.model,
+      variant: config.variant,
+      calls: run.calls,
+      blocks: { system: 0, diff: 0, touched: 0, imported: 0, meta: 0 },
+      findings: {},
+    }),
+  );
 }
 
 function knownPaths(meta: PrMeta, context: AssembledContext): Set<string> {
@@ -1098,6 +1225,13 @@ async function main(): Promise<void> {
       console.log('Aucune clé de provider : review ignorée.');
       return;
     }
+  }
+
+  // A replay never touches `review()`'s abort/cleanup path: it never posts an
+  // announcement in the first place, so there is nothing to conclude.
+  if (config.replayMerge) {
+    await replayMerge(config);
+    return;
   }
 
   try {

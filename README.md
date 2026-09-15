@@ -548,6 +548,28 @@ poste ; en CI la ligne garde les compteurs, qui ne citent rien. Et c'est bien su
 qu'il faut comparer : les tokens disent lequel est le moins cher, jamais lequel a perdu quelque
 chose.
 
+### Rejouer la fusion
+
+Régler le prompt de fusion ou essayer un modèle moins cher pour trier ne devrait pas coûter trois
+passes à chaque essai. `--replay-merge` rejoue **seulement** la fusion, sur les trouvailles d'un
+dump produit une seule fois :
+
+```
+pr-review 154 --dry-run > dump.log
+pr-review 154 --replay-merge dump.log
+pr-review 154 --replay-merge dump.log --merge-model deepseek-flash --merge-thinking low
+```
+
+Le premier appel checkoute la PR à sa tête (`gh pr checkout 154`) puis produit le dump ; les
+suivants relisent ce dump et n'appellent que la fusion, avec exactement le même prompt que
+`review()` aurait construit. `--merge-model` et `--merge-thinking` valent aussi hors rejeu : ce
+sont les mêmes réglages que les inputs `merge-model` / `merge-thinking`, avec la priorité de la
+ligne de commande.
+
+**Un dump contient les trouvailles brutes de la passe « données et accès »**, donc potentiellement
+un secret cité par une trouvaille : il reste local, ne se commit jamais et ne s'attache jamais à un
+run de CI.
+
 ### Pourquoi pas une review agentique
 
 Le runner sort bien le dépôt, et `glm-5.2:cloud` accepte les outils : rien n'empêche techniquement
