@@ -104,8 +104,7 @@ const WINDOW: Omit<WindowOptions, 'minLines'> = {
 
 /**
  * Fallback run key outside CI, where `config.runKey` is empty (`inputs.ts`
- * stays pure). Module-scoped, not per-call: two local runs in the same
- * process must not collide, but one run must keep a single key throughout.
+ * stays pure). Per process, which is enough: one process runs one review.
  */
 const LOCAL_RUN_KEY = `local-${process.pid}-${Date.now()}`;
 
