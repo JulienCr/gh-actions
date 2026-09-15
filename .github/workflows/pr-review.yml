@@ -33,9 +33,10 @@ jobs:
     # Le mur vaut « le plus gros groupe séquencé + fusion ». Les passes ne
     # s'enchaînent que chez un provider qui cache les préfixes ; sur Ollama
     # elles restent parallèles, soit deux fois le « timeout-minutes » de
-    # l'action. Avec une clé DeepSeek, trois fois. Plus la marge du commentaire
-    # d'échec. Mesuré sur la PR #8 : 8 min 08 s au total, dont 470 s pour la
-    # seule régression.
+    # l'action, même avec un `model:` explicite. Avec une clé DeepSeek, trois
+    # fois. Avec `provider: deepseek`, quatre fois. Plus la marge du
+    # commentaire d'échec. Mesuré sur la PR #8 : 8 min 08 s au total, dont
+    # 470 s pour la seule régression.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7

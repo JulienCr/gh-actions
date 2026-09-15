@@ -399,17 +399,22 @@ Enchaîner sans cache n'achetait donc qu'un mur de job plus long : sur les dix m
 chaîne doctrine→données finissait après la régression dans 7 cas sur 10, de 90 à 435 s.
 
 ⚠️ **Le séquencement change l'arithmétique du `timeout-minutes` du job.** Le mur vaut
-`(taille du plus gros groupe séquencé + 1) × timeout-minutes`, la fusion étant le `+ 1` :
+`(taille du plus gros groupe séquencé + 1) × timeout-minutes`, la fusion étant le `+ 1`. Seul un
+provider qui cache les préfixes justifie d'enchaîner : un `model:` explicite sur un provider
+Ollama garde les passes en parallèle, alors que `provider: deepseek` les met toutes sur une seule
+route qui cache.
 
 | Configuration | Plus gros groupe | Mur théorique |
 | --- | --- | --- |
-| défaut (mix actif) | 2 (doctrine puis données) | 3 × 15 = **45 min** |
-| `model:` écrit à la main | 3 (les trois passes, même modèle) | 4 × 15 = **60 min** |
+| mix par défaut, sans clé DeepSeek (Ollama) | 1 (tout en parallèle) | 2 × 15 = **30 min** |
+| mix par défaut, avec clé DeepSeek | 2 (doctrine puis données, régression en parallèle) | 3 × 15 = **45 min** |
+| `model:` explicite, provider Ollama | 1 (un seul modèle, mais non cacheable) | 2 × 15 = **30 min** |
+| `provider: deepseek`, un seul modèle | 3 (les trois passes enchaînées) | 4 × 15 = **60 min** |
 
-La seconde ligne est le piège : écrire `model:` remet les quatre appels sur un seul modèle, donc
-les trois passes dans le même groupe. Un `timeout-minutes: 45` y couperait la review pendant la
-fusion, sans laisser le temps de poster le commentaire d'échec. Baisse `timeout-minutes` ou monte
-le budget du job.
+La dernière ligne est le piège : poser `provider: deepseek` remet les quatre appels sur une seule
+route qui cache, donc les trois passes dans le même groupe. Un `timeout-minutes: 45` y couperait la
+review pendant la fusion, sans laisser le temps de poster le commentaire d'échec. Baisse
+`timeout-minutes` ou monte le budget du job.
 
 Mesuré sur cette PR, on est loin du pire cas, la régression pesant à elle seule cinq fois les deux
 autres réunies :

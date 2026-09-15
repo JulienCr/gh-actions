@@ -336,10 +336,12 @@ inputs:
       provider ET un modèle chez un provider qui cache les préfixes : celles-là
       s'enchaînent, pour que la seconde rejoue le préfixe de la première en
       cache. Le mur du job vaut donc « (taille de la plus longue chaîne + 1) ×
-      cette valeur » : deux fois avec le mix Ollama par défaut, où rien ne
-      cache, trois fois si doctrine et données s'enchaînent chez DeepSeek en
-      direct. Le timeout-minutes du job doit rester au-dessus, sinon le
-      commentaire d'échec n'a pas le temps d'être posté.
+      cette valeur » : deux fois sans clé DeepSeek (tout part en parallèle,
+      même avec un `model:` explicite sur Ollama), trois fois avec une clé
+      DeepSeek (doctrine et données s'enchaînent en direct), quatre fois avec
+      `provider: deepseek` (les trois passes sur un seul modèle qui cache). Le
+      timeout-minutes du job doit rester au-dessus, sinon le commentaire
+      d'échec n'a pas le temps d'être posté.
     required: false
     default: '15'
 
