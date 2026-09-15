@@ -382,54 +382,44 @@ export interface Sequenceable {
   /** Taille de l'entrée, en caractères. */
   chars: number;
   /**
-   * Les enchaîner achète-t-il un préfixe en cache ?
+   * Does chaining this call after another buy a cached prefix?
    *
-   * Ne décide plus du groupement, seulement de ce qu'on en DIT : chez un
-   * provider qui cache, la mise en file achète des tokens ; chez les autres,
-   * elle achète des passes qui aboutissent. Voir `groupByDestination`.
+   * The only reason to serialize two calls at all: the second one replays
+   * the first one's cached prefix instead of paying for it again. See
+   * `groupForCache`.
    */
   cacheable: boolean;
 }
 
 /**
- * Regroupe les appels par destination, et ordonne chaque groupe.
+ * Groups cacheable calls by destination, sorted shortest-first; every other
+ * call becomes its own single-item group.
  *
- * Deux appels qui visent le même couple provider+modèle ne partent plus
- * ensemble. Deux raisons, et la seconde a coûté trois reviews avant d'être
- * comprise :
- *
- * 1. **Le cache.** Chez un provider qui cache les préfixes, la seconde requête
- *    rejoue le gros contexte commun à un trente-et-unième du tarif, à condition
- *    de partir APRÈS : un cache s'écrit à la fin de l'entrée qui l'a produit.
- *    D'où le tri par taille croissante, au cran `balanced` : « doctrine » ne
- *    reçoit pas les fichiers importés et « données » les reçoit, or ils sont
- *    rendus en dernier. Le prompt de doctrine est alors un préfixe strict de
- *    celui de données.
- * 2. **La capacité.** Mesuré sur avolo-shorts#63, #64 et #68 : trois grosses
- *    requêtes simultanées sur un même compte Ollama, et les deux qui partagent
- *    un modèle rendent un contenu VIDE après trois minutes de génération. La
- *    même passe lancée SEULE, avec un contexte plus gros (173 109 tokens contre
- *    ~134 000), aboutit. Ce n'est donc pas la taille du contexte, c'est la
- *    concurrence.
- *
- * Le groupement ne regarde donc plus `cacheable`. La version précédente y
- * voyait le seul motif de sérialiser, et laissait par conséquent partir
- * ensemble deux appels qu'Ollama ne savait pas servir en même temps.
- *
- * Les groupes, eux, restent parallèles entre eux : destinations distinctes,
- * rien à se disputer.
+ * A cache is written at the end of the input that produced it, so the
+ * second call in a chain must start AFTER the first one finishes, and the
+ * shorter prompt goes first so the longer one's prefix matches it. Calls
+ * that can't reuse a cache gain nothing from chaining and run in parallel.
  */
-export function groupByDestination<T extends Sequenceable>(items: readonly T[]): T[][] {
-  const groups = new Map<string, T[]>();
+export function groupForCache<T extends Sequenceable>(items: readonly T[]): T[][] {
+  const groups: T[][] = [];
+  const byDestination = new Map<string, T[]>();
   for (const item of items) {
+    if (!item.cacheable) {
+      groups.push([item]);
+      continue;
+    }
     const key = `${item.provider}/${item.model}`;
-    const group = groups.get(key);
+    const group = byDestination.get(key);
     if (group) group.push(item);
-    else groups.set(key, [item]);
+    else {
+      const fresh: T[] = [item];
+      byDestination.set(key, fresh);
+      groups.push(fresh);
+    }
   }
-  // Le tri est stable : deux entrées de même taille gardent l'ordre des passes,
-  // qui est lui-même déterministe. Rien ici ne doit dépendre d'une exécution.
-  return [...groups.values()].map((group) => [...group].sort((a, b) => a.chars - b.chars));
+  // Stable sort: two entries of the same size keep the passes' own order,
+  // itself deterministic. Nothing here should depend on execution timing.
+  return groups.map((group) => [...group].sort((a, b) => a.chars - b.chars));
 }
 
 /**

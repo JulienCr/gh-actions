@@ -332,16 +332,16 @@ inputs:
   timeout-minutes:
     description: >-
       Délai maximum d'UNE requête au modèle. La review en fait quatre. Les
-      passes tournent en parallèle, sauf celles qui partagent un provider ET un
-      modèle : celles-là s'enchaînent toujours, pour que la seconde rejoue le
-      préfixe de la première quand le provider cache, et parce qu'un même modèle
-      ne sert pas deux gros contextes à la fois quand il ne cache pas. Le mur du
-      job vaut
-      donc « (taille du plus gros groupe + 1) × cette valeur » : trois fois avec
-      le mix, où doctrine et données s'enchaînent, et QUATRE fois si un « model »
-      écrit à la main remet les trois passes sur un seul modèle. Le
-      timeout-minutes du job doit rester au-dessus, sinon le commentaire d'échec
-      n'a pas le temps d'être posté.
+      passes tournent en parallèle, sauf celles qui partagent à la fois un
+      provider ET un modèle chez un provider qui cache les préfixes : celles-là
+      s'enchaînent, pour que la seconde rejoue le préfixe de la première en
+      cache. Le mur du job vaut donc « (taille de la plus longue chaîne + 1) ×
+      cette valeur » : deux fois sans clé DeepSeek (tout part en parallèle,
+      même avec un `model:` explicite sur Ollama), trois fois avec une clé
+      DeepSeek (doctrine et données s'enchaînent en direct), quatre fois avec
+      `provider: deepseek` (les trois passes sur un seul modèle qui cache). Le
+      timeout-minutes du job doit rester au-dessus, sinon le commentaire
+      d'échec n'a pas le temps d'être posté.
     required: false
     default: '15'
 

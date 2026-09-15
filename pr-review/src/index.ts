@@ -60,7 +60,7 @@ import {
   buildMergeSystemPrompt,
   buildMergeUserPrompt,
   buildPassMessages,
-  groupByDestination,
+  groupForCache,
   PASS_HEADING,
   selectPasses,
   type Pass,
@@ -389,7 +389,7 @@ interface PassPrompt {
   messages: ChatMessage[];
   /** Le contexte que CETTE passe reçoit, imports retirés le cas échéant. */
   seen: AssembledContext;
-  /** Pour `groupByDestination` : deux appels de même destination partagent une file. */
+  /** For `groupForCache`: two cacheable calls at the same destination share a chain. */
   provider: string;
   model: string;
   /** Taille totale de l'entrée. Le plus court part en premier dans son groupe. */
@@ -434,25 +434,17 @@ interface PassOutcome {
 }
 
 /**
- * Lance les passes, groupées par destination.
+ * Runs the passes, grouped only where a prefix cache pays for it.
  *
- * Deux régimes, et c'est tout l'objet de la fonction :
- *
- * - **entre groupes, en parallèle.** Ils ne partagent rien, et les sérialiser
- *   ne ferait qu'additionner leurs durées. Le mur du job reste celui du groupe
- *   le plus lent, en pratique la régression.
- * - **dans un groupe, en séquence.** Deux passes qui visent le même couple
- *   provider+modèle partagent un préfixe de quatre-vingt-dix kilo-octets, mais
- *   un cache s'écrit à la fin de l'entrée qui l'a produit : lancées ensemble,
- *   elles le paient toutes les deux. La plus courte part en premier, et la
- *   seconde rejoue son préfixe à un trente-et-unième du tarif.
- *
- * L'échec d'une passe ne fait toujours tomber qu'elle : dans un groupe
- * séquentiel, il coûte à la suivante son cache, pas sa lecture.
+ * Groups run in parallel: the job's wall clock is the slowest one, usually
+ * regression. Inside a cacheable chain, calls run in sequence, shorter
+ * prompt first, so the second replays the first one's cached prefix. A
+ * failed pass only takes itself down; in a chain it costs the next call
+ * its cache, not its ability to run.
  */
 async function runPasses(config: Config, run: Run, plan: PassPrompt[]): Promise<PassOutcome[]> {
   const groups = await Promise.all(
-    groupByDestination(plan).map(async (group) => {
+    groupForCache(plan).map(async (group) => {
       const outcomes: PassOutcome[] = [];
       for (const { pass, target, messages } of group) {
         const result = await callModel(config, run, {
@@ -561,18 +553,12 @@ function countOnly(config: Config, plan: PassPrompt[], context: AssembledContext
     '\n  La fusion n\u2019est pas comptée : son entrée est faite des trouvailles des passes,\n' +
       '  qui n\u2019existent pas sans appel. Mesurée en production, elle pèse ~2 000 tokens.',
   );
-  for (const group of groupByDestination(plan).filter((chain) => chain.length > 1)) {
-    // Deux motifs de mise en file, et ils ne s'annoncent pas pareil : chez un
-    // provider qui cache, elle achète des tokens ; chez les autres, elle achète
-    // des passes qui aboutissent.
-    const why = group[0]!.cacheable
-      ? 'pour que la seconde rejoue le préfixe de la première en cache'
-      : "parce qu'un même modèle ne sert pas deux gros contextes à la fois";
+  for (const group of groupForCache(plan).filter((chain) => chain.length > 1)) {
     console.log(
       `\n  ${group.map(({ pass }) => `« ${pass.label} »`).join(' puis ')} : même destination,\n` +
-        `  donc lancées à la suite ${why}.`,
+        '  donc lancées à la suite pour que la seconde rejoue le préfixe de la première en cache.',
     );
-    if (group[0]!.cacheable) console.log(`  ${describePrefix(group)}`);
+    console.log(`  ${describePrefix(group)}`);
   }
 }
 
