@@ -556,6 +556,9 @@ describe('resolveConfig · rejeu de la fusion', () => {
       'depuis-cli',
     ]);
     expect(config.passConfigs.merge.model).toBe('depuis-cli');
+    expect(config.passConfigs.regression.model).toBe(DEFAULTS.model);
+    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4.1-flash:cloud');
+    expect(config.passConfigs.data.model).toBe('deepseek-v4.1-flash:cloud');
   });
 
   it('« --merge-thinking » l’emporte sur l’input « merge-thinking »', () => {
@@ -572,6 +575,9 @@ describe('resolveConfig · rejeu de la fusion', () => {
     expect(config.passConfigs.merge.model).toBe('un-modele');
     expect(config.passConfigs.merge.thinking).toBe('high');
     expect(config.replayMerge).toBe('');
+    expect(config.passConfigs.regression.model).toBe(DEFAULTS.model);
+    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4.1-flash:cloud');
+    expect(config.passConfigs.data.model).toBe('deepseek-v4.1-flash:cloud');
   });
 
   it('refuse « --merge-model » et « --merge-thinking » sans valeur', () => {

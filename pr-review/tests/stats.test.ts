@@ -164,6 +164,7 @@ describe('la ligne ::stats::', () => {
   const line = statsLine({
     pr: 154,
     repo: 'JulienCr/avolo-shorts',
+    headSha: 'abc123',
     model: 'glm-5.2:cloud',
     variant: 'balanced',
     calls: [call()],
@@ -192,6 +193,7 @@ describe('parseStatsLine · extraction depuis un dump', () => {
   const payload = {
     pr: 154,
     repo: 'JulienCr/avolo-shorts',
+    headSha: 'abc123',
     model: 'glm-5.2:cloud',
     variant: 'balanced',
     calls: [],

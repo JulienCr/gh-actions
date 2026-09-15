@@ -2622,6 +2622,7 @@ async function review(config) {
     statsLine({
       pr: config.pr,
       repo,
+      headSha: meta.headSha,
       model: config.model,
       variant: config.variant,
       calls: run2.calls,
@@ -2658,7 +2659,7 @@ async function replayMerge(config) {
     console.error(`\u2717 rejeu de la fusion : ${error instanceof Error ? error.message : String(error)}`);
     return;
   }
-  if (Object.keys(payload.findings).length === 0) {
+  if (!payload.findings || typeof payload.findings !== "object" || Object.keys(payload.findings).length === 0) {
     console.error(
       "\u2717 rejeu de la fusion : la ligne \xAB ::stats:: \xBB ne porte aucune trouvaille (dump produit sans \xAB --dry-run \xBB ?)."
     );
@@ -2670,8 +2671,20 @@ async function replayMerge(config) {
     );
     return;
   }
-  if (payload.repo && !process.env.GH_REPO) process.env.GH_REPO = payload.repo;
+  if (payload.repo && process.env.GH_REPO && process.env.GH_REPO !== payload.repo) {
+    console.error(
+      `\u2717 rejeu de la fusion : GH_REPO=${process.env.GH_REPO} diff\xE8re du d\xE9p\xF4t du dump (${payload.repo}).`
+    );
+    return;
+  }
+  if (payload.repo) process.env.GH_REPO = payload.repo;
   const [repo, meta] = await Promise.all([resolveRepo(), fetchPrMeta(config.pr)]);
+  if (payload.headSha && payload.headSha !== meta.headSha) {
+    console.error(
+      `\u2717 rejeu de la fusion : la PR a boug\xE9 depuis le dump (${payload.headSha} \u2192 ${meta.headSha}) : recr\xE9e-le.`
+    );
+    return;
+  }
   const byId = new Map(PASSES.map((pass) => [pass.id, pass]));
   const outcomes = [];
   for (const pass of PASSES) {
@@ -2680,6 +2693,12 @@ async function replayMerge(config) {
   }
   for (const id of Object.keys(payload.findings)) {
     if (!byId.has(id)) console.warn(`\u26A0 passe \xAB ${id} \xBB inconnue dans ce dump : ignor\xE9e.`);
+  }
+  if (outcomes.length === 0) {
+    console.error(
+      "\u2717 rejeu de la fusion : aucune trouvaille ne correspond \xE0 une passe connue."
+    );
+    return;
   }
   const run2 = { calls: [], failures: [] };
   const mergeTarget = resolveTarget(config, "merge", "fusion", (message) => console.warn(`\u26A0 ${message}`));
@@ -2723,6 +2742,7 @@ async function replayMerge(config) {
     statsLine({
       pr: config.pr,
       repo,
+      headSha: meta.headSha,
       model: config.model,
       variant: config.variant,
       calls: run2.calls,

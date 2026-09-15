@@ -275,6 +275,8 @@ export interface StatsPayload {
   pr: number;
   /** `owner/repo`, so a replay can target the right repo from any cwd. */
   repo: string;
+  /** PR head SHA at dump time, so a replay can refuse a PR that moved since. */
+  headSha: string;
   model: string;
   /** Free-form arm name, to compare two runs. */
   variant: string;

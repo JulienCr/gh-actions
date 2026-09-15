@@ -1005,6 +1005,7 @@ async function review(config: Config): Promise<void> {
     statsLine({
       pr: config.pr,
       repo,
+      headSha: meta.headSha,
       model: config.model,
       variant: config.variant,
       calls: run.calls,
@@ -1057,7 +1058,7 @@ async function replayMerge(config: Config): Promise<void> {
     console.error(`✗ rejeu de la fusion : ${error instanceof Error ? error.message : String(error)}`);
     return;
   }
-  if (Object.keys(payload.findings).length === 0) {
+  if (!payload.findings || typeof payload.findings !== 'object' || Object.keys(payload.findings).length === 0) {
     console.error(
       "✗ rejeu de la fusion : la ligne « ::stats:: » ne porte aucune trouvaille (dump produit sans « --dry-run » ?).",
     );
@@ -1070,11 +1071,26 @@ async function replayMerge(config: Config): Promise<void> {
     return;
   }
 
+  // An inherited GH_REPO pointing at a different repo than the dump would
+  // silently win without this guard; refuse instead of merging on the wrong repo.
+  if (payload.repo && process.env.GH_REPO && process.env.GH_REPO !== payload.repo) {
+    console.error(
+      `✗ rejeu de la fusion : GH_REPO=${process.env.GH_REPO} diffère du dépôt du dump (${payload.repo}).`,
+    );
+    return;
+  }
   // A dump made before this field has no repo: fall back to cwd or an
   // already-set GH_REPO, exactly as before this change.
-  if (payload.repo && !process.env.GH_REPO) process.env.GH_REPO = payload.repo;
+  if (payload.repo) process.env.GH_REPO = payload.repo;
 
   const [repo, meta] = await Promise.all([resolveRepo(), fetchPrMeta(config.pr)]);
+
+  if (payload.headSha && payload.headSha !== meta.headSha) {
+    console.error(
+      `✗ rejeu de la fusion : la PR a bougé depuis le dump (${payload.headSha} → ${meta.headSha}) : recrée-le.`,
+    );
+    return;
+  }
 
   const byId = new Map(PASSES.map((pass) => [pass.id, pass]));
   const outcomes: PassOutcome[] = [];
@@ -1084,6 +1100,12 @@ async function replayMerge(config: Config): Promise<void> {
   }
   for (const id of Object.keys(payload.findings)) {
     if (!byId.has(id)) console.warn(`⚠ passe « ${id} » inconnue dans ce dump : ignorée.`);
+  }
+  if (outcomes.length === 0) {
+    console.error(
+      '✗ rejeu de la fusion : aucune trouvaille ne correspond à une passe connue.',
+    );
+    return;
   }
 
   const run: Run = { calls: [], failures: [] };
@@ -1131,6 +1153,7 @@ async function replayMerge(config: Config): Promise<void> {
     statsLine({
       pr: config.pr,
       repo,
+      headSha: meta.headSha,
       model: config.model,
       variant: config.variant,
       calls: run.calls,
