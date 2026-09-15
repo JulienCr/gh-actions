@@ -201,18 +201,17 @@ export function mixFor(provider: string): Partial<Record<PassId, PassConfig>> {
 }
 
 /**
- * Par quelle route le mix passe, ou `null` quand il ne s'applique pas.
+ * Which route the mix takes, or `null` when it does not apply.
  *
- * Un dépôt qui a désigné son provider global a pris la main : on ne renvoie pas
- * ses passes ailleurs dans son dos, clé DeepSeek ou non. Ce test passait
- * autrefois APRÈS celui de la clé, et un `provider: openai` se faisait quand
- * même déplacer : trois passes partaient chez DeepSeek pendant que la
- * régression restait seule sur un endpoint étranger, avec un nom de modèle
- * Ollama qu'il ne sert pas.
+ * A repo that named its own global provider is in charge: we never reroute
+ * its passes behind its back, DeepSeek key or not. This check used to run
+ * AFTER the key check, and a `provider: openai` still got moved: three
+ * passes went to DeepSeek while the regression pass stayed alone on a
+ * foreign endpoint, with an Ollama model name it does not serve.
  *
- * Le provider resté au défaut, DeepSeek en direct l'emporte dès qu'une clé
- * existe, parce que son cache de préfixe est le levier le plus fort. Sinon
- * Ollama, qui sert le même modèle et suffit à descendre d'un niveau d'usage.
+ * With the provider left at its default, DeepSeek direct wins as soon as a
+ * key exists, because its prefix cache is the strongest lever. Otherwise
+ * Ollama, which serves the same model outside the flagship.
  */
 export function mixRoute(provider: string, hasDeepSeekKey: boolean): string | null {
   if (provider !== DEFAULTS.provider) return null;

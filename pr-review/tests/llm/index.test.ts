@@ -48,6 +48,13 @@ describe('l’estimation de coût', () => {
     );
   });
 
+  it('facture le mix DeepSeek V4.1 Flash au tarif de son entrée dans PRICES', () => {
+    expect(estimateCost('deepseek', 'deepseek-flash', usage())).toBeCloseTo(
+      PRICES['deepseek/deepseek-flash']!.input,
+      6,
+    );
+  });
+
   /**
    * `inputTokens` inclut la part servie par le cache : la facturer au plein
    * tarif la compterait deux fois et effacerait précisément l'économie qu'on

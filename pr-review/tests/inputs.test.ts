@@ -283,9 +283,9 @@ describe('les drapeaux de mesure', () => {
  */
 describe('resolveConfig · la destination de chaque appel', () => {
   /**
-   * Sans clé DeepSeek, le mix passe quand même : Ollama sert le même modèle, à
-   * un niveau d'usage moyen là où glm-5.2 est à un niveau élevé. La clé
-   * n'achète pas le modèle bon marché, elle achète son cache de préfixe.
+   * Without a DeepSeek key, the mix still applies: Ollama serves the same
+   * model outside the flagship. The key does not buy the cheap model, it
+   * buys its prefix cache.
    */
   it('passe par Ollama pour le modèle bon marché quand aucune clé DeepSeek n’existe', () => {
     const config = resolve();

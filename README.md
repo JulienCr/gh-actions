@@ -363,15 +363,16 @@ rendu 41 681 tokens de sortie, dont 98 % de raisonnement.
 
 #### Une clé DeepSeek achète le cache de préfixe
 
-Le même modèle, servi en direct par `api.deepseek.com`, ajoute ce qu'Ollama n'a pas : un cache de
-préfixe automatique, facturé **trente et une fois moins cher** que l'entrée fraîche (0,014 $/M
-contre 0,44 $/M en heure pleine). Poser `deepseek-api-key` suffit à basculer les trois appels sur
-cette route.
+Le même modèle, servi en direct par `api.deepseek.com`, facture le cache de préfixe **cinquante
+fois moins cher** que l'entrée fraîche (0,006 $/M contre 0,30 $/M en heure pleine). Ollama Cloud
+affiche lui aussi un tarif pour l'entrée en cache, mais l'action n'enchaîne pas les appels pour en
+profiter : ce cache-là ne joue que sur la route DeepSeek directe. Poser `deepseek-api-key` suffit
+à basculer les trois appels sur cette route.
 
 ⚠️ DeepSeek est passé le **16 août 2026** d'un tarif plat à un tarif horaire : heures pleines de
-01:00 à 04:00 et de 06:00 à 10:00 UTC, moitié prix le reste du temps. `estimateCost` applique le
-régime de l'heure de l'appel. Toute table de prix antérieure à cette date est fausse d'un facteur
-trois.
+01:00 à 04:00 et de 06:00 à 10:00 UTC, du lundi au vendredi, moitié prix le reste du temps.
+`estimateCost` applique le régime de l'heure de l'appel. Toute table de prix antérieure à cette
+date est fausse d'un facteur trois.
 
 « Doctrine » et « données » visent volontairement le **même couple provider + modèle**, ce qui leur
 permet de partager ce cache. Deux conditions, que l'action tient toutes les deux :
