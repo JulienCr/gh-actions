@@ -377,15 +377,15 @@ async function resolveRepo() {
   const stdout = await run("gh", ["repo", "view", "--json", "nameWithOwner"]);
   return JSON.parse(stdout).nameWithOwner;
 }
-async function findMarkedComment(repo, pr, marker) {
+async function findMarkedComment(repo, pr, marker, tag) {
   const stdout = await run("gh", [
     "api",
     `repos/${repo}/issues/${pr}/comments`,
     "--paginate",
     "--jq",
-    // Une ligne de JSON compact par commentaire : le corps porte des retours à
-    // la ligne, donc `\(.id) \(.body)` en collerait plusieurs sur une seule.
-    `.[] | select(.body | startswith(${JSON.stringify(marker)})) | {id, body} | tojson`
+    // One compact JSON line per comment: bodies carry newlines, so
+    // `\(.id) \(.body)` would glue several of them onto one line.
+    `.[] | select((.body | startswith(${JSON.stringify(marker)})) and (.body | contains(${JSON.stringify(tag)}))) | {id, body} | tojson`
   ]);
   const found = stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "").map((line) => JSON.parse(line));
   return found.at(-1) ?? null;
@@ -397,8 +397,8 @@ async function updateComment(repo, id, body) {
     JSON.stringify({ body })
   );
 }
-async function upsertComment(repo, pr, marker, body) {
-  const existing = await findMarkedComment(repo, pr, marker).catch(() => null);
+async function upsertComment(repo, pr, marker, tag, body) {
+  const existing = await findMarkedComment(repo, pr, marker, tag).catch(() => null);
   if (existing === null) {
     await postComment(pr, body);
     return;
@@ -408,6 +408,35 @@ async function upsertComment(repo, pr, marker, body) {
   } catch {
     await postComment(pr, body);
   }
+}
+async function minimizeOtherReports(repo, pr, marker, tag) {
+  const [owner, name] = repo.split("/");
+  const query = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){comments(first:100,after:$endCursor){nodes{id body isMinimized} pageInfo{hasNextPage endCursor}}}}}";
+  const stdout = await run("gh", [
+    "api",
+    "graphql",
+    "--paginate",
+    "-f",
+    `query=${query}`,
+    "-F",
+    `owner=${owner}`,
+    "-F",
+    `name=${name}`,
+    "-F",
+    `number=${pr}`,
+    "--jq",
+    `.data.repository.pullRequest.comments.nodes[] | select((.body | startswith(${JSON.stringify(marker)})) and (.body | contains(${JSON.stringify(tag)}) | not) and (.isMinimized == false)) | .id`
+  ]);
+  const ids = stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  for (const id of ids) {
+    const mutation = "mutation($id:ID!){minimizeComment(input:{subjectId:$id, classifier:OUTDATED}){minimizedComment{isMinimized}}}";
+    await runWithStdin(
+      "gh",
+      ["api", "graphql", "--input", "-"],
+      JSON.stringify({ query: mutation, variables: { id } })
+    );
+  }
+  return ids.length;
 }
 async function postStatus(repo, sha, status) {
   await runWithStdin(
@@ -1544,6 +1573,12 @@ function runUrlFrom(env) {
   const id = env.GITHUB_RUN_ID?.trim();
   return server && repo && id ? `${server}/${repo}/actions/runs/${id}` : "";
 }
+function runKeyFrom(env) {
+  const id = env.GITHUB_RUN_ID?.trim();
+  if (!id) return `local-${process.pid}-${Date.now()}`;
+  const attempt2 = env.GITHUB_RUN_ATTEMPT?.trim() || "1";
+  return `${id}.${attempt2}`;
+}
 function isEnabled(env) {
   return !/^(false|0|no|off)$/i.test(readInput(env, "enable"));
 }
@@ -1726,7 +1761,8 @@ function resolveConfig({ argv, env, warn = () => {
     statusCheck: readBoolean(env, "status-check"),
     statusContext: readInput(env, "status-context") || DEFAULTS.statusContext,
     mode: readInput(env, "mode").toLowerCase() === "abort" ? "abort" : "review",
-    runUrl: runUrlFrom(env)
+    runUrl: runUrlFrom(env),
+    runKey: runKeyFrom(env)
   };
 }
 
@@ -1826,6 +1862,14 @@ var statsLine = (payload) => `::stats::${JSON.stringify(payload)}`;
 
 // pr-review/src/render.ts
 var MARKER = "<!-- aristarque -->";
+function runTag(key) {
+  return `<!-- aristarque-run: ${key} -->`;
+}
+function withRunTag(body, key) {
+  return `${body}
+
+${runTag(key)}`;
+}
 var HEADING = "## Aristarque \u2014 review automatique";
 var FIRST_HEADING = "## Verdict";
 var MAX_LENGTH = 12e3;
@@ -2310,7 +2354,9 @@ function reporterFor(config, repo, headSha) {
     async announce(passes) {
       if (mute || !config.announce) return;
       try {
-        await upsertComment(repo, config.pr, MARKER, renderPendingComment({ passes, runUrl: config.runUrl }));
+        const tag = runTag(config.runKey);
+        const body = withRunTag(renderPendingComment({ passes, runUrl: config.runUrl }), config.runKey);
+        await upsertComment(repo, config.pr, MARKER, tag, body);
         console.log(`Annonce pos\xE9e sur la PR #${config.pr}.`);
       } catch (error) {
         console.warn(`\u26A0 Annonce non pos\xE9e : ${String(error)}`);
@@ -2318,7 +2364,16 @@ function reporterFor(config, repo, headSha) {
     },
     async settle(state, description, body) {
       if (body !== void 0 && !mute) {
-        await upsertComment(repo, config.pr, MARKER, body);
+        const tag = runTag(config.runKey);
+        await upsertComment(repo, config.pr, MARKER, tag, withRunTag(body, config.runKey));
+        if (state === "success") {
+          try {
+            const collapsed = await minimizeOtherReports(repo, config.pr, MARKER, tag);
+            if (collapsed > 0) console.log(`${collapsed} ancien(s) rapport(s) repli\xE9(s) comme p\xE9rim\xE9s.`);
+          } catch (error) {
+            console.warn(`\u26A0 Repliage des anciens rapports \xE9chou\xE9 : ${String(error)}`);
+          }
+        }
       }
       await status(state, description);
     }
@@ -2328,7 +2383,7 @@ async function abort(config, reason = "run annul\xE9 ou d\xE9lai d\xE9pass\xE9")
   const repo = await resolveRepo();
   const meta = await fetchPrMeta(config.pr);
   const report = reporterFor(config, repo, meta.headSha);
-  const existing = await findMarkedComment(repo, config.pr, MARKER).catch(() => null);
+  const existing = await findMarkedComment(repo, config.pr, MARKER, runTag(config.runKey)).catch(() => null);
   const pending = existing === null || isPendingComment(existing.body);
   if (!pending) {
     console.log("Le rapport est d\xE9j\xE0 pos\xE9 : seul le statut est conclu.");

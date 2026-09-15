@@ -516,4 +516,15 @@ describe('l’annonce et le statut de commit', () => {
     // Une variable manquante donne une URL fausse : mieux vaut pas d'URL.
     expect(resolve({ GITHUB_SERVER_URL: 'https://github.com', GITHUB_REPOSITORY: 'o/r' }).runUrl).toBe('');
   });
+
+  /** A new attempt (job re-run) must yield a different key, hence a new comment. */
+  it('dérive la clé de run de l’identifiant et de l’essai du job', () => {
+    expect(resolve({ GITHUB_RUN_ID: '99', GITHUB_RUN_ATTEMPT: '2' }).runKey).toBe('99.2');
+    expect(resolve({ GITHUB_RUN_ID: '99' }).runKey).toBe('99.1');
+  });
+
+  /** No GITHUB_RUN_ID outside CI: the key stays unique per process. */
+  it('retombe sur un identifiant local hors CI', () => {
+    expect(resolve({}).runKey).toMatch(new RegExp(`^local-${process.pid}-\\d+$`));
+  });
 });

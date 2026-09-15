@@ -28,6 +28,7 @@ import {
   fetchPrDiff,
   fetchPrMeta,
   findMarkedComment,
+  minimizeOtherReports,
   postStatus,
   resolveRepo,
   upsertComment,
@@ -73,6 +74,8 @@ import {
   renderFailureComment,
   renderPartialComment,
   renderPendingComment,
+  runTag,
+  withRunTag,
 } from './render';
 import {
   describeCall,
@@ -700,7 +703,9 @@ function reporterFor(config: Config, repo: string, headSha: string): Reporter {
     async announce(passes) {
       if (mute || !config.announce) return;
       try {
-        await upsertComment(repo, config.pr, MARKER, renderPendingComment({ passes, runUrl: config.runUrl }));
+        const tag = runTag(config.runKey);
+        const body = withRunTag(renderPendingComment({ passes, runUrl: config.runUrl }), config.runKey);
+        await upsertComment(repo, config.pr, MARKER, tag, body);
         console.log(`Annonce posée sur la PR #${config.pr}.`);
       } catch (error) {
         // Cosmétique au sens strict : l'annonce sert à lever une ambiguïté, pas
@@ -710,7 +715,18 @@ function reporterFor(config: Config, repo: string, headSha: string): Reporter {
     },
     async settle(state, description, body) {
       if (body !== undefined && !mute) {
-        await upsertComment(repo, config.pr, MARKER, body);
+        const tag = runTag(config.runKey);
+        await upsertComment(repo, config.pr, MARKER, tag, withRunTag(body, config.runKey));
+        // Only a successful, non-empty report retires older ones: a failed or
+        // interrupted run must never hide the last valid report.
+        if (state === 'success') {
+          try {
+            const collapsed = await minimizeOtherReports(repo, config.pr, MARKER, tag);
+            if (collapsed > 0) console.log(`${collapsed} ancien(s) rapport(s) replié(s) comme périmés.`);
+          } catch (error) {
+            console.warn(`⚠ Repliage des anciens rapports échoué : ${String(error)}`);
+          }
+        }
       }
       await status(state, description);
     },
@@ -735,7 +751,7 @@ async function abort(config: Config, reason = 'run annulé ou délai dépassé')
   // l'écraserait. On ne remplace donc QUE l'annonce, reconnaissable à son
   // propre rendu. Le statut, lui, se conclut dans tous les cas — un « pending »
   // laissé derrière bloquerait le merge pour toujours.
-  const existing = await findMarkedComment(repo, config.pr, MARKER).catch(() => null);
+  const existing = await findMarkedComment(repo, config.pr, MARKER, runTag(config.runKey)).catch(() => null);
   const pending = existing === null || isPendingComment(existing.body);
   if (!pending) {
     console.log('Le rapport est déjà posé : seul le statut est conclu.');

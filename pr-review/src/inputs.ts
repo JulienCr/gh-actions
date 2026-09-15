@@ -311,6 +311,13 @@ export interface Config {
   mode: 'review' | 'abort';
   /** Lien du run, pour l'annonce et le statut. Vide hors CI. */
   runUrl: string;
+  /**
+   * Identifies this run, so each execution owns its own comment.
+   *
+   * `${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}` in CI, a local id otherwise:
+   * re-running a job (new attempt) therefore also creates a new comment.
+   */
+  runKey: string;
   /** Imprimer ce qui partirait, et ne rien envoyer. Réglage local seulement. */
   countOnly: boolean;
   /** Nom libre du bras mesuré, repris dans la ligne « ::stats:: ». */
@@ -408,6 +415,19 @@ function runUrlFrom(env: Env): string {
   const repo = env.GITHUB_REPOSITORY?.trim();
   const id = env.GITHUB_RUN_ID?.trim();
   return server && repo && id ? `${server}/${repo}/actions/runs/${id}` : '';
+}
+
+/**
+ * Same idea as `runUrlFrom`, but never empty: it must always name a comment.
+ *
+ * Falls back to a process-scoped id in local runs, where `GITHUB_RUN_ID` is
+ * absent — pid plus timestamp is enough to tell two local runs apart.
+ */
+function runKeyFrom(env: Env): string {
+  const id = env.GITHUB_RUN_ID?.trim();
+  if (!id) return `local-${process.pid}-${Date.now()}`;
+  const attempt = env.GITHUB_RUN_ATTEMPT?.trim() || '1';
+  return `${id}.${attempt}`;
 }
 
 /**
@@ -731,5 +751,6 @@ export function resolveConfig({ argv, env, warn = () => {} }: ResolveOptions): C
     statusContext: readInput(env, 'status-context') || DEFAULTS.statusContext,
     mode: readInput(env, 'mode').toLowerCase() === 'abort' ? 'abort' : 'review',
     runUrl: runUrlFrom(env),
+    runKey: runKeyFrom(env),
   };
 }

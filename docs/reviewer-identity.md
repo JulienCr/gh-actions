@@ -45,7 +45,8 @@ JSON
 ```
 
 `headSha` est déjà dans `PrMeta`. Le renseigner fait passer la review en « outdated » quand la
-branche bouge, ce que le commentaire upserté ne sait pas faire.
+branche bouge, ce que le commentaire du run — upserté en place, puis replié comme périmé au run
+suivant — ne sait pas faire.
 
 Ce que ça apporte :
 
