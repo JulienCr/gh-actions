@@ -273,20 +273,44 @@ function describeBlocks(blocks: InputBreakdown): string {
 
 export interface StatsPayload {
   pr: number;
+  /** `owner/repo`, so a replay can target the right repo from any cwd. */
+  repo: string;
+  /** PR head SHA at dump time, so a replay can refuse a PR that moved since. */
+  headSha: string;
   model: string;
-  /** Nom libre du bras mesuré, pour comparer deux exécutions. */
+  /** Free-form arm name, to compare two runs. */
   variant: string;
   calls: CallStat[];
   blocks: InputBreakdown;
-  /** Trouvailles brutes par passe : la seule mesure de qualité qui compte. */
+  /** Raw findings per pass: the only quality measure that matters. */
   findings: Record<string, string>;
 }
 
 /**
- * Une ligne préfixée, greppable dans un journal de CI comme en local.
+ * A prefixed line, greppable in a CI log as much as locally.
  *
- * Les trouvailles brutes y sont, et pas seulement les compteurs : comparer deux
- * réglages sur leurs tokens dit lequel est le moins cher, jamais lequel a perdu
- * une trouvaille. C'est pourtant la seule question qui puisse annuler un levier.
+ * Raw findings ride along, not just counters: comparing two settings on
+ * tokens alone says which is cheaper, never which one lost a finding.
  */
 export const statsLine = (payload: StatsPayload): string => `::stats::${JSON.stringify(payload)}`;
+
+/**
+ * Extracts and parses the LAST `::stats::` line of a dump.
+ *
+ * The last one wins because a dump is a whole stdout capture: a run can log
+ * several (a retry, a previous local test), and only the final one describes
+ * what actually got produced.
+ */
+export function parseStatsLine(dump: string): StatsPayload {
+  let last: string | null = null;
+  for (const line of dump.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('::stats::')) last = trimmed;
+  }
+  if (last === null) {
+    throw new Error(
+      "aucune ligne « ::stats:: » dans ce dump : produis-le avec « pr-review <n° PR> --dry-run > dump.log ».",
+    );
+  }
+  return JSON.parse(last.slice('::stats::'.length)) as StatsPayload;
+}

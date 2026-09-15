@@ -529,3 +529,59 @@ describe('l’annonce et le statut de commit', () => {
     expect(resolve({}).runKey).toBe('');
   });
 });
+
+describe('resolveConfig · rejeu de la fusion', () => {
+  it('« --replay-merge » pose le chemin et implique --dry-run', () => {
+    const config = resolve({}, ['42', '--replay-merge', 'dump.log']);
+    expect(config.replayMerge).toBe('dump.log');
+    expect(config.dryRun).toBe(true);
+  });
+
+  it('est vide quand le drapeau est absent', () => {
+    expect(resolve().replayMerge).toBe('');
+  });
+
+  it('refuse « --replay-merge » sans chemin', () => {
+    expect(() => resolve({}, ['42', '--replay-merge'])).toThrow(UsageError);
+  });
+
+  it('le numéro de PR reste requis, même en rejeu', () => {
+    expect(() => resolve({}, ['--replay-merge', 'dump.log'])).toThrow(UsageError);
+  });
+
+  it('« --merge-model » l’emporte sur l’input « merge-model »', () => {
+    const config = resolve({ 'INPUT_MERGE-MODEL': 'depuis-input' }, [
+      '42',
+      '--merge-model',
+      'depuis-cli',
+    ]);
+    expect(config.passConfigs.merge.model).toBe('depuis-cli');
+    expect(config.passConfigs.regression.model).toBe(DEFAULTS.model);
+    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4.1-flash:cloud');
+    expect(config.passConfigs.data.model).toBe('deepseek-v4.1-flash:cloud');
+  });
+
+  it('« --merge-thinking » l’emporte sur l’input « merge-thinking »', () => {
+    const config = resolve({ 'INPUT_MERGE-THINKING': 'low' }, [
+      '42',
+      '--merge-thinking',
+      'max',
+    ]);
+    expect(config.passConfigs.merge.thinking).toBe('max');
+  });
+
+  it('« --merge-model » et « --merge-thinking » marchent hors rejeu aussi', () => {
+    const config = resolve({}, ['42', '--merge-model', 'un-modele', '--merge-thinking', 'high']);
+    expect(config.passConfigs.merge.model).toBe('un-modele');
+    expect(config.passConfigs.merge.thinking).toBe('high');
+    expect(config.replayMerge).toBe('');
+    expect(config.passConfigs.regression.model).toBe(DEFAULTS.model);
+    expect(config.passConfigs.doctrine.model).toBe('deepseek-v4.1-flash:cloud');
+    expect(config.passConfigs.data.model).toBe('deepseek-v4.1-flash:cloud');
+  });
+
+  it('refuse « --merge-model » et « --merge-thinking » sans valeur', () => {
+    expect(() => resolve({}, ['42', '--merge-model'])).toThrow(UsageError);
+    expect(() => resolve({}, ['42', '--merge-thinking'])).toThrow(UsageError);
+  });
+});

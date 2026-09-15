@@ -6,6 +6,7 @@ import {
   describeTargets,
   estimateTokens,
   formatCost,
+  parseStatsLine,
   reasoningShare,
   renderBreakdown,
   statsLine,
@@ -162,6 +163,8 @@ describe('le tableau de --count-only', () => {
 describe('la ligne ::stats::', () => {
   const line = statsLine({
     pr: 154,
+    repo: 'JulienCr/avolo-shorts',
+    headSha: 'abc123',
     model: 'glm-5.2:cloud',
     variant: 'balanced',
     calls: [call()],
@@ -175,14 +178,43 @@ describe('la ligne ::stats::', () => {
   });
 
   /**
-   * Comparer deux réglages sur leurs tokens dit lequel est le moins cher, jamais
-   * lequel a perdu une trouvaille. C'est pourtant la seule question qui annule
-   * un levier, d'où les trouvailles brutes dans la charge utile.
+   * Comparing two settings on tokens alone says which is cheaper, never
+   * which one lost a finding — yet that is the only question that can
+   * invalidate a lever, hence the raw findings in the payload.
    */
   it('emporte les trouvailles brutes, et pas seulement les compteurs', () => {
     const parsed = JSON.parse(line.slice('::stats::'.length));
     expect(parsed.findings.regression).toContain('[rien]');
     expect(parsed.variant).toBe('balanced');
+  });
+});
+
+describe('parseStatsLine · extraction depuis un dump', () => {
+  const payload = {
+    pr: 154,
+    repo: 'JulienCr/avolo-shorts',
+    headSha: 'abc123',
+    model: 'glm-5.2:cloud',
+    variant: 'balanced',
+    calls: [],
+    blocks: BLOCKS,
+    findings: { regression: '## Trouvailles\n- [rien] : rien.' },
+  };
+  const line = statsLine(payload);
+
+  it('extrait et parse la ligne au milieu d’un dump multi-lignes', () => {
+    const dump = `Lecture de la PR #154…\n· passe « régression »…\n${line}\nReview postée.`;
+    expect(parseStatsLine(dump)).toEqual(payload);
+  });
+
+  it('garde la DERNIÈRE occurrence quand il y en a plusieurs', () => {
+    const other = statsLine({ ...payload, variant: 'lean' });
+    const dump = `${line}\nrelance…\n${other}`;
+    expect(parseStatsLine(dump).variant).toBe('lean');
+  });
+
+  it('échoue clairement quand la ligne est absente', () => {
+    expect(() => parseStatsLine('rien à voir ici')).toThrow('::stats::');
   });
 });
 

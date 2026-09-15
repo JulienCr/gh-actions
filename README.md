@@ -548,6 +548,31 @@ poste ; en CI la ligne garde les compteurs, qui ne citent rien. Et c'est bien su
 qu'il faut comparer : les tokens disent lequel est le moins cher, jamais lequel a perdu quelque
 chose.
 
+### Rejouer la fusion
+
+Régler le prompt de fusion ou essayer un modèle moins cher pour trier ne devrait pas coûter trois
+passes à chaque essai. `--replay-merge` rejoue **seulement** la fusion, sur les trouvailles d'un
+dump produit une seule fois :
+
+```
+gh pr checkout 154
+pr-review 154 --dry-run > "${TMPDIR:-/tmp}/pr-154.dump"
+pr-review 154 --replay-merge "${TMPDIR:-/tmp}/pr-154.dump"
+pr-review 154 --replay-merge "${TMPDIR:-/tmp}/pr-154.dump" --merge-model deepseek-flash --merge-thinking low
+```
+
+Le `gh pr checkout` d'abord : `--dry-run` ne fait que **prévenir** quand le contenu lu ne
+correspond pas à la tête de la PR, il ne checkoute rien lui-même. Le dump s'écrit hors du dépôt
+pour qu'un `git add -A` ne puisse jamais le commettre. Les appels suivants relisent ce dump et
+n'appellent que la fusion, avec exactement le même prompt que `review()` aurait construit.
+`--merge-model` et `--merge-thinking` valent aussi hors rejeu : ce sont les mêmes réglages que
+les inputs `merge-model` / `merge-thinking`, avec la priorité de la ligne de commande.
+
+**Un dump contient les trouvailles brutes de la passe « données et accès »**, donc potentiellement
+un secret cité par une trouvaille : il reste local, ne se commit jamais et ne s'attache jamais à un
+run de CI. Le rejeu refuse aussi un dump dont la tête a bougé depuis : si la PR a reçu un nouveau
+commit entre le `--dry-run` et le `--replay-merge`, il faut recréer le dump.
+
 ### Pourquoi pas une review agentique
 
 Le runner sort bien le dépôt, et `glm-5.2:cloud` accepte les outils : rien n'empêche techniquement

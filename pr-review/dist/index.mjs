@@ -1671,6 +1671,9 @@ function resolveConfig({ argv, env, warn = () => {
   let model = readInput(env, "model") || env.OLLAMA_REVIEW_MODEL?.trim() || "";
   let countOnly2 = false;
   let variant = readInput(env, "variant") || DEFAULTS.variant;
+  let replayMerge2 = "";
+  let mergeModelFlag = "";
+  let mergeThinkingFlag = "";
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--dry-run") dryRun = true;
@@ -1685,6 +1688,19 @@ function resolveConfig({ argv, env, warn = () => {
       const value = argv[++index];
       if (!value) throw new UsageError("\xAB --variant \xBB attend un nom.");
       variant = value;
+    } else if (arg === "--replay-merge") {
+      const value = argv[++index];
+      if (!value) throw new UsageError("\xAB --replay-merge \xBB attend le chemin d\u2019un dump --dry-run.");
+      replayMerge2 = value;
+      dryRun = true;
+    } else if (arg === "--merge-model") {
+      const value = argv[++index];
+      if (!value) throw new UsageError("\xAB --merge-model \xBB attend un nom de mod\xE8le.");
+      mergeModelFlag = value;
+    } else if (arg === "--merge-thinking") {
+      const value = argv[++index];
+      if (!value) throw new UsageError("\xAB --merge-thinking \xBB attend un niveau.");
+      mergeThinkingFlag = value;
     } else if (/^#?\d+$/.test(arg)) pr = Number(arg.replace("#", ""));
     else throw new UsageError(`argument inconnu : ${arg}`);
   }
@@ -1717,20 +1733,25 @@ function resolveConfig({ argv, env, warn = () => {
     );
   }
   const route = model === "" ? mixRoute(provider, keys.deepseek !== "") : null;
+  const passConfigEnv = mergeModelFlag || mergeThinkingFlag ? {
+    ...env,
+    ...mergeModelFlag ? { "INPUT_MERGE-MODEL": mergeModelFlag } : {},
+    ...mergeThinkingFlag ? { "INPUT_MERGE-THINKING": mergeThinkingFlag } : {}
+  } : env;
   return {
     pr,
     dryRun,
     model: model || providerDefault || DEFAULTS.model,
     provider,
-    // Pas de validation contre une liste de niveaux : ils varient d'un modèle à
-    // l'autre, et un niveau refusé est rattrapé à l'appel.
+    // No validation against a list of levels: they vary from one model to
+    // another, and a refused level is caught at call time.
     passConfigs: resolvePassConfigs(
-      env,
+      passConfigEnv,
       {
         provider,
         model: model || providerDefault || DEFAULTS.model,
         thinking: readInput(env, "thinking"),
-        mergeThinking: readInput(env, "merge-thinking"),
+        mergeThinking: readInput(passConfigEnv, "merge-thinking"),
         effort,
         mix: route === null ? {} : mixFor(route)
       },
@@ -1777,7 +1798,8 @@ function resolveConfig({ argv, env, warn = () => {
     statusContext: readInput(env, "status-context") || DEFAULTS.statusContext,
     mode: readInput(env, "mode").toLowerCase() === "abort" ? "abort" : "review",
     runUrl: runUrlFrom(env),
-    runKey: runKeyFrom(env)
+    runKey: runKeyFrom(env),
+    replayMerge: replayMerge2
   };
 }
 
@@ -1874,6 +1896,19 @@ function describeBlocks(blocks) {
   ].join(" \xB7 ");
 }
 var statsLine = (payload) => `::stats::${JSON.stringify(payload)}`;
+function parseStatsLine(dump) {
+  let last = null;
+  for (const line of dump.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("::stats::")) last = trimmed;
+  }
+  if (last === null) {
+    throw new Error(
+      "aucune ligne \xAB ::stats:: \xBB dans ce dump : produis-le avec \xAB pr-review <n\xB0 PR> --dry-run > dump.log \xBB."
+    );
+  }
+  return JSON.parse(last.slice("::stats::".length));
+}
 
 // pr-review/src/render.ts
 var MARKER = "<!-- aristarque -->";
@@ -2408,6 +2443,20 @@ async function abort(config, reason = "run annul\xE9 ou d\xE9lai d\xE9pass\xE9")
   await report.settle("error", `review interrompue (${reason})`, renderAbortedComment(config.runUrl));
   console.log(`Review de la PR #${config.pr} d\xE9clar\xE9e interrompue.`);
 }
+function mergeMessages(config, repo, meta, outcomes) {
+  return [
+    {
+      role: "system",
+      content: buildMergeSystemPrompt({
+        repo,
+        maxFindings: config.maxFindings,
+        softSections: config.softSections,
+        passes: outcomes.map((outcome) => outcome.pass)
+      })
+    },
+    { role: "user", content: buildMergeUserPrompt(meta, outcomes) }
+  ];
+}
 async function review(config) {
   const root = repoRoot();
   console.log(`Lecture de la PR #${config.pr}\u2026`);
@@ -2535,21 +2584,7 @@ async function review(config) {
   const merged = mergeTarget === null ? null : await callModel(config, run2, {
     id: "merge",
     target: mergeTarget,
-    messages: [
-      {
-        role: "system",
-        // Les passes qui ont abouti, pas celles qui étaient prévues :
-        // annoncer un relecteur qui n'a rien rendu ferait chercher à la
-        // fusion un axe absent.
-        content: buildMergeSystemPrompt({
-          repo,
-          maxFindings: config.maxFindings,
-          softSections: config.softSections,
-          passes: outcomes.map((outcome) => outcome.pass)
-        })
-      },
-      { role: "user", content: buildMergeUserPrompt(meta, outcomes) }
-    ],
+    messages: mergeMessages(config, repo, meta, outcomes),
     label: "fusion"
   });
   const server = (process.env.GITHUB_SERVER_URL ?? "https://github.com").replace(/\/$/, "");
@@ -2586,6 +2621,8 @@ async function review(config) {
   console.log(
     statsLine({
       pr: config.pr,
+      repo,
+      headSha: meta.headSha,
       model: config.model,
       variant: config.variant,
       calls: run2.calls,
@@ -2604,6 +2641,115 @@ async function review(config) {
     comment
   );
   console.log(`Review post\xE9e sur la PR #${config.pr}.`);
+}
+async function replayMerge(config) {
+  let dump;
+  try {
+    dump = readFileSync(config.replayMerge, "utf-8");
+  } catch (error) {
+    console.error(
+      `\u2717 rejeu de la fusion : lecture de \xAB ${config.replayMerge} \xBB impossible (${String(error)}).`
+    );
+    return;
+  }
+  let payload;
+  try {
+    payload = parseStatsLine(dump);
+  } catch (error) {
+    console.error(`\u2717 rejeu de la fusion : ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (!payload.findings || typeof payload.findings !== "object" || Object.keys(payload.findings).length === 0) {
+    console.error(
+      "\u2717 rejeu de la fusion : la ligne \xAB ::stats:: \xBB ne porte aucune trouvaille (dump produit sans \xAB --dry-run \xBB ?)."
+    );
+    return;
+  }
+  if (payload.pr !== config.pr) {
+    console.error(
+      `\u2717 rejeu de la fusion : le dump porte sur la PR #${payload.pr}, pas sur #${config.pr}.`
+    );
+    return;
+  }
+  if (payload.repo && process.env.GH_REPO && process.env.GH_REPO !== payload.repo) {
+    console.error(
+      `\u2717 rejeu de la fusion : GH_REPO=${process.env.GH_REPO} diff\xE8re du d\xE9p\xF4t du dump (${payload.repo}).`
+    );
+    return;
+  }
+  if (payload.repo) process.env.GH_REPO = payload.repo;
+  const [repo, meta] = await Promise.all([resolveRepo(), fetchPrMeta(config.pr)]);
+  if (payload.headSha && payload.headSha !== meta.headSha) {
+    console.error(
+      `\u2717 rejeu de la fusion : la PR a boug\xE9 depuis le dump (${payload.headSha} \u2192 ${meta.headSha}) : recr\xE9e-le.`
+    );
+    return;
+  }
+  const byId = new Map(PASSES.map((pass) => [pass.id, pass]));
+  const outcomes = [];
+  for (const pass of PASSES) {
+    const findings = payload.findings[pass.id];
+    if (findings !== void 0) outcomes.push({ pass, findings });
+  }
+  for (const id of Object.keys(payload.findings)) {
+    if (!byId.has(id)) console.warn(`\u26A0 passe \xAB ${id} \xBB inconnue dans ce dump : ignor\xE9e.`);
+  }
+  if (outcomes.length === 0) {
+    console.error(
+      "\u2717 rejeu de la fusion : aucune trouvaille ne correspond \xE0 une passe connue."
+    );
+    return;
+  }
+  const run2 = { calls: [], failures: [] };
+  const mergeTarget = resolveTarget(config, "merge", "fusion", (message) => console.warn(`\u26A0 ${message}`));
+  if (mergeTarget === null) {
+    console.error(`\u2717 rejeu de la fusion : aucune cl\xE9 pour \xAB ${config.passConfigs.merge.provider} \xBB.`);
+    return;
+  }
+  const merged = await callModel(config, run2, {
+    id: "merge",
+    target: mergeTarget,
+    messages: mergeMessages(config, repo, meta, outcomes),
+    label: "fusion (rejeu)"
+  });
+  if (merged === null) {
+    console.error(`\u2717 rejeu de la fusion : ${run2.failures.at(-1) ?? "raison inconnue"}.`);
+    return;
+  }
+  const server = (process.env.GITHUB_SERVER_URL ?? "https://github.com").replace(/\/$/, "");
+  const comment = renderComment({
+    review: merged.content,
+    repoUrl: `${server}/${repo}`,
+    headSha: meta.headSha,
+    knownPaths: new Set(meta.files.map((file) => file.path)),
+    footer: {
+      models: describeTargets(run2.calls.filter((call) => call.ok)),
+      durationMs: run2.calls.at(-1)?.durationMs ?? 0,
+      ...totals(run2.calls),
+      skipped: [],
+      omitted: [],
+      windowed: [],
+      imported: 0,
+      effort: config.effort,
+      importsWithheld: [],
+      failedPasses: [],
+      skippedPasses: []
+    }
+  });
+  console.log("\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 fusion rejou\xE9e (dry-run, non post\xE9e) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n");
+  console.log(comment);
+  console.log(
+    statsLine({
+      pr: config.pr,
+      repo,
+      headSha: meta.headSha,
+      model: config.model,
+      variant: config.variant,
+      calls: run2.calls,
+      blocks: { system: 0, diff: 0, touched: 0, imported: 0, meta: 0 },
+      findings: {}
+    })
+  );
 }
 function knownPaths(meta, context) {
   return /* @__PURE__ */ new Set([
@@ -2645,6 +2791,10 @@ async function main() {
       console.log("Aucune cl\xE9 de provider : review ignor\xE9e.");
       return;
     }
+  }
+  if (config.replayMerge) {
+    await replayMerge(config);
+    return;
   }
   try {
     await review(config);
