@@ -73,7 +73,7 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
       thinkingOff: { thinking: { type: 'disabled' } },
     }),
     defaultBaseUrl: 'https://api.deepseek.com',
-    defaultModel: 'deepseek-v4-flash',
+    defaultModel: 'deepseek-flash',
     prefixCache: true,
     supportsSeed: false,
   },
@@ -96,17 +96,13 @@ export const PROVIDER_IDS = Object.keys(PROVIDERS);
 export const isProvider = (value: string): boolean => value in PROVIDERS;
 
 /**
- * Tarif public, en dollars par million de tokens.
+ * Public pricing, in dollars per million tokens.
  *
- * Relevé sur api-docs.deepseek.com le 2026-08-18. ⚠️ DeepSeek est passé le
- * **16 août 2026** d'un tarif plat à un tarif horaire : toute table écrite
- * avant cette date est périmée d'un facteur trois, et une review a bien failli
- * m'en faire adopter une. Les heures pleines vont de 01:00 à 04:00 et de 06:00
- * à 10:00 UTC ; le reste est à moitié prix.
- *
- * Cette table vieillira à son tour. C'est assumé : elle sert à situer un ordre
- * de grandeur dans un journal de CI, pas à tenir une comptabilité. Les tokens,
- * eux, sont rapportés bruts et ne vieillissent pas.
+ * Retrieved from api-docs.deepseek.com on 2026-09-15. `deepseek-flash` is the
+ * recommended name for DeepSeek-V4.1-Flash; the legacy `deepseek-v4-flash` now
+ * resolves to it, same price. `deepseek-v4-pro` remains distinct, billed
+ * separately. Peak hours run 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri only;
+ * the rest, weekends included, is half price. This table will age in turn.
  */
 export interface Price {
   input: number;
@@ -114,21 +110,25 @@ export interface Price {
   output: number;
 }
 
-/** Tarif d'heure pleine. L'heure creuse vaut la moitié, cf. `priceFor`. */
+/** Peak-hour pricing. Off-peak is half, cf. `priceFor`. */
 export const PRICES: Record<string, Price> = {
-  'deepseek/deepseek-v4-flash': { input: 0.44, cachedInput: 0.014, output: 1.32 },
+  'deepseek/deepseek-flash': { input: 0.3, cachedInput: 0.006, output: 1.2 },
+  'deepseek/deepseek-v4-flash': { input: 0.3, cachedInput: 0.006, output: 1.2 },
   'deepseek/deepseek-v4-pro': { input: 1.32, cachedInput: 0.044, output: 3.96 },
 };
 
 /**
- * L'instant est-il en heure pleine chez DeepSeek ?
+ * Is this instant a DeepSeek peak hour?
  *
- * La date est injectée plutôt que lue : ce module reste pur, et un test qui
- * dépendrait de l'heure qu'il est passerait ou non selon le moment du jour.
+ * The date is injected rather than read: this module stays pure, and a test
+ * doesn't pass or fail depending on the time of day it runs. Peak hours only
+ * count Monday through Friday.
  */
 export function isPeakHour(now: Date): boolean {
   const hour = now.getUTCHours();
-  return (hour >= 1 && hour < 4) || (hour >= 6 && hour < 10);
+  const day = now.getUTCDay();
+  const isWeekday = day >= 1 && day <= 5;
+  return isWeekday && ((hour >= 1 && hour < 4) || (hour >= 6 && hour < 10));
 }
 
 const OFF_PEAK_RATIO = 0.5;

@@ -169,45 +169,32 @@ export interface PassConfig {
 }
 
 /**
- * Le modèle bon marché, sous le nom que chaque provider lui donne.
+ * The cheap model, under the name each provider gives it.
  *
- * Le même poids (284 milliards de paramètres dont 13 actifs), servi par deux
- * routes. Ollama le facture en temps GPU, à un **niveau d'usage moyen** là où
- * `glm-5.2:cloud` est à un niveau élevé : le déplacement paie déjà avec la
- * seule clé Ollama. DeepSeek le facture au token, et y ajoute un cache de
- * préfixe qui rend le contexte commun des deux passes presque gratuit.
+ * Both routes serve DeepSeek-V4.1-Flash. Ollama Cloud bills it per token,
+ * same as `glm-5.2:cloud`, so the move pays off on price alone. DeepSeek
+ * bills it per token too, and adds prefix caching that makes the context
+ * shared by the doctrine and data passes nearly free.
  */
 const CHEAP_MODEL: Record<string, string> = {
-  ollama: 'deepseek-v4-flash:cloud',
-  deepseek: 'deepseek-v4-flash',
+  ollama: 'deepseek-v4.1-flash:cloud',
+  deepseek: 'deepseek-flash',
 };
 
 /**
- * Le mix recommandé : trois appels sur quatre quittent le modèle flagship.
+ * The recommended mix: three calls out of four leave the flagship model.
  *
- * Pourquoi ces trois-là, et pas le quatrième :
- *
- * - **régression** n'y est pas. C'est la passe la plus complexe, la valeur de
- *   GLM-5.2 y est observée empiriquement, et rien ne prouve qu'un autre modèle
- *   la tienne. Elle garde le provider et le modèle globaux.
- * - **doctrine** est une tâche `règle -> conformité -> preuve`, très guidée par
- *   un document qu'elle a sous les yeux. Un modèle bien moins cher y suffit.
- * - **données et accès** est plus subtile, mais V4-Flash est un point de départ
- *   solide. Première escalade prévue si le recall baisse sur de vraies PR :
- *   `data-model: deepseek-v4-pro`, et rien d'autre à toucher.
- * - **fusion** ne reçoit pas le code : elle trie une trentaine de puces. Un
- *   flagship n'y achèterait que de la latence, d'où `low`.
- *
- * Doctrine et données partagent volontairement le même couple provider+modèle.
- * Chez un provider qui cache les préfixes, c'est ce qui leur permet de ne payer
- * qu'une fois les quatre-vingt-dix kilo-octets de contexte commun. Les séparer
- * annulerait ce levier.
+ * Regression stays put: GLM-5.2's value there is only observed. Data keeps
+ * `high`; escalation path is `data-model: deepseek-v4-pro`, still distinct.
+ * Merge sorts bullets with no code in view, so `low`. Doctrine runs without
+ * reasoning (`false`): `high` exhausted its output budget in 9/10 measured
+ * runs, `medium` didn't help, and the existing `false` replay delivered.
  */
 export function mixFor(provider: string): Partial<Record<PassId, PassConfig>> {
   const model = CHEAP_MODEL[provider];
   if (!model) return {};
   return {
-    doctrine: { provider, model, thinking: 'high' },
+    doctrine: { provider, model, thinking: 'false' },
     data: { provider, model, thinking: 'high' },
     merge: { provider, model, thinking: 'low' },
   };
