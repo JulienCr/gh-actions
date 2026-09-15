@@ -115,22 +115,12 @@ reader doubt the whole finding, and a true finding dies with its invented suppor
 }
 
 /**
- * Le contexte envoyé à une passe : la PR, son diff, ses fichiers, ses imports.
+ * The context sent to a pass: the PR, its diff, its files, its imports.
  *
- * ⚠️ **Ce texte est le préfixe partagé entre les passes**, et le cache de
- * préfixe des providers exige une égalité octet pour octet. Deux règles en
- * découlent, et elles ne sont pas cosmétiques :
- *
- * 1. Aucune phrase du bloc commun ne se formule différemment selon ce que la
- *    passe reçoit. La consigne sur les fichiers absents disait autrefois
- *    « from this section » ou « from this section and from the next one »
- *    selon qu'il y avait des imports : une variante à cet endroit fait
- *    diverger le prompt bien avant les quatre-vingt-dix kilo-octets qu'on
- *    cherchait à réutiliser.
- * 2. Les fichiers importés se rendent en DERNIER, pour que le prompt d'une
- *    passe qui ne les reçoit pas soit un préfixe **strict** de celui d'une
- *    passe qui les reçoit. C'est ce qui rend le cran « balanced » compatible
- *    avec le cache. Voir `groupByDestination` dans `passes.ts`.
+ * This text is the prefix shared between passes, and a provider's prefix
+ * cache needs byte-for-byte equality: no phrase may vary with what the pass
+ * receives, and imported files render LAST so a pass without them gets a
+ * strict prefix of one that has them. See `groupForCache` in `passes.ts`.
  */
 export function buildUserPrompt(meta: PrMeta, context: AssembledContext): string {
   const fileList = meta.files

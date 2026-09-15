@@ -87,9 +87,10 @@ jobs:
     concurrency:
       group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
       cancel-in-progress: true
-    # Le mur vaut « le plus gros groupe séquencé, plus la fusion ». Sans clé
-    # DeepSeek les passes sont parallèles, donc deux fois le « timeout-minutes »
-    # de l'action ; avec, le groupe DeepSeek en enchaîne deux, donc trois fois.
+    # Le mur vaut « la plus longue chaîne en cache, plus la fusion ». Sans clé
+    # DeepSeek rien ne cache et les passes sont parallèles, donc deux fois le
+    # « timeout-minutes » de l'action ; avec, le groupe DeepSeek en enchaîne
+    # deux, donc trois fois.
     timeout-minutes: 45
     steps:
       # Un run déclenché par commentaire n'apparaît pas comme check sur la PR :
@@ -254,7 +255,7 @@ Seul `pr` est obligatoire.
 | `per-file-chars` | `80000` | Plafond par fichier. |
 | `window-min-lines` | selon le cran | Taille à partir de laquelle un fichier part par extraits. `0` : jamais. |
 | `imports-budget-chars` | `300000` | Plafond des fichiers **importés**, joints en contexte. `0` : aucun. `120000` au cran `lean`. |
-| `timeout-minutes` | `15` | Délai d'**une** requête. Le mur du job vaut « le plus gros groupe séquencé, plus la fusion » ; voir ci-dessous. |
+| `timeout-minutes` | `15` | Délai d'**une** requête. Le mur du job vaut « la plus longue chaîne en cache, plus la fusion » ; voir ci-dessous. |
 | `max-output-tokens` | *(vide)* | Plafond de tokens de **sortie** d'une requête ; `budget-chars` borne l'entrée. Vide : le plafond du modèle. Le poser borne ce que coûte un appel qui part en boucle de raisonnement. |
 | `dry-run` | `false` | `true` : la review part dans les logs, rien n'est posté. |
 
@@ -386,27 +387,16 @@ permet de partager ce cache. Deux conditions, que l'action tient toutes les deux
    l'a produit. Les passes qui partagent une destination **s'enchaînent** donc, la plus courte
    d'abord.
 
-#### Deux appels ne partent jamais ensemble vers le même modèle
+#### Seul un provider qui cache justifie d'enchaîner
 
-Le séquencement vaut pour **tous** les providers, y compris ceux qui n'ont pas de cache. Ce n'est
-pas ce que faisait la première version : elle n'enchaînait que ce qui avait un cache à gagner, et
-laissait donc partir ensemble deux requêtes qu'Ollama ne sait pas servir en même temps.
-
-Mesuré sur `avolo-shorts`, trois PR de suite : trois grosses requêtes simultanées sur un même
-compte, et les deux qui partagent un modèle rendent un contenu **vide** après trois minutes de
-génération. Deux passes sur trois perdues, à chaque review.
-
-| Appel | En parallèle de | Entrée | Résultat |
-| --- | --- | --- | --- |
-| doctrine (flash), en local | rien | **173 109** | aboutit |
-| doctrine (flash), en CI | 2 autres appels | ~134 000 | **vide** |
-| données (flash), en CI | 2 autres appels | ~134 000 | **vide** |
-| régression (glm-5.2), en CI | 2 autres appels | 366 547 | aboutit |
-
-La ligne qui tranche est la première : le prompt **le plus gros** aboutit quand il part seul, et le
-plus petit échoue quand il part accompagné. Ce n'est donc pas la taille du contexte, c'est la
-concurrence. Chez un provider qui cache, la mise en file achète des tokens ; chez les autres, elle
-achète des passes qui aboutissent.
+Chez un provider sans cache, deux appels au même modèle partent en parallèle : la mise en file
+n'y achète rien. La théorie inverse (#9) reposait sur trois runs `avolo-shorts` où deux appels
+Ollama simultanés au même modèle rendaient un contenu vide. Mesuré depuis sur dix reviews de plus,
+la théorie ne tient pas : le vide revient quand la passe tourne seule sur le compte (runs
+34038476695, 33952385660, 33928073765), et une passe aboutit en parallèle d'une autre (run
+33932084324). La cause est l'épuisement des tokens de sortie en raisonnement, pas la concurrence.
+Enchaîner sans cache n'achetait donc qu'un mur de job plus long : sur les dix mêmes reviews, la
+chaîne doctrine→données finissait après la régression dans 7 cas sur 10, de 90 à 435 s.
 
 ⚠️ **Le séquencement change l'arithmétique du `timeout-minutes` du job.** Le mur vaut
 `(taille du plus gros groupe séquencé + 1) × timeout-minutes`, la fusion étant le `+ 1` :

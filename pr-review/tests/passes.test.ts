@@ -6,7 +6,7 @@ import {
   buildMergeSystemPrompt,
   buildMergeUserPrompt,
   buildPassMessages,
-  groupByDestination,
+  groupForCache,
   PASSES,
   PASS_HEADING,
   selectPasses,
@@ -471,7 +471,7 @@ describe('les messages d’une passe', () => {
   });
 });
 
-describe('le regroupement par destination', () => {
+describe('le regroupement pour le cache', () => {
   const item = (id: string, provider: string, model: string, chars: number, cacheable = true) => ({
     id,
     provider,
@@ -481,7 +481,7 @@ describe('le regroupement par destination', () => {
   });
 
   it('sépare les destinations, qui ne se disputent rien', () => {
-    const groups = groupByDestination([
+    const groups = groupForCache([
       item('regression', 'ollama', 'glm-5.2:cloud', 300_000),
       item('doctrine', 'deepseek', 'deepseek-v4-flash', 200_000),
     ]);
@@ -493,12 +493,12 @@ describe('le regroupement par destination', () => {
   });
 
   /**
-   * Un cache s'écrit à la fin de l'entrée qui l'a produit : la passe dont le
-   * prompt est un préfixe de l'autre doit partir en premier, sinon la seconde
-   * n'a rien à réutiliser.
+   * A cache is written at the end of the input that produced it: the pass
+   * whose prompt is a prefix of the other must go first, or the second one
+   * has nothing to reuse.
    */
   it('range le prompt le plus court en tête de son groupe', () => {
-    const groups = groupByDestination([
+    const groups = groupForCache([
       item('data', 'deepseek', 'deepseek-v4-flash', 320_000),
       item('doctrine', 'deepseek', 'deepseek-v4-flash', 210_000),
     ]);
@@ -506,9 +506,9 @@ describe('le regroupement par destination', () => {
     expect(groups[0]!.map((entry) => entry.id)).toEqual(['doctrine', 'data']);
   });
 
-  /** Un même modèle chez deux providers ne partage rien : la clé porte les deux. */
+  /** Same model name at two providers shares nothing: the key carries both. */
   it('ne regroupe pas deux providers qui servent le même nom de modèle', () => {
-    const groups = groupByDestination([
+    const groups = groupForCache([
       item('doctrine', 'deepseek', 'deepseek-v4-flash', 200_000),
       item('data', 'openai', 'deepseek-v4-flash', 200_000),
     ]);
@@ -516,7 +516,7 @@ describe('le regroupement par destination', () => {
   });
 
   it('garde l’ordre des passes quand deux entrées pèsent pareil', () => {
-    const groups = groupByDestination([
+    const groups = groupForCache([
       item('doctrine', 'deepseek', 'm', 100),
       item('data', 'deepseek', 'm', 100),
     ]);
@@ -524,7 +524,7 @@ describe('le regroupement par destination', () => {
   });
 
   it('ne perd aucune entrée', () => {
-    const groups = groupByDestination([
+    const groups = groupForCache([
       item('regression', 'ollama', 'glm', 3, false),
       item('doctrine', 'deepseek', 'ds', 2),
       item('data', 'deepseek', 'ds', 1),
@@ -533,38 +533,51 @@ describe('le regroupement par destination', () => {
   });
 
   /**
-   * Le contraire de ce que ce test épinglait d'abord, et le renversement a
-   * coûté trois reviews. On croyait qu'un provider sans cache n'avait aucune
-   * raison de sérialiser, donc on laissait partir ses passes ensemble.
-   *
-   * Mesuré sur avolo-shorts#63, #64 et #68 : trois grosses requêtes simultanées
-   * sur un même compte Ollama, et les deux qui partagent un modèle rendent un
-   * contenu VIDE après trois minutes de génération. La même passe lancée seule,
-   * avec un contexte PLUS GROS (173 109 tokens contre ~134 000), aboutit. La
-   * mise en file n'achète pas un cache ici, elle achète des passes qui
-   * aboutissent, ce qui vaut largement le mur de job qu'elle coûte.
+   * The inverse of what this test pinned at first (#9). Measured since on ten
+   * more `avolo-shorts` reviews: empty output came back with the pass running
+   * ALONE on the account (output budget exhausted in reasoning), and a pass
+   * succeeded at high concurrency with another. Concurrency doesn't break
+   * Ollama, so nothing justifies chaining calls that buy no cache there.
    */
-  it('met en file les appels de même destination, cache ou pas', () => {
-    const groups = groupByDestination([
+  it('ne met plus en file les appels sans cache à gagner', () => {
+    const groups = groupForCache([
       item('regression', 'ollama', 'glm-5.2:cloud', 300_000, false),
       item('doctrine', 'ollama', 'glm-5.2:cloud', 200_000, false),
       item('data', 'ollama', 'glm-5.2:cloud', 300_000, false),
     ]);
-    expect(groups).toHaveLength(1);
-    expect(groups[0]!.map((entry) => entry.id)).toEqual(['doctrine', 'regression', 'data']);
+    expect(groups).toHaveLength(3);
+    expect(groups.map((group) => group.map((entry) => entry.id))).toEqual([
+      ['regression'],
+      ['doctrine'],
+      ['data'],
+    ]);
   });
 
-  /** Des destinations distinctes ne se disputent rien : elles restent parallèles. */
+  /** Distinct destinations share nothing to fight over: they stay parallel. */
   it('garde en parallèle ce qui ne partage pas de destination', () => {
-    const groups = groupByDestination([
+    const groups = groupForCache([
       item('regression', 'ollama', 'glm-5.2:cloud', 300_000, false),
       item('doctrine', 'ollama', 'deepseek-v4-flash:cloud', 200_000, false),
       item('data', 'ollama', 'deepseek-v4-flash:cloud', 300_000, false),
     ]);
-    expect(groups).toHaveLength(2);
+    expect(groups).toHaveLength(3);
     expect(groups.map((group) => group.map((entry) => entry.id))).toEqual([
       ['regression'],
+      ['doctrine'],
+      ['data'],
+    ]);
+  });
+
+  it('enchaîne les appels cacheables et isole le non-cacheable de même destination', () => {
+    const groups = groupForCache([
+      item('data', 'deepseek', 'deepseek-v4-flash', 300_000),
+      item('doctrine', 'deepseek', 'deepseek-v4-flash', 200_000),
+      item('regression', 'deepseek', 'deepseek-v4-flash', 250_000, false),
+    ]);
+    expect(groups).toHaveLength(2);
+    expect(groups.map((group) => group.map((entry) => entry.id))).toEqual([
       ['doctrine', 'data'],
+      ['regression'],
     ]);
   });
 });
