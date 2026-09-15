@@ -523,8 +523,8 @@ describe('l’annonce et le statut de commit', () => {
     expect(resolve({ GITHUB_RUN_ID: '99' }).runKey).toBe('99.1');
   });
 
-  /** No GITHUB_RUN_ID outside CI: the key stays unique per process. */
-  it('retombe sur un identifiant local hors CI', () => {
-    expect(resolve({}).runKey).toMatch(new RegExp(`^local-${process.pid}-\\d+$`));
+  /** No GITHUB_RUN_ID outside CI: this pure module yields empty, not a guess. */
+  it('rend une clé vide hors CI', () => {
+    expect(resolve({}).runKey).toBe('');
   });
 });

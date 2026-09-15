@@ -103,6 +103,13 @@ const WINDOW: Omit<WindowOptions, 'minLines'> = {
 };
 
 /**
+ * Fallback run key outside CI, where `config.runKey` is empty (`inputs.ts`
+ * stays pure). Module-scoped, not per-call: two local runs in the same
+ * process must not collide, but one run must keep a single key throughout.
+ */
+const LOCAL_RUN_KEY = `local-${process.pid}-${Date.now()}`;
+
+/**
  * Emplacements 1Password des clés, pour l'usage local. Surchargeables par
  * `<PROVIDER>_API_KEY_REF`, par exemple `OLLAMA_API_KEY_REF`.
  */
@@ -703,8 +710,8 @@ function reporterFor(config: Config, repo: string, headSha: string): Reporter {
     async announce(passes) {
       if (mute || !config.announce) return;
       try {
-        const tag = runTag(config.runKey);
-        const body = withRunTag(renderPendingComment({ passes, runUrl: config.runUrl }), config.runKey);
+        const tag = runTag(config.runKey || LOCAL_RUN_KEY);
+        const body = withRunTag(renderPendingComment({ passes, runUrl: config.runUrl }), config.runKey || LOCAL_RUN_KEY);
         await upsertComment(repo, config.pr, MARKER, tag, body);
         console.log(`Annonce posée sur la PR #${config.pr}.`);
       } catch (error) {
@@ -715,8 +722,8 @@ function reporterFor(config: Config, repo: string, headSha: string): Reporter {
     },
     async settle(state, description, body) {
       if (body !== undefined && !mute) {
-        const tag = runTag(config.runKey);
-        await upsertComment(repo, config.pr, MARKER, tag, withRunTag(body, config.runKey));
+        const tag = runTag(config.runKey || LOCAL_RUN_KEY);
+        await upsertComment(repo, config.pr, MARKER, tag, withRunTag(body, config.runKey || LOCAL_RUN_KEY));
         // Only a successful, non-empty report retires older ones: a failed or
         // interrupted run must never hide the last valid report.
         if (state === 'success') {
@@ -751,7 +758,7 @@ async function abort(config: Config, reason = 'run annulé ou délai dépassé')
   // l'écraserait. On ne remplace donc QUE l'annonce, reconnaissable à son
   // propre rendu. Le statut, lui, se conclut dans tous les cas — un « pending »
   // laissé derrière bloquerait le merge pour toujours.
-  const existing = await findMarkedComment(repo, config.pr, MARKER, runTag(config.runKey)).catch(() => null);
+  const existing = await findMarkedComment(repo, config.pr, MARKER, runTag(config.runKey || LOCAL_RUN_KEY)).catch(() => null);
   const pending = existing === null || isPendingComment(existing.body);
   if (!pending) {
     console.log('Le rapport est déjà posé : seul le statut est conclu.');

@@ -118,11 +118,20 @@ describe('poser le rapport là où est déjà l’annonce de ce run', () => {
 
 /**
  * The listing goes through GraphQL (REST has no "does not contain" filter),
- * then one `minimizeComment` mutation per stale id.
+ * then one `minimizeComment` mutation per stale id. Ordering is on
+ * `createdAt`, not on run identity: an older foreign report collapses, a
+ * newer one survives, whatever each run's start time was.
  */
 describe('replier les anciens rapports', () => {
-  it('liste par GraphQL paginé, filtre sur marqueur/tag/isMinimized, puis minimise chaque id trouvé', async () => {
-    runMock.mockResolvedValue('gid1\ngid2\n');
+  it('liste par GraphQL paginé, filtre sur marqueur, puis minimise ce qui est plus vieux que le commentaire propre', async () => {
+    runMock.mockResolvedValue(
+      [
+        { id: 'gid1', isMinimized: false, createdAt: '2024-01-01T00:00:00Z', own: false },
+        { id: 'gid2', isMinimized: false, createdAt: '2024-01-02T00:00:00Z', own: true },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
     const collapsed = await minimizeOtherReports('o/r', 7, MARKER, TAG);
 
     const [command, args] = runMock.mock.calls[0]!;
@@ -142,18 +151,52 @@ describe('replier les anciens rapports', () => {
     const query = args[args.indexOf('-f') + 1];
     expect(query).toContain('query=query($owner:String!,$name:String!,$number:Int!,$endCursor:String)');
     expect(query).toContain('$endCursor');
+    expect(query).toContain('createdAt');
     const jqFilter = args.at(-1)!;
     expect(jqFilter).toContain(`startswith("${MARKER}")`);
-    expect(jqFilter).toContain(`contains("${TAG}") | not`);
-    expect(jqFilter).toContain('.isMinimized == false');
+    expect(jqFilter).toContain(`contains("${TAG}")`);
 
-    expect(stdinMock).toHaveBeenCalledTimes(2);
+    expect(stdinMock).toHaveBeenCalledTimes(1);
     const [, mutationArgs, mutationInput] = stdinMock.mock.calls[0]!;
     expect(mutationArgs).toEqual(['api', 'graphql', '--input', '-']);
     const parsed = JSON.parse(mutationInput) as { query: string; variables: { id: string } };
     expect(parsed.query).toContain('minimizeComment(input:{subjectId:$id, classifier:OUTDATED})');
     expect(parsed.variables).toEqual({ id: 'gid1' });
-    expect(collapsed).toBe(2);
+    expect(collapsed).toBe(1);
+  });
+
+  it('épargne un rapport étranger plus récent que le commentaire propre', async () => {
+    runMock.mockResolvedValue(
+      [
+        { id: 'gid1', isMinimized: false, createdAt: '2024-01-03T00:00:00Z', own: false },
+        { id: 'gid2', isMinimized: false, createdAt: '2024-01-01T00:00:00Z', own: true },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    expect(await minimizeOtherReports('o/r', 7, MARKER, TAG)).toBe(0);
+    expect(stdinMock).not.toHaveBeenCalled();
+  });
+
+  it('n’essaie pas de minimiser un rapport déjà replié', async () => {
+    runMock.mockResolvedValue(
+      [
+        { id: 'gid1', isMinimized: true, createdAt: '2024-01-01T00:00:00Z', own: false },
+        { id: 'gid2', isMinimized: false, createdAt: '2024-01-02T00:00:00Z', own: true },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    expect(await minimizeOtherReports('o/r', 7, MARKER, TAG)).toBe(0);
+    expect(stdinMock).not.toHaveBeenCalled();
+  });
+
+  it('ne minimise rien, et rend 0, sans commentaire propre', async () => {
+    runMock.mockResolvedValue(
+      JSON.stringify({ id: 'gid1', isMinimized: false, createdAt: '2024-01-01T00:00:00Z', own: false }) + '\n',
+    );
+    expect(await minimizeOtherReports('o/r', 7, MARKER, TAG)).toBe(0);
+    expect(stdinMock).not.toHaveBeenCalled();
   });
 
   it('ne minimise rien, et rend 0, quand la liste est vide', async () => {

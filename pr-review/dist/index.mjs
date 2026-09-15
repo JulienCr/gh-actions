@@ -411,7 +411,7 @@ async function upsertComment(repo, pr, marker, tag, body) {
 }
 async function minimizeOtherReports(repo, pr, marker, tag) {
   const [owner, name] = repo.split("/");
-  const query = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){comments(first:100,after:$endCursor){nodes{id body isMinimized} pageInfo{hasNextPage endCursor}}}}}";
+  const query = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){comments(first:100,after:$endCursor){nodes{id body isMinimized createdAt} pageInfo{hasNextPage endCursor}}}}}";
   const stdout = await run("gh", [
     "api",
     "graphql",
@@ -425,9 +425,12 @@ async function minimizeOtherReports(repo, pr, marker, tag) {
     "-F",
     `number=${pr}`,
     "--jq",
-    `.data.repository.pullRequest.comments.nodes[] | select((.body | startswith(${JSON.stringify(marker)})) and (.body | contains(${JSON.stringify(tag)}) | not) and (.isMinimized == false)) | .id`
+    `.data.repository.pullRequest.comments.nodes[] | select(.body | startswith(${JSON.stringify(marker)})) | {id, isMinimized, createdAt, own: (.body | contains(${JSON.stringify(tag)}))} | tojson`
   ]);
-  const ids = stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  const comments = stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "").map((line) => JSON.parse(line));
+  const ownCreatedAt = comments.filter((comment) => comment.own).map((comment) => comment.createdAt).sort().at(0);
+  if (ownCreatedAt === void 0) return 0;
+  const ids = comments.filter((comment) => !comment.own && !comment.isMinimized && comment.createdAt < ownCreatedAt).map((comment) => comment.id);
   for (const id of ids) {
     const mutation = "mutation($id:ID!){minimizeComment(input:{subjectId:$id, classifier:OUTDATED}){minimizedComment{isMinimized}}}";
     await runWithStdin(
@@ -1575,7 +1578,7 @@ function runUrlFrom(env) {
 }
 function runKeyFrom(env) {
   const id = env.GITHUB_RUN_ID?.trim();
-  if (!id) return `local-${process.pid}-${Date.now()}`;
+  if (!id) return "";
   const attempt2 = env.GITHUB_RUN_ATTEMPT?.trim() || "1";
   return `${id}.${attempt2}`;
 }
@@ -2018,6 +2021,7 @@ var WINDOW = {
   joinGap: 25,
   maxCoverage: 0.7
 };
+var LOCAL_RUN_KEY = `local-${process.pid}-${Date.now()}`;
 var DEFAULT_KEY_REFS = {
   ollama: "op://Personal/Ollama/add more/api_key",
   deepseek: "op://Personal/DeepSeek/api_key"
@@ -2354,8 +2358,8 @@ function reporterFor(config, repo, headSha) {
     async announce(passes) {
       if (mute || !config.announce) return;
       try {
-        const tag = runTag(config.runKey);
-        const body = withRunTag(renderPendingComment({ passes, runUrl: config.runUrl }), config.runKey);
+        const tag = runTag(config.runKey || LOCAL_RUN_KEY);
+        const body = withRunTag(renderPendingComment({ passes, runUrl: config.runUrl }), config.runKey || LOCAL_RUN_KEY);
         await upsertComment(repo, config.pr, MARKER, tag, body);
         console.log(`Annonce pos\xE9e sur la PR #${config.pr}.`);
       } catch (error) {
@@ -2364,8 +2368,8 @@ function reporterFor(config, repo, headSha) {
     },
     async settle(state, description, body) {
       if (body !== void 0 && !mute) {
-        const tag = runTag(config.runKey);
-        await upsertComment(repo, config.pr, MARKER, tag, withRunTag(body, config.runKey));
+        const tag = runTag(config.runKey || LOCAL_RUN_KEY);
+        await upsertComment(repo, config.pr, MARKER, tag, withRunTag(body, config.runKey || LOCAL_RUN_KEY));
         if (state === "success") {
           try {
             const collapsed = await minimizeOtherReports(repo, config.pr, MARKER, tag);
@@ -2383,7 +2387,7 @@ async function abort(config, reason = "run annul\xE9 ou d\xE9lai d\xE9pass\xE9")
   const repo = await resolveRepo();
   const meta = await fetchPrMeta(config.pr);
   const report = reporterFor(config, repo, meta.headSha);
-  const existing = await findMarkedComment(repo, config.pr, MARKER, runTag(config.runKey)).catch(() => null);
+  const existing = await findMarkedComment(repo, config.pr, MARKER, runTag(config.runKey || LOCAL_RUN_KEY)).catch(() => null);
   const pending = existing === null || isPendingComment(existing.body);
   if (!pending) {
     console.log("Le rapport est d\xE9j\xE0 pos\xE9 : seul le statut est conclu.");

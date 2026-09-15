@@ -193,11 +193,20 @@ export async function upsertComment(
   }
 }
 
+interface AristarqueComment {
+  id: string;
+  isMinimized: boolean;
+  createdAt: string;
+  own: boolean;
+}
+
 /**
- * Collapses every OTHER run's report as OUTDATED, keeping this run's own.
+ * Collapses every OTHER run's report older than this run's own comment,
+ * keeping this run's own and anything newer.
  *
- * The listing goes through GraphQL because REST does not expose `isMinimized`:
- * without it, every run would re-minimize the whole history.
+ * GraphQL, because REST does not expose `isMinimized`. Ordering on
+ * `createdAt`, not on run identity, is what keeps a slow run from collapsing a
+ * faster run's already-posted report. No own comment yet: minimize nothing.
  *
  * @returns how many comments were collapsed by this call.
  */
@@ -211,7 +220,7 @@ export async function minimizeOtherReports(
   const query =
     'query($owner:String!,$name:String!,$number:Int!,$endCursor:String){' +
     'repository(owner:$owner,name:$name){pullRequest(number:$number){' +
-    'comments(first:100,after:$endCursor){nodes{id body isMinimized} pageInfo{hasNextPage endCursor}}}}}';
+    'comments(first:100,after:$endCursor){nodes{id body isMinimized createdAt} pageInfo{hasNextPage endCursor}}}}}';
   const stdout = await run('gh', [
     'api',
     'graphql',
@@ -225,12 +234,24 @@ export async function minimizeOtherReports(
     '-F',
     `number=${pr}`,
     '--jq',
-    `.data.repository.pullRequest.comments.nodes[] | select((.body | startswith(${JSON.stringify(marker)})) and (.body | contains(${JSON.stringify(tag)}) | not) and (.isMinimized == false)) | .id`,
+    `.data.repository.pullRequest.comments.nodes[] | select(.body | startswith(${JSON.stringify(marker)})) | {id, isMinimized, createdAt, own: (.body | contains(${JSON.stringify(tag)}))} | tojson`,
   ]);
-  const ids = stdout
+  const comments = stdout
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => line !== '');
+    .filter((line) => line !== '')
+    .map((line) => JSON.parse(line) as AristarqueComment);
+
+  const ownCreatedAt = comments
+    .filter((comment) => comment.own)
+    .map((comment) => comment.createdAt)
+    .sort()
+    .at(0);
+  if (ownCreatedAt === undefined) return 0;
+
+  const ids = comments
+    .filter((comment) => !comment.own && !comment.isMinimized && comment.createdAt < ownCreatedAt)
+    .map((comment) => comment.id);
 
   for (const id of ids) {
     const mutation = 'mutation($id:ID!){minimizeComment(input:{subjectId:$id, classifier:OUTDATED}){minimizedComment{isMinimized}}}';

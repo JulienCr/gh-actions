@@ -314,8 +314,9 @@ export interface Config {
   /**
    * Identifies this run, so each execution owns its own comment.
    *
-   * `${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}` in CI, a local id otherwise:
-   * re-running a job (new attempt) therefore also creates a new comment.
+   * `${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}` in CI; empty outside CI, where
+   * the caller supplies `LOCAL_RUN_KEY` instead (`index.ts`), keeping this
+   * module free of `process.pid` / `Date.now()`.
    */
   runKey: string;
   /** Imprimer ce qui partirait, et ne rien envoyer. Réglage local seulement. */
@@ -418,28 +419,24 @@ function runUrlFrom(env: Env): string {
 }
 
 /**
- * Same idea as `runUrlFrom`, but never empty: it must always name a comment.
- *
- * Falls back to a process-scoped id in local runs, where `GITHUB_RUN_ID` is
- * absent — pid plus timestamp is enough to tell two local runs apart.
+ * Same idea as `runUrlFrom`, but this module stays pure: no `process.pid` or
+ * `Date.now()` here. Empty outside CI — the caller supplies a local fallback.
  */
 function runKeyFrom(env: Env): string {
   const id = env.GITHUB_RUN_ID?.trim();
-  if (!id) return `local-${process.pid}-${Date.now()}`;
+  if (!id) return '';
   const attempt = env.GITHUB_RUN_ATTEMPT?.trim() || '1';
   return `${id}.${attempt}`;
 }
 
 /**
- * La review est-elle branchée ?
+ * Is the review switched on?
  *
- * Interrupteur du dépôt consommateur : `enable: false` la coupe sans rien
- * démonter du workflow, le temps d'un quota épuisé ou d'une refonte. Absent vaut
- * allumé, sinon un dépôt qui branche l'action sans lire la doc n'obtiendrait
- * rien et croirait à une PR jugée irréprochable.
- *
- * Lu hors de `resolveConfig`, et appelé avant lui : une review éteinte ne doit
- * pas exiger un numéro de PR, seule chose dont l'absence sort en 1.
+ * `enable: false` cuts it without dismantling the workflow, for a spent quota
+ * or a rework. Absent means on: a repo that wires the action without reading
+ * the doc must not get nothing while believing the PR was found clean. Read
+ * and called outside `resolveConfig`, before it: a disabled review must not
+ * require a PR number, the only absence that exits 1.
  */
 export function isEnabled(env: Env): boolean {
   return !/^(false|0|no|off)$/i.test(readInput(env, 'enable'));
