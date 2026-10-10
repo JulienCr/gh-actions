@@ -16,6 +16,7 @@
     "build": "node scripts/build.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:models": "LIVE_MODELS=1 vitest run pr-review/tests/models.live.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
