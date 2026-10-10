@@ -105,6 +105,7 @@ const FOOTER: Footer = {
   windowed: [],
   effort: 'balanced',
   importsWithheld: [],
+  calls: [],
 };
 
 describe('renderComment', () => {
@@ -265,6 +266,15 @@ describe('le pied de page déclare ce que le cran a retiré', () => {
   it('dit à quelles passes les imports n’ont pas été joints', () => {
     const comment = footer({ imported: 21, importsWithheld: ['doctrine du dépôt'] });
     expect(comment).toContain('21 fichier(s) importés joints en contexte (hors « doctrine du dépôt »)');
+  });
+
+  it('replie le détail par appel sous le total', () => {
+    const comment = footer({ calls: ['régression en 42 s · a', 'merge en 9 s · b'] });
+    expect(comment).toContain('<details><summary><sub>Détail par appel</sub></summary>\n\n- régression en 42 s · a\n- merge en 9 s · b\n\n</details>');
+  });
+
+  it('n’ouvre pas de <details> sans appel à détailler', () => {
+    expect(footer({ calls: [] })).not.toContain('<details>');
   });
 
   it('ne dit rien de tel quand les trois passes les ont eus', () => {
