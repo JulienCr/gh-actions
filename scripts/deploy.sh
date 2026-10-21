@@ -6,6 +6,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 KNOWN_ACTIONS="pr-review (alias: aristarque)"
 BRANCH="ci/aristarque-pr-review"
 DEFAULT_WORKFLOW_PATH=".github/workflows/pr-review.yml"
+FALLBACK_WORKFLOW_PATH=".github/workflows/aristarque.yml"
 ACTION_REF="JulienCr/gh-actions/pr-review"
 GATE_CONTEXT="aristarque/review"
 OP_REF='op://Personal/Ollama/add more/api_key'
@@ -97,7 +98,14 @@ BODY
 secret_step() { # repo
   local repo=$1 value
   local manual="op read '$OP_REF' | gh secret set OLLAMA_API_KEY --repo $repo"
-  if gh secret list --repo "$repo" --json name --jq '.[].name' 2>/dev/null | grep -qx OLLAMA_API_KEY; then
+  local listed
+  if ! listed=$(gh secret list --repo "$repo" --json name --jq '.[].name' 2>"$TMP/err"); then
+    SECRET_STATUS="unknown (cannot list secrets: admin rights needed?)"
+    RC=1
+    echo "warning: cannot list secrets on $repo ($(head -c 200 "$TMP/err" | tr '\n' ' ')); not setting it" >&2
+    return 0
+  fi
+  if grep -qx OLLAMA_API_KEY <<<"$listed"; then
     SECRET_STATUS="already set"
     info "secret OLLAMA_API_KEY already set"
     return 0
@@ -123,17 +131,36 @@ secret_step() { # repo
   else
     SECRET_STATUS="NOT SET (op read failed or empty)"
     RC=1
-    echo "warning: could not read the key from 1Password; set it by hand:  $manual" >&2
+    echo "warning: could not read the key from 1Password (run \`op signin\` or unlock 1Password); set it by hand:  $manual" >&2
   fi
   value=""
 }
 
-gate_step() { # repo branch
-  local repo=$1 branch=$2 cmd
+gate_step() { # repo branch fresh
+  local repo=$1 branch=$2 fresh=$3 cmd
   # POST .../contexts appends to the list; PATCH on required_status_checks would replace it.
   cmd="echo '[\"$GATE_CONTEXT\"]' | gh api -X POST repos/$repo/branches/$branch/protection/required_status_checks/contexts --input -"
   if ((!GATE)); then
     echo "hint: to make the review block merges, run:  $cmd"
+    return 0
+  fi
+  if ((fresh)); then
+    GATE_STATUS="deferred: merge the PR, then rerun with --gate"
+    info "gate deferred: the workflow is not on $branch yet; merge the PR, then rerun with --gate"
+    return 0
+  fi
+  # Without the key the action posts no status and every merge stays blocked.
+  case $SECRET_STATUS in
+    "already set" | "set from 1Password" | "would be set"*) ;;
+    *)
+      GATE_STATUS="NOT applied: secret OLLAMA_API_KEY missing"
+      RC=1
+      echo "warning: gate not applied: OLLAMA_API_KEY is not in place, merges would stay blocked" >&2
+      return 0
+      ;;
+  esac
+  if ((DRY)); then
+    GATE_STATUS="would require $GATE_CONTEXT"
     return 0
   fi
   if printf '["%s"]' "$GATE_CONTEXT" \
@@ -141,6 +168,7 @@ gate_step() { # repo branch
     GATE_STATUS="$GATE_CONTEXT required on $branch"
   else
     GATE_STATUS="NOT applied"
+    RC=1
     echo "warning: gate not applied ($(head -c 200 "$TMP/err" | tr '\n' ' '))" >&2
     echo "         needs branch protection with required checks (403/404: none, or private repo on a free plan). Command:  $cmd" >&2
   fi
@@ -155,7 +183,7 @@ summary() { # repo
 }
 
 deploy_pr_review() { # repo
-  local repo=$1 default_branch author path existing_file="" f names p
+  local repo=$1 default_branch author path existing_file="" f names p fresh=0
   local doctrine_paths=() doctrine_note
   gh repo view "$repo" --json defaultBranchRef --jq .defaultBranchRef.name >"$TMP/branch" 2>"$TMP/err" \
     || { cat "$TMP/err" >&2; die "repository $repo is not accessible"; }
@@ -164,6 +192,7 @@ deploy_pr_review() { # repo
   info "$repo: default branch is $default_branch"
 
   author=$(gh api user -q .login) || die "cannot read the gh user login"
+  info "author login: $author (only this login can trigger a review by mention)"
 
   # The action's "doctrine" input REPLACES its default list, so a non-default file
   # must be emitted together with the defaults.
@@ -179,7 +208,7 @@ deploy_pr_review() { # repo
       if api_file "$repo" "$p" "$default_branch" >/dev/null; then found_extra+=("$p"); fi
     done
     if ((${#found_extra[@]})); then
-      doctrine_paths=("${DEFAULT_DOCTRINE[@]}" "${found_extra[@]}")
+      doctrine_paths=("${found_default[@]}" "${found_extra[@]}")
       doctrine_note="détectée, liste explicite : ${doctrine_paths[*]}"
     elif ((${#found_default[@]})); then
       doctrine_note="détectée par défaut (${found_default[*]}), aucun réglage nécessaire"
@@ -214,9 +243,24 @@ deploy_pr_review() { # repo
     info "$repo already uses the action in $existing_file; nothing written (use --force to update)"
     diff -u --label "$existing_file (deployed)" --label "rendered template" \
       "$TMP/current.yml" "$TMP/rendered.yml" || true
+    secret_step "$repo"
+    gate_step "$repo" "$default_branch" 0
+    summary "$repo"
     return 0
   fi
-  path=${existing_file:-$DEFAULT_WORKFLOW_PATH}
+  if [[ -z $existing_file ]]; then
+    fresh=1
+    path=$DEFAULT_WORKFLOW_PATH
+    if grep -qxF "$path" <<<"$names"; then
+      path=$FALLBACK_WORKFLOW_PATH
+      info "$DEFAULT_WORKFLOW_PATH is taken by another workflow; using $path"
+      if grep -qxF "$path" <<<"$names"; then
+        die "both $DEFAULT_WORKFLOW_PATH and $path exist without the action; free one or install by hand"
+      fi
+    fi
+  else
+    path=$existing_file
+  fi
   local verb=add
   if [[ -n $existing_file ]]; then verb=update; fi
   local message="ci: $verb Aristarque PR review"
@@ -229,8 +273,9 @@ deploy_pr_review() { # repo
     echo "  - PUT $path (\"$message\")"
     echo "  - open a PR $BRANCH -> $default_branch (or print the existing one)"
     echo "  - set secret OLLAMA_API_KEY from 1Password (unless already set)"
-    if ((GATE)); then echo "  - require status check $GATE_CONTEXT on $default_branch"; fi
+    if ((GATE && !fresh)); then echo "  - require status check $GATE_CONTEXT on $default_branch"; fi
     secret_step "$repo"
+    gate_step "$repo" "$default_branch" "$fresh"
     summary "$repo"
     return 0
   fi
@@ -247,7 +292,7 @@ deploy_pr_review() { # repo
   # The sha must come from the branch being written to, which may already hold the file.
   local branch_sha put_args
   branch_sha=$(api_sha "$repo" "$path" "$BRANCH")
-  put_args=(-f "message=$message" -f "branch=$BRANCH" -f "content=$(base64 -w0 "$TMP/rendered.yml")")
+  put_args=(-f "message=$message" -f "branch=$BRANCH" -f "content=$(base64 <"$TMP/rendered.yml" | tr -d '\n')")
   if [[ -n $branch_sha ]]; then put_args+=(-f "sha=$branch_sha"); fi
   gh api -X PUT "repos/$repo/contents/$path" "${put_args[@]}" >/dev/null
   info "wrote $path on $BRANCH"
@@ -264,7 +309,7 @@ deploy_pr_review() { # repo
   fi
 
   secret_step "$repo"
-  gate_step "$repo" "$default_branch"
+  gate_step "$repo" "$default_branch" "$fresh"
   summary "$repo"
 }
 
