@@ -115,6 +115,8 @@ function mapOutsideFences(markdown: string, transform: (segment: string) => stri
 }
 
 export interface Footer {
+  /** Une ligne déjà formatée par appel LLM abouti, repliée sous le total. */
+  calls: string[];
   /**
    * Ce qui a tourné et où, une entrée par destination.
    *
@@ -243,7 +245,10 @@ function renderFooter(footer: Footer): string {
     const plural = quoted.length > 1 ? 's' : '';
     bits.push(`⚠ passe${plural} ${enumerate(quoted)} non aboutie${plural}`);
   }
-  return `<sub>${bits.join(' · ')}</sub>`;
+  const line = `<sub>${bits.join(' · ')}</sub>`;
+  if (footer.calls.length === 0) return line;
+  const items = footer.calls.map((call) => `- ${call}`).join('\n');
+  return `${line}\n\n<details><summary><sub>Détail par appel</sub></summary>\n\n${items}\n\n</details>`;
 }
 
 /** Une énumération française : virgules, puis « et » devant le dernier terme. */

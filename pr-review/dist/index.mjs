@@ -1994,7 +1994,16 @@ function renderFooter(footer) {
     const plural = quoted.length > 1 ? "s" : "";
     bits.push(`\u26A0 passe${plural} ${enumerate2(quoted)} non aboutie${plural}`);
   }
-  return `<sub>${bits.join(" \xB7 ")}</sub>`;
+  const line = `<sub>${bits.join(" \xB7 ")}</sub>`;
+  if (footer.calls.length === 0) return line;
+  const items = footer.calls.map((call) => `- ${call}`).join("\n");
+  return `${line}
+
+<details><summary><sub>D\xE9tail par appel</sub></summary>
+
+${items}
+
+</details>`;
 }
 function enumerate2(items) {
   if (items.length < 2) return items.join("");
@@ -2598,6 +2607,7 @@ async function review(config) {
       models: describeTargets(run2.calls.filter((call) => call.ok)),
       durationMs: Date.now() - started,
       ...totals(run2.calls),
+      calls: run2.calls.filter((call) => call.ok).map(describeCall),
       skipped: context.skipped,
       omitted: context.omitted,
       windowed: context.windowed,
@@ -2726,6 +2736,7 @@ async function replayMerge(config) {
       models: describeTargets(run2.calls.filter((call) => call.ok)),
       durationMs: run2.calls.at(-1)?.durationMs ?? 0,
       ...totals(run2.calls),
+      calls: run2.calls.filter((call) => call.ok).map(describeCall),
       skipped: [],
       omitted: [],
       windowed: [],
