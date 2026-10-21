@@ -172,11 +172,12 @@ Poser `status-check: true` fait poser à l'action un **statut de commit** sur la
 atteste qu'elle a été lue, pas qu'elle est propre. La doctrine tient — une review est un avis, pas
 un gate — et ce qu'on gate est l'existence de la lecture, pas son verdict.
 
-Il reste à le déclarer requis, côté dépôt, une fois pour toutes :
+Il reste à le déclarer requis, côté dépôt, une fois pour toutes : `scripts/deploy.sh aristarque
+<owner>/<repo> --gate`, ou à la main (la branche doit déjà avoir une protection) :
 
 ```
-gh api -X PUT repos/<owner>/<repo>/branches/main/protection/required_status_checks \
-  -f 'checks[][context]=aristarque/review'
+echo '["aristarque/review"]' | gh api -X POST \
+  repos/<owner>/<repo>/branches/main/protection/required_status_checks/contexts --input -
 ```
 
 Ce qui fait la valeur de ce mécanisme est le cas qu'un check ordinaire ne couvre pas : **un statut
