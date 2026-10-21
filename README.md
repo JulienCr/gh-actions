@@ -29,125 +29,18 @@ jugée irréprochable.
 
 ### Installation dans un dépôt
 
-Poser le secret `OLLAMA_API_KEY` (`gh secret set OLLAMA_API_KEY --repo <owner>/<repo>`), puis
-créer `.github/workflows/pr-review.yml` :
+Le workflow de référence est [`pr-review/templates/pr-review.yml`](pr-review/templates/pr-review.yml).
+Pour l'installer dans un autre dépôt, sans clone (tout passe par `gh api`) :
 
-```yaml
-name: Review IA des PR
-
-on:
-  pull_request:
-    types: [opened, ready_for_review]
-  # Une mention rattrape ce que les deux autres ne couvrent pas : ni « opened »
-  # ni « ready_for_review » ne se rejouent sur une PR déjà relue, et un rebase
-  # ne redéclenche rien.
-  issue_comment:
-    types: [created]
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: 'Numéro de la PR à relire'
-        required: true
-        type: string
-
-permissions:
-  contents: read
-  pull-requests: write
-  # Pour réagir 👀 au commentaire déclencheur. Un commentaire de conversation de
-  # PR est un commentaire d'issue au sens de l'API : « pull-requests » ne suffit pas.
-  issues: write
-  # Pour le statut de commit « aristarque/review », le seul mécanisme qui fasse
-  # attendre la review. Voir « Faire attendre la review ».
-  statuses: write
-
-jobs:
-  review:
-    # Un brouillon ne consomme pas de quota : il sera relu au passage en « prêt ».
-    # La mention passe outre le brouillon : demander explicitement une review
-    # sur un brouillon est une demande, pas un accident.
-    #
-    # ⚠️ La garde sur l'auteur n'est pas du confort. `issue_comment` s'exécute avec
-    # les secrets du dépôt et un jeton en écriture, sur commentaire de n'importe
-    # qui. Sur un dépôt public, sans allowlist, un inconnu vide la clé Ollama en
-    # boucle. Mettre son propre login. `issue.pull_request` écarte au passage les
-    # commentaires d'issue, que le même événement porte aussi.
-    if: >-
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
-      || (github.event_name == 'issue_comment'
-          && github.event.issue.pull_request
-          && github.event.comment.user.login == 'JulienCr'
-          && contains(github.event.comment.body, '@aristarque review'))
-    runs-on: ubuntu-latest
-    # Au niveau du job, pas du workflow. Un run dont le job est écarté par la
-    # garde ci-dessus n'entre jamais dans le groupe ; au niveau du workflow il y
-    # entrait avant que la garde soit évaluée, donc n'importe quel commentaire
-    # d'un inconnu annulait la review en cours via `cancel-in-progress`. La
-    # garde sur l'auteur empêchait de lancer une review, pas d'en tuer une.
-    concurrency:
-      group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
-      cancel-in-progress: true
-    # Le mur vaut « la plus longue chaîne en cache, plus la fusion ». Sans clé
-    # DeepSeek rien ne cache et les passes sont parallèles, donc deux fois le
-    # « timeout-minutes » de l'action ; avec, le groupe DeepSeek en enchaîne
-    # deux, donc trois fois.
-    timeout-minutes: 45
-    steps:
-      # Un run déclenché par commentaire n'apparaît pas comme check sur la PR :
-      # sans cet accusé de réception, la mention se fait à l'aveugle.
-      - name: Accuser réception de la mention
-        if: github.event_name == 'issue_comment'
-        # Cosmétique, donc non bloquant : sans ceci un `gh api` qui échoue (rate
-        # limit, commentaire supprimé) sort en non-zéro, et checkout comme review
-        # sont skippés. La réaction manquerait ET la review avec.
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api -X POST \
-            "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
-            -f content=eyes
-
-      # La tête de la PR, pas le commit de merge : le contenu lu doit
-      # correspondre au diff, sinon le modèle raisonne sur des numéros de ligne
-      # qui ont bougé.
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', github.event.issue.number || inputs.pr) }}
-
-      - uses: JulienCr/gh-actions/pr-review@v3
-        with:
-          pr: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
-          ollama-api-key: ${{ secrets.OLLAMA_API_KEY }}
-          # Facultative. Sans elle, les trois appels bon marché passent par
-          # Ollama ; avec elle, par l'API DeepSeek, qui ajoute un cache de
-          # préfixe. Voir « Le mix par passe ».
-          deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
-          doctrine: |
-            .github/copilot-instructions.md
-            CLAUDE.md
-          skip: |
-            src/generated/**
-            deploy/**
-          # Voir « Faire attendre la review ». Sans ceci, un auto-merge armé
-          # part par-dessus une review encore en cours.
-          status-check: true
-
-      # Un run tué par « cancel-in-progress » ou par « timeout-minutes » ne
-      # repasse pas par la fin du programme : sans cette étape, son annonce
-      # resterait « review en cours » et son statut « pending » pour toujours,
-      # et ce pending bloquerait le merge sans fin. En « continue-on-error »
-      # pour la même raison que l'accusé de réception : un nettoyage qui échoue
-      # ne doit pas emporter ce qu'il nettoie.
-      - name: Signaler une review interrompue
-        if: always() && (cancelled() || failure())
-        continue-on-error: true
-        uses: JulienCr/gh-actions/pr-review@v3
-        with:
-          pr: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
-          mode: abort
-          status-check: true
+```bash
+scripts/deploy.sh aristarque <owner>/<repo> [--skip '<glob>']... [--doctrine <chemin>]... [--gate] [--force] [--dry-run]
 ```
+
+Le script ouvre une PR `ci/aristarque-pr-review` qui ajoute le workflow (épinglé sur `@main`, auteur
+autorisé = le login `gh` courant), détecte la doctrine du dépôt, refuse d'écraser une installation
+existante sans `--force`, et pose le secret `OLLAMA_API_KEY` depuis 1Password. `--gate` rend le
+statut `aristarque/review` obligatoire sur la branche par défaut. `--dry-run` n'écrit rien.
+À la main : `gh secret set OLLAMA_API_KEY --repo <owner>/<repo>`.
 
 Aucune dépendance à installer : l'action n'importe que des builtins Node et pilote GitHub par le
 CLI `gh`, déjà présent sur le runner. Le job reste donc vert même quand le lockfile de la branche
@@ -279,11 +172,12 @@ Poser `status-check: true` fait poser à l'action un **statut de commit** sur la
 atteste qu'elle a été lue, pas qu'elle est propre. La doctrine tient — une review est un avis, pas
 un gate — et ce qu'on gate est l'existence de la lecture, pas son verdict.
 
-Il reste à le déclarer requis, côté dépôt, une fois pour toutes :
+Il reste à le déclarer requis, côté dépôt, une fois pour toutes : `scripts/deploy.sh aristarque
+<owner>/<repo> --gate`, ou à la main (la branche doit déjà avoir une protection) :
 
 ```
-gh api -X PUT repos/<owner>/<repo>/branches/main/protection/required_status_checks \
-  -f 'checks[][context]=aristarque/review'
+echo '["aristarque/review"]' | gh api -X POST \
+  repos/<owner>/<repo>/branches/main/protection/required_status_checks/contexts --input -
 ```
 
 Ce qui fait la valeur de ce mécanisme est le cas qu'un check ordinaire ne couvre pas : **un statut
